@@ -87,10 +87,15 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           path: { type: "string", description: "File path on remote server" },
           offset: { type: "number", description: "Start line (0-based)" },
           limit: { type: "number", description: "Max lines to read" },
+          binary: { type: "boolean", description: "Read as binary (base64 encoded)" },
         },
         required: ["path"],
       },
-      async execute(params: { path: string; offset?: number; limit?: number }) {
+      async execute(params: { path: string; offset?: number; limit?: number; binary?: boolean }) {
+        if (params.binary) {
+          const buffer = await fs.readFile(params.path)
+          return (buffer as Buffer).toString("base64")
+        }
         const content = await fs.readFile(params.path, { encoding: "utf-8" })
         const lines = (content as string).split("\n")
         const start = params.offset ?? 0
@@ -110,16 +115,22 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         type: "object",
         properties: {
           path: { type: "string", description: "File path on remote server" },
-          content: { type: "string", description: "Content to write" },
+          content: { type: "string", description: "Content to write (text or base64 for binary)" },
           mode: { type: "number", description: "File permissions (octal)" },
+          binary: { type: "boolean", description: "Content is base64 encoded binary" },
         },
         required: ["path", "content"],
       },
-      async execute(params: { path: string; content: string; mode?: number }) {
+      async execute(params: { path: string; content: string; mode?: number; binary?: boolean }) {
         checkReadOnly("writeFile", policy)
         checkBlockedPath(params.path, policy)
-        await fs.writeFile(params.path, params.content, { mode: params.mode })
-        return `Written ${params.content.length} bytes to ${params.path}`
+        let data: string | Buffer = params.content
+        if (params.binary) {
+          data = Buffer.from(params.content, "base64")
+        }
+        await fs.writeFile(params.path, data, { mode: params.mode })
+        const size = Buffer.isBuffer(data) ? data.length : data.length
+        return `Written ${size} bytes to ${params.path}`
       },
     },
 

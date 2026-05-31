@@ -1,9 +1,15 @@
 /**
  * SSH Profile Manager - saves/loads SSH connection profiles
- * Supports encrypted password storage
+ * Supports password obfuscation (NOT encryption!)
+ * 
+ * SECURITY WARNING:
+ * - The XOR-based "encryption" is NOT cryptographically secure!
+ * - It only provides basic obfuscation against accidental exposure.
+ * - For production environments, use a system keychain (keytar/keychain) or proper encryption.
+ * - Profile files are saved with 600 permissions (owner-only read/write) to limit exposure.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "fs"
 import { dirname, join } from "path"
 import { randomUUID } from "crypto"
 import type { SSHHostConfig, SSHProfile } from "./types.js"
@@ -54,6 +60,13 @@ export class ProfileManager {
     const dir = dirname(this.profilesPath)
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true })
+      // Set directory permissions to 700
+      try {
+        chmodSync(dir, 0o700)
+      } catch {
+        // Non-fatal, but log warning
+        console.warn("[ProfileManager] Could not set directory permissions to 700")
+      }
     }
 
     let data = this.profiles
@@ -62,6 +75,13 @@ export class ProfileManager {
     }
 
     writeFileSync(this.profilesPath, JSON.stringify(data, null, 2), "utf-8")
+    // Set file permissions to 600 (owner read/write only)
+    try {
+      chmodSync(this.profilesPath, 0o600)
+    } catch {
+      // Non-fatal, but log warning
+      console.warn("[ProfileManager] Could not set file permissions to 600")
+    }
   }
 
   /** Add a new profile */
@@ -151,7 +171,11 @@ export class ProfileManager {
     return profile.chain.map(ProfileManager.hostFromProfile)
   }
 
-  /** Simple XOR-based obfuscation for password storage (not cryptographically secure) */
+  /**
+   * Simple XOR-based obfuscation for password storage.
+   * WARNING: This is NOT cryptographically secure! It only provides basic obfuscation.
+   * For production use, consider using a system keychain or proper encryption library.
+   */
   private encrypt(text: string): string {
     if (!this.encryptionKey) return text
     const key = this.encryptionKey
