@@ -1,0 +1,532 @@
+#!/usr/bin/env node
+
+/**
+ * ssh-exec - 通过 SSH 网关执行远程命令
+ *
+ * 用法:
+ *   node ssh-exec.ts --config <json-file> --command <命令>
+ *   node ssh-exec.ts --config <json-file> --shell  (交互式 shell)
+ *
+ * 配置文件格式 (JSON):
+ * {
+ *   "gateways": [
+ *     { "host": "跳板机1", "port": 22, "username": "user1", "password": "pass1" },
+ *     { "host": "跳板机2", "port": 22, "username": "user2", "password": "pass2" }
+ *   ],
+ *   "target": { "host": "目标机", "port": 22, "username": "root", "password": "xxx" }
+ * }
+ */
+
+import { readFileSync } from "fs"
+import { resolve } from "path"
+import { checkDeps } from "../check-deps.js"
+import { SSHGateway } from "../gateway.js"
+import { remoteExec } from "../remote-shell.js"
+import {
+  handleDaemonStart,
+  handleDaemonStop,
+  handleDaemonExec,
+  handleDaemonSessions,
+  handleDaemonDisconnect,
+  handleDaemonPing,
+} from "./daemon-commands.js"
+import { DaemonClient } from "../daemon-client.js"
+import { createRequest } from "../ipc-protocol.js"
+import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "../file-transfer.js"
+import { BackgroundExecManager } from "../background-exec.js"
+import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
+
+interface HostConfig {
+  host: string
+  port?: number
+  username: string
+  password?: string
+  privateKey?: string
+}
+
+interface SshExecConfig {
+  gateways?: HostConfig[]
+  target: HostConfig
+  timeout?: number
+}
+
+function parseArgs(): { configPath?: string; configJson?: string; command?: string; shell: boolean; debug: boolean } {
+  const args = process.argv.slice(2)
+  let configPath: string | undefined
+  let configJson: string | undefined
+  let command: string | undefined
+  let shell = false
+  let debug = false
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--config" && i + 1 < args.length) {
+      configPath = args[++i]
+    } else if (args[i] === "--config-json" && i + 1 < args.length) {
+      configJson = args[++i]
+    } else if (args[i] === "--command" && i + 1 < args.length) {
+      command = args[++i]
+    } else if (args[i] === "--shell") {
+      shell = true
+    } else if (args[i] === "--debug") {
+      debug = true
+    } else if (args[i] === "--help" || args[i] === "-h") {
+      console.log(`用法:
+  ssh-exec [--debug] --config <json文件> --command <命令>       执行命令（单次连接）
+  ssh-exec [--debug] --config-json '<json串>' --command <命令>  同上，但直接传 JSON
+  ssh-exec [--debug] --config <json文件> --shell                交互式 shell
+  ssh-exec daemon start                                         启动持久化 daemon
+  ssh-exec daemon stop                                          停止 daemon
+  ssh-exec daemon exec --config <json文件> --command <命令>      通过 daemon 执行（复用连接）
+  ssh-exec daemon exec --config-json '<json串>' --command <命令> 同上，但直接传 JSON
+  ssh-exec daemon sessions                                      查看活跃会话
+  ssh-exec daemon disconnect <sessionId>                        断开指定会话
+  ssh-exec daemon ping                                          检查 daemon 状态
+
+--config <文件>       SSH 配置文件路径
+--config-json <JSON>  直接传入 SSH 配置 JSON 字符串（和 --config 二选一）
+--debug               开启调试日志
+
+持久化模式（daemon）:
+  首次 exec 自动启动 daemon，后续命令复用已有 SSH 连接，无需重复握手。
+  空闲 10 分钟后自动断开连接。
+
+配置格式:
+{
+  "gateways": [
+    { "host": "跳板机", "port": 22, "username": "user", "password": "pass" }
+  ],
+  "target": { "host": "目标机", "port": 22, "username": "root", "password": "xxx" }
+}`)
+      process.exit(0)
+    }
+  }
+
+  return { configPath, configJson, command, shell, debug }
+}
+
+function loadConfigFromJson(jsonStr: string): SshExecConfig {
+  const config = JSON.parse(jsonStr) as SshExecConfig
+
+  if (!config.target?.host || !config.target?.username) {
+    throw new Error("配置必须包含 target.host 和 target.username")
+  }
+
+  return config
+}
+
+function loadConfig(path: string): SshExecConfig {
+  const raw = readFileSync(path, "utf-8")
+  const config = JSON.parse(raw) as SshExecConfig
+
+  if (!config.target?.host || !config.target?.username) {
+    throw new Error("配置文件必须包含 target.host 和 target.username")
+  }
+
+  return config
+}
+
+async function execCommand(config: SshExecConfig, command: string): Promise<void> {
+  log("exec", `Starting exec: ${command}`)
+  log("exec", `Target: ${config.target.host}:${config.target.port ?? 22} as ${config.target.username}`)
+  log("exec", `Gateways: ${(config.gateways ?? []).length}`)
+
+  const gw = new SSHGateway({
+    connectionTimeout: config.timeout ?? 15000,
+    maxSessions: 1,
+  })
+
+  try {
+    const jumpHosts = (config.gateways ?? []).map((g) => ({
+      host: g.host,
+      port: g.port ?? 22,
+      username: g.username,
+      password: g.password,
+      privateKey: g.privateKey,
+    }))
+
+    log("exec", "Connecting...")
+    const session = await gw.connectSimple({
+      host: config.target.host,
+      port: config.target.port ?? 22,
+      username: config.target.username,
+      password: config.target.password,
+      privateKey: config.target.privateKey,
+      jumpHosts,
+      name: `exec-${Date.now()}`,
+    })
+    log("exec", `Connected, session: ${session.id}`)
+
+    const connection = gw.sessions.getConnection(session.id)
+    if (!connection) throw new Error("连接失败")
+
+    const client = connection.getFinalClient()
+    log("exec", `Executing: ${command}`)
+    const result = await remoteExec(client, command, {
+      timeout: config.timeout ?? 30000,
+    })
+    log("exec", `Exit code: ${result.code}, stdout: ${result.stdout.length} bytes, stderr: ${result.stderr.length} bytes`)
+
+    if (result.stdout) process.stdout.write(result.stdout)
+    if (result.stderr) process.stderr.write(result.stderr)
+
+    process.exitCode = result.code
+  } catch (err: any) {
+    logError("exec", "exec failed", err)
+    printErrorAndLogPath(err.message)
+    process.exitCode = 1
+  } finally {
+    log("exec", "Disconnecting...")
+    await gw.disconnectAll()
+  }
+}
+
+async function interactiveShell(config: SshExecConfig): Promise<void> {
+  const gw = new SSHGateway({
+    connectionTimeout: config.timeout ?? 15000,
+    maxSessions: 1,
+  })
+
+  try {
+    const jumpHosts = (config.gateways ?? []).map((g) => ({
+      host: g.host,
+      port: g.port ?? 22,
+      username: g.username,
+      password: g.password,
+      privateKey: g.privateKey,
+    }))
+
+    const session = await gw.connectSimple({
+      host: config.target.host,
+      port: config.target.port ?? 22,
+      username: config.target.username,
+      password: config.target.password,
+      privateKey: config.target.privateKey,
+      jumpHosts,
+      name: `shell-${Date.now()}`,
+    })
+
+    const connection = gw.sessions.getConnection(session.id)
+    if (!connection) throw new Error("连接失败")
+
+    // 监听远程输出（保存引用以便清理）
+    const onData = (event: any) => {
+      if (event.type === "data") {
+        process.stdout.write(event.data)
+      }
+    }
+    connection.on("event", onData)
+
+    // 本地 stdin → 远程 shell
+    const onStdin = async (data: Buffer) => {
+      try {
+        await connection.sendData(data)
+      } catch {
+        // 连接已断开
+      }
+    }
+    process.stdin.setRawMode(true)
+    process.stdin.resume()
+    process.stdin.on("data", onStdin)
+
+    // 等待断开
+    await new Promise<void>((resolve) => {
+      const onDisconnect = (event: any) => {
+        if (event.type === "disconnected" || event.type === "error") {
+          resolve()
+        }
+      }
+      connection.on("event", onDisconnect)
+      // 清理 disconnect 监听器（onData 在 finally 中统一清理）
+      connection.once("event", (event: any) => {
+        if (event.type === "disconnected" || event.type === "error") {
+          connection.off("event", onDisconnect)
+        }
+      })
+    })
+  } finally {
+    process.stdin.setRawMode(false)
+    process.stdin.pause()
+    process.stdin.removeAllListeners("data")
+    await gw.disconnectAll()
+  }
+}
+
+function createClient(): DaemonClient {
+  return new DaemonClient()
+}
+
+export async function handleDaemonTransfer(args: string[]): Promise<void> {
+  let configPath: string | undefined
+  let configJson: string | undefined
+  let action: string | undefined
+  let localPath: string | undefined
+  let remotePath: string | undefined
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--config" && i + 1 < args.length) {
+      configPath = args[++i]
+    } else if (args[i] === "--config-json" && i + 1 < args.length) {
+      configJson = args[++i]
+    } else if (args[i] === "--action" && i + 1 < args.length) {
+      action = args[++i]
+    } else if (args[i] === "--local" && i + 1 < args.length) {
+      localPath = args[++i]
+    } else if (args[i] === "--remote" && i + 1 < args.length) {
+      remotePath = args[++i]
+    }
+  }
+
+  if (!configPath && !configJson) {
+    console.error("Error: --config or --config-json is required")
+    process.exitCode = 1
+    return
+  }
+  if (!action || !localPath || !remotePath) {
+    console.error("Error: --action (upload/download/upload-folder/download-folder), --local, and --remote are required")
+    process.exitCode = 1
+    return
+  }
+
+  const debug = args.includes("--debug")
+  const client = createClient()
+  try {
+    await client.ensureDaemon({ debug })
+
+    let connectResp
+    if (configJson) {
+      connectResp = await client.connectHostJson(configJson)
+    } else {
+      connectResp = await client.connectHost(resolve(configPath!))
+    }
+
+    if (!connectResp.ok) {
+      console.error(`Connection failed: ${(connectResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    const { sessionId } = connectResp.data as any
+    const execResp = await client.exec(sessionId, "echo ok", 5000)
+    if (!execResp.ok) {
+      console.error(`Session validation failed: ${(execResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    console.error(`[ssh-exec] Connected, starting ${action}...`)
+
+    const result = await client.send(
+      createRequest("transfer", { sessionId, action, localPath, remotePath }),
+      300000,
+    )
+
+    if (result.ok) {
+      const data = result.data as any
+      console.log(JSON.stringify(data, null, 2))
+    } else {
+      console.error(`Transfer failed: ${(result as any).error}`)
+      process.exitCode = 1
+    }
+  } catch (err: any) {
+    console.error(`Error: ${err.message}`)
+    process.exitCode = 1
+  } finally {
+    client.disconnect()
+  }
+}
+
+export async function handleDaemonBgExec(args: string[]): Promise<void> {
+  let configPath: string | undefined
+  let configJson: string | undefined
+  let command: string | undefined
+  let subcommand = "start"
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--config" && i + 1 < args.length) {
+      configPath = args[++i]
+    } else if (args[i] === "--config-json" && i + 1 < args.length) {
+      configJson = args[++i]
+    } else if (args[i] === "--command" && i + 1 < args.length) {
+      command = args[++i]
+    } else if (args[i] === "--task-id" && i + 1 < args.length) {
+      command = args[++i]
+    } else if (args[i] === "--sub" && i + 1 < args.length) {
+      subcommand = args[++i]
+    }
+  }
+
+  if (!configPath && !configJson) {
+    console.error("Error: --config or --config-json is required")
+    process.exitCode = 1
+    return
+  }
+
+  const debug = args.includes("--debug")
+  const client = createClient()
+  try {
+    await client.ensureDaemon({ debug })
+
+    let connectResp
+    if (configJson) {
+      connectResp = await client.connectHostJson(configJson)
+    } else {
+      connectResp = await client.connectHost(resolve(configPath!))
+    }
+
+    if (!connectResp.ok) {
+      console.error(`Connection failed: ${(connectResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    const { sessionId } = connectResp.data as any
+
+    const result = await client.send(
+      createRequest("bgExec", { sessionId, subcommand, command, taskId: command }),
+      60000,
+    )
+
+    if (result.ok) {
+      console.log(JSON.stringify(result.data, null, 2))
+    } else {
+      console.error(`Error: ${(result as any).error}`)
+      process.exitCode = 1
+    }
+  } catch (err: any) {
+    console.error(`Error: ${err.message}`)
+    process.exitCode = 1
+  } finally {
+    client.disconnect()
+  }
+}
+
+async function main() {
+  checkDeps()
+  const args = process.argv.slice(2)
+  const hasDebug = args.includes("--debug")
+
+  // Parse config early if debug mode, to extract host for log filename
+  if (hasDebug) {
+    let host: string | undefined
+    let cmd: string | undefined
+    let label: string | undefined
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--config" && i + 1 < args.length) {
+        try {
+          const cfg = JSON.parse(readFileSync(args[i + 1], "utf-8"))
+          host = cfg.target?.host
+        } catch {}
+      }
+      if (args[i] === "--config-json" && i + 1 < args.length) {
+        try {
+          const cfg = JSON.parse(args[i + 1])
+          host = cfg.target?.host
+        } catch {}
+      }
+      if (args[i] === "--command" && i + 1 < args.length) {
+        cmd = args[i + 1]
+      }
+      if (args[i] === "--label" && i + 1 < args.length) {
+        label = args[++i]
+      }
+    }
+    // For daemon subcommands, use label or "daemon"; for direct mode, use host+command
+    if (args[0] === "daemon") {
+      enableDebug({ label: label ?? "daemon" })
+    } else {
+      enableDebug({ host, command: cmd })
+    }
+    log("main", "Debug mode enabled")
+  }
+
+  // Handle daemon subcommands (filter debug flags from args)
+  const cmdArgs = args.filter((a, i) => a !== "--debug" && a !== "--label" && args[i - 1] !== "--label")
+  if (cmdArgs[0] === "daemon") {
+    const sub = cmdArgs[1]
+    const remaining = cmdArgs.slice(2)
+
+    switch (sub) {
+      case "start": {
+        const extra = []
+        if (hasDebug) extra.push("--debug")
+        const lbl = args.find((a, i) => args[i - 1] === "--label")
+        if (lbl) extra.push("--label", lbl)
+        await handleDaemonStart([...remaining, ...extra])
+        return
+      }
+      case "stop":
+        await handleDaemonStop()
+        return
+      case "exec":
+        await handleDaemonExec(hasDebug ? [...remaining, "--debug"] : remaining)
+        return
+      case "sessions":
+        await handleDaemonSessions()
+        return
+      case "disconnect":
+        await handleDaemonDisconnect(remaining)
+        return
+      case "ping":
+        await handleDaemonPing()
+        return
+      case "transfer":
+        await handleDaemonTransfer(remaining)
+        return
+      case "bg-exec":
+      case "bgexec":
+        await handleDaemonBgExec(remaining)
+        return
+      default:
+        console.error(`Unknown daemon subcommand: ${sub ?? ""}`)
+        console.log("Available: start, stop, exec, sessions, disconnect, ping, transfer, bg-exec")
+        process.exit(1)
+    }
+  }
+
+  // Handle mcp subcommand
+  if (cmdArgs[0] === "mcp") {
+    const { spawn } = await import("child_process")
+    const __dirname = new URL(".", import.meta.url).pathname
+    const mcpScript = __dirname.replace(/cli\/?$/, "mcp-server.js")
+    const mcpArgs = cmdArgs.slice(1)
+    if (hasDebug) mcpArgs.push("--debug")
+    const child = spawn("node", [mcpScript, ...mcpArgs], {
+      stdio: "inherit",
+    })
+    child.on("exit", (code) => process.exit(code ?? 0))
+    return
+  }
+
+  // Original behavior: direct connection (no daemon)
+  const { configPath, configJson, command, shell } = parseArgs()
+
+  if (!configPath && !configJson) {
+    console.error("错误: 必须指定 --config <json 文件路径> 或 --config-json '<json 字符串>'")
+    process.exit(1)
+  }
+
+  let config: SshExecConfig
+  if (configJson) {
+    log("main", "Config: inline JSON")
+    config = loadConfigFromJson(configJson)
+  } else {
+    log("main", `Config: ${configPath}`)
+    config = loadConfig(configPath!)
+  }
+  log("main", `Loaded config: target=${config.target.host}, gateways=${(config.gateways ?? []).length}`)
+
+  if (shell) {
+    await interactiveShell(config)
+  } else if (command) {
+    await execCommand(config, command)
+  } else {
+    console.error("错误: 必须指定 --command <命令> 或 --shell")
+    process.exit(1)
+  }
+}
+
+main().catch((err) => {
+  logError("main", "fatal error", err)
+  printErrorAndLogPath(err.message)
+  process.exit(1)
+})

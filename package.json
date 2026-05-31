@@ -1,0 +1,31 @@
+{
+  "name": "ai-ssh-tool",
+  "version": "2.0.0",
+  "description": "SSH multi-hop tool for AI agents - MCP support, daemon, file transfer, background exec",
+  "type": "module",
+  "main": "./dist/gateway.js",
+  "bin": {
+    "ssh-exec": "./dist/cli/ssh-exec.js",
+    "ssh-daemon": "./dist/daemon.js",
+    "ssh-mcp": "./dist/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "setup": "npm install && npm run build",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test dist/__tests__/daemon.test.js dist/__tests__/daemon-lifecycle.test.js dist/__tests__/session-manager.test.js dist/__tests__/profile-manager.test.js dist/__tests__/remote-shell.test.js dist/__tests__/remote-fs.test.js dist/__tests__/remote-tools.test.js dist/__tests__/connection.test.js dist/__tests__/gateway.test.js",
+    "test:integration": "npm run build:test && node --test dist/__tests__/integration.test.js"
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0",
+    "uuid": "^11.1.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
