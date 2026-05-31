@@ -31,6 +31,7 @@ export type IPCRequest =
   | { id: string; action: "disconnect"; params: { sessionId: string } }
   | { id: string; action: "transfer"; params: { sessionId: string; action: string; localPath: string; remotePath: string } }
   | { id: string; action: "bgExec"; params: { sessionId: string; subcommand: string; command?: string; taskId?: string } }
+  | { id: string; action: "portForward"; params: { sessionId: string; subcommand: string; type?: string; bindAddr?: string; bindPort?: number; dstAddr?: string; dstPort?: number; forwardId?: string } }
   | { id: string; action: "list" }
   | { id: string; action: "ping" }
   | { id: string; action: "shutdown" }
@@ -81,7 +82,7 @@ export function createRequest(
   params?: Record<string, unknown>,
 ): IPCRequest {
   const id = randomUUID()
-  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec") {
+  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec" || action === "portForward") {
     return { id, action, params: params as any }
   }
   return { id, action } as IPCRequest

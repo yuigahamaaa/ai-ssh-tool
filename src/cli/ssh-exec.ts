@@ -400,6 +400,83 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
   }
 }
 
+export async function handleDaemonPortForward(args: string[]): Promise<void> {
+  let configPath: string | undefined
+  let configJson: string | undefined
+  let subcommand = "list"
+  let type = "local"
+  let bindAddr = "127.0.0.1"
+  let bindPort: number | undefined
+  let dstAddr: string | undefined
+  let dstPort: number | undefined
+  let forwardId: string | undefined
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--config" && i + 1 < args.length) {
+      configPath = args[++i]
+    } else if (args[i] === "--config-json" && i + 1 < args.length) {
+      configJson = args[++i]
+    } else if (args[i] === "--sub" && i + 1 < args.length) {
+      subcommand = args[++i]
+    } else if (args[i] === "--type" && i + 1 < args.length) {
+      type = args[++i]
+    } else if (args[i] === "--bind-addr" && i + 1 < args.length) {
+      bindAddr = args[++i]
+    } else if (args[i] === "--bind-port" && i + 1 < args.length) {
+      bindPort = parseInt(args[++i])
+    } else if (args[i] === "--dst-addr" && i + 1 < args.length) {
+      dstAddr = args[++i]
+    } else if (args[i] === "--dst-port" && i + 1 < args.length) {
+      dstPort = parseInt(args[++i])
+    } else if (args[i] === "--forward-id" && i + 1 < args.length) {
+      forwardId = args[++i]
+    }
+  }
+
+  if (!configPath && !configJson) {
+    console.error("Error: --config or --config-json is required")
+    process.exitCode = 1
+    return
+  }
+
+  const debug = args.includes("--debug")
+  const client = createClient()
+  try {
+    await client.ensureDaemon({ debug })
+
+    let connectResp
+    if (configJson) {
+      connectResp = await client.connectHostJson(configJson)
+    } else {
+      connectResp = await client.connectHost(resolve(configPath!))
+    }
+
+    if (!connectResp.ok) {
+      console.error(`Connection failed: ${(connectResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    const { sessionId } = connectResp.data as any
+    const result = await client.send(
+      createRequest("portForward", { sessionId, subcommand, type, bindAddr, bindPort, dstAddr, dstPort, forwardId }),
+      30000,
+    )
+
+    if (result.ok) {
+      console.log(JSON.stringify(result.data, null, 2))
+    } else {
+      console.error(`Error: ${(result as any).error}`)
+      process.exitCode = 1
+    }
+  } catch (err: any) {
+    console.error(`Error: ${err.message}`)
+    process.exitCode = 1
+  } finally {
+    client.disconnect()
+  }
+}
+
 async function main() {
   checkDeps()
   const args = process.argv.slice(2)
@@ -476,9 +553,13 @@ async function main() {
       case "bgexec":
         await handleDaemonBgExec(remaining)
         return
+      case "port-forward":
+      case "fwd":
+        await handleDaemonPortForward(remaining)
+        return
       default:
         console.error(`Unknown daemon subcommand: ${sub ?? ""}`)
-        console.log("Available: start, stop, exec, sessions, disconnect, ping, transfer, bg-exec")
+        console.log("Available: start, stop, exec, sessions, disconnect, ping, transfer, bg-exec, port-forward")
         process.exit(1)
     }
   }

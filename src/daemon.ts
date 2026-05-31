@@ -18,6 +18,7 @@ import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
 import { BackgroundExecManager } from "./background-exec.js"
 import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "./file-transfer.js"
+import { PortForwardManager } from "./port-forwarding.js"
 import { enableDebug, log, logError } from "./logger.js"
 import {
   getPipePath,
@@ -49,6 +50,7 @@ export class SSHDaemon {
   private configCache = new Map<string, CachedConfig>() // path -> cached hash
   private startedAt = Date.now()
   private bgManager = new BackgroundExecManager()
+  private forwardManagers = new Map<string, PortForwardManager>()
 
   constructor(opts?: { pipePath?: string; idleTimeoutMs?: number }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
@@ -201,6 +203,10 @@ export class SSHDaemon {
 
       case "bgExec":
         resp = await this.handleBgExec(req)
+        break
+
+      case "portForward":
+        resp = await this.handlePortForward(req)
         break
 
       default:
@@ -462,6 +468,50 @@ export class SSHDaemon {
         }
         default:
           return { id: req.id, ok: false, error: `Unknown bgExec subcommand: ${subcommand}` }
+      }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private async handlePortForward(req: IPCRequest & { action: "portForward" }): Promise<IPCResponse> {
+    const { sessionId, subcommand, type, bindAddr, bindPort, dstAddr, dstPort, forwardId } = req.params
+    const connection = this.gateway.sessions.getConnection(sessionId)
+    if (!connection) {
+      return { id: req.id, ok: false, error: `Session ${sessionId} not found` }
+    }
+    const client = connection.getFinalClient()
+    try {
+      let manager = this.forwardManagers.get(sessionId)
+      if (!manager) {
+        manager = new PortForwardManager(client)
+        this.forwardManagers.set(sessionId, manager)
+      }
+      switch (subcommand) {
+        case "start": {
+          if (!bindAddr || !bindPort || !dstAddr || !dstPort) {
+            return { id: req.id, ok: false, error: "bindAddr, bindPort, dstAddr, dstPort are required" }
+          }
+          if (type === "local") {
+            const forward = await manager.localForward(bindAddr, bindPort, dstAddr, dstPort)
+            return { id: req.id, ok: true, data: forward }
+          } else if (type === "remote") {
+            const forward = await manager.remoteForward(bindAddr, bindPort, dstAddr, dstPort)
+            return { id: req.id, ok: true, data: forward }
+          }
+          return { id: req.id, ok: false, error: `Unknown forward type: ${type}` }
+        }
+        case "stop": {
+          if (!forwardId) return { id: req.id, ok: false, error: "forwardId is required" }
+          const stopped = await manager.stop(forwardId)
+          return { id: req.id, ok: true, data: { stopped } }
+        }
+        case "list": {
+          const forwards = manager.list()
+          return { id: req.id, ok: true, data: forwards }
+        }
+        default:
+          return { id: req.id, ok: false, error: `Unknown portForward subcommand: ${subcommand}` }
       }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }

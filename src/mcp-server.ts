@@ -19,6 +19,7 @@ import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
 import { BackgroundExecManager } from "./background-exec.js"
 import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "./file-transfer.js"
+import { PortForwardManager } from "./port-forwarding.js"
 import { enableDebug, log, logError } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
 
@@ -106,6 +107,7 @@ async function main() {
   if (!connection) throw new Error("Failed to establish SSH connection")
   const client = connection.getFinalClient()
 
+  const forwardManager = new PortForwardManager(client)
   log("mcp", `Connected to ${config.target.host}, session: ${session.id.slice(0, 8)}`)
 
   const server = new McpServer({
@@ -369,6 +371,59 @@ async function main() {
     async () => {
       const tasks = bgManager.list()
       return { content: [{ type: "text" as const, text: JSON.stringify(tasks) }] }
+    },
+  )
+
+  // --- Port forwarding ---
+  server.tool(
+    "local_forward",
+    "Start local port forwarding (like ssh -L). Maps a remote service to localhost. Useful for accessing remote databases, APIs, or web UIs that are only available on the internal network.",
+    {
+      local_port: z.number().describe("Local port to listen on"),
+      remote_host: z.string().describe("Remote host to connect to (e.g., 'db-server' or '127.0.0.1')"),
+      remote_port: z.number().describe("Remote port to connect to"),
+      local_addr: z.string().optional().describe("Local address to bind (default: 127.0.0.1)"),
+    },
+    async ({ local_port, remote_host, remote_port, local_addr }) => {
+      const forward = await forwardManager.localForward(local_addr ?? "127.0.0.1", local_port, remote_host, remote_port)
+      return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
+    },
+  )
+
+  server.tool(
+    "remote_forward",
+    "Start remote port forwarding (like ssh -R). Exposes a local service to the remote server. Useful for exposing local dev servers to remote machines.",
+    {
+      remote_port: z.number().describe("Port to listen on remote server"),
+      local_host: z.string().describe("Local host to forward to (e.g., '127.0.0.1')"),
+      local_port: z.number().describe("Local port to forward to"),
+      remote_addr: z.string().optional().describe("Remote address to bind (default: 127.0.0.1)"),
+    },
+    async ({ remote_port, local_host, local_port, remote_addr }) => {
+      const forward = await forwardManager.remoteForward(remote_addr ?? "127.0.0.1", remote_port, local_host, local_port)
+      return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
+    },
+  )
+
+  server.tool(
+    "stop_forward",
+    "Stop a port forward by its ID.",
+    {
+      forward_id: z.string().describe("Forward ID to stop"),
+    },
+    async ({ forward_id }) => {
+      const stopped = await forwardManager.stop(forward_id)
+      return { content: [{ type: "text" as const, text: stopped ? `Forward ${forward_id} stopped` : `Forward ${forward_id} not found` }] }
+    },
+  )
+
+  server.tool(
+    "list_forwards",
+    "List all active port forwards.",
+    {},
+    async () => {
+      const forwards = forwardManager.list()
+      return { content: [{ type: "text" as const, text: JSON.stringify(forwards) }] }
     },
   )
 

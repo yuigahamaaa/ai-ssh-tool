@@ -295,6 +295,12 @@ export class SSHConnection extends EventEmitter {
     if (host.auth.passphrase) {
       config.passphrase = host.auth.passphrase
     }
+    if (host.auth.agent) {
+      config.agent = host.auth.agent
+    }
+    if (host.auth.agentForward) {
+      config.agentForward = host.auth.agentForward
+    }
 
     return config
   }

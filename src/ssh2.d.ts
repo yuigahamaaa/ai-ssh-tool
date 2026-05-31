@@ -63,6 +63,9 @@ declare module "ssh2" {
     shell(window: { term?: string; cols?: number; rows?: number }, callback: (err: Error | undefined, channel: ClientChannel) => void): void
     exec(command: string, callback: (err: Error | undefined, stream: ClientChannel) => void): void
     forwardOut(srcIP: string, srcPort: number, dstIP: string, dstPort: number, callback: (err: Error | undefined, stream: any) => void): void
+    forwardIn(bindAddr: string, bindPort: number, callback: (err: Error | undefined) => void): void
+    unforwardIn(bindAddr: string, bindPort: number, callback: (err: Error | undefined) => void): void
+    on(event: "tcp connection", listener: (details: { srcIP: string; srcPort: number; dstIP: string; dstPort: number }, accept: () => any, reject: () => void) => void): this
     sftp(callback: (err: Error | undefined, sftp: SFTPWrapper) => void): void
     destroy(): void
     on(event: "ready", listener: () => void): this
