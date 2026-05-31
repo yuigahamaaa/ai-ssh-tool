@@ -98,8 +98,21 @@ node dist/mcp-server.js --config server.json
 node dist/cli/ssh-exec.js mcp --config server.json
 ```
 
-**Claude Desktop / Cursor config:**
+**Claude Desktop / Cursor / OpenCode config:**
 
+Claude Desktop / Cursor:
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "node",
+      "args": ["/path/to/ai-ssh-tool/dist/mcp-server.js", "--config", "/path/to/server.json"]
+    }
+  }
+}
+```
+
+OpenCode:
 ```json
 {
   "mcpServers": {
@@ -384,8 +397,21 @@ node dist/mcp-server.js --config server.json
 node dist/cli/ssh-exec.js mcp --config server.json
 ```
 
-**Claude Desktop / Cursor 配置示例：**
+**Claude Desktop / Cursor / OpenCode 配置示例：**
 
+Claude Desktop / Cursor:
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "node",
+      "args": ["/path/to/ai-ssh-tool/dist/mcp-server.js", "--config", "/path/to/server.json"]
+    }
+  }
+}
+```
+
+OpenCode:
 ```json
 {
   "mcpServers": {

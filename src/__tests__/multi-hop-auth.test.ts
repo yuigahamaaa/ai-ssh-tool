@@ -1,0 +1,238 @@
+import { describe, it, before, after } from "node:test"
+import assert from "node:assert/strict"
+import ssh2 from "ssh2"
+import { SSHConnection } from "../connection.js"
+import { remoteExec } from "../remote-shell.js"
+import type { SSHHostConfig } from "../types.js"
+
+const { Server, utils } = ssh2
+const hostKey = utils.generateKeyPairSync("ed25519")
+const userPrivateKey = utils.generateKeyPairSync("ed25519")
+
+function createTestServer(opts?: {
+  authMethods?: ("password" | "publickey")[]
+  enableForwarding?: boolean
+}): Promise<{
+  server: InstanceType<typeof Server>
+  port: number
+  cleanup: () => Promise<void>
+}> {
+  return new Promise((resolve, reject) => {
+    const allowedAuth = opts?.authMethods ?? ["password", "publickey"]
+    const server = new Server(
+      { hostKeys: [hostKey.private] },
+      (client: any) => {
+        client.on("authentication", (ctx: any) => {
+          if (allowedAuth.includes("password") && ctx.method === "password" && ctx.password === "testpass") {
+            ctx.accept()
+          } else if (allowedAuth.includes("publickey") && ctx.method === "publickey") {
+            ctx.accept()
+          } else {
+            ctx.reject()
+          }
+        })
+        client.on("ready", () => {
+          if (opts?.enableForwarding) {
+            client.on("tcpip", (accept: any, rejectConn: any) => { try { rejectConn?.() } catch {} })
+          }
+          client.on("session", (accept: any) => {
+            const session = accept()
+            session.on("pty", (accept: any) => { accept() })
+          session.on("window-change", (accept: any) => { if (accept) accept() })
+          session.on("shell", (accept: any) => { const s = accept(); s.on("close", () => {}) })
+          session.on("exec", (acceptExec: any) => {
+              const stream = acceptExec()
+              stream.write("ok\n")
+              stream.exit(0)
+              stream.close()
+            })
+          })
+        })
+      },
+    )
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address()
+      if (!addr || typeof addr === "string") { reject(new Error("Failed")); return }
+      resolve({
+        server,
+        port: addr.port,
+        cleanup: () => new Promise<void>((res) => { server.close(() => setTimeout(res, 50)) }),
+      })
+    })
+    server.on("error", reject)
+  })
+}
+
+describe("Multi-hop Mixed Authentication", () => {
+  describe("1-hop: single auth method", () => {
+    it("password auth", async () => {
+      const srv = await createTestServer({ authMethods: ["password"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [{ id: "t1", name: "test-pw", host: "127.0.0.1", port: srv.port, auth: { username: "testuser", password: "testpass" } }],
+          timeout: 5000,
+        })
+        assert.equal(conn.isConnected(), true)
+        const result = await remoteExec(conn.getFinalClient(), "echo test", { timeout: 5000 })
+        assert.ok(result.stdout.includes("test"))
+        await conn.disconnect()
+      } finally { await srv.cleanup() }
+    })
+
+    it("publickey auth", async () => {
+      const srv = await createTestServer({ authMethods: ["publickey"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [{ id: "t1", name: "test-key", host: "127.0.0.1", port: srv.port, auth: { username: "testuser", privateKey: userPrivateKey.private } }],
+          timeout: 5000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await srv.cleanup() }
+    })
+  })
+
+  describe("2-hop: mixed auth methods", () => {
+    it("hop1: password, hop2: password", async () => {
+      const gw = await createTestServer({ authMethods: ["password"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["password"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw", name: "gateway", host: "127.0.0.1", port: gw.port, auth: { username: "u1", password: "testpass" } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u2", password: "testpass" } },
+          ],
+          timeout: 10000,
+        })
+        assert.equal(conn.isConnected(), true)
+        const result = await remoteExec(conn.getFinalClient(), "echo pw-pw", { timeout: 5000 })
+        assert.ok(result.stdout.includes("pw-pw"))
+        await conn.disconnect()
+      } finally { await gw.cleanup(); await target.cleanup() }
+    })
+
+    it("hop1: password, hop2: publickey", async () => {
+      const gw = await createTestServer({ authMethods: ["password"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["publickey"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw", name: "gateway", host: "127.0.0.1", port: gw.port, auth: { username: "u1", password: "testpass" } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u2", privateKey: userPrivateKey.private } },
+          ],
+          timeout: 10000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await gw.cleanup(); await target.cleanup() }
+    })
+
+    it("hop1: publickey, hop2: password", async () => {
+      const gw = await createTestServer({ authMethods: ["publickey"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["password"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw", name: "gateway", host: "127.0.0.1", port: gw.port, auth: { username: "u1", privateKey: userPrivateKey.private } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u2", password: "testpass" } },
+          ],
+          timeout: 10000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await gw.cleanup(); await target.cleanup() }
+    })
+
+    it("hop1: publickey, hop2: publickey", async () => {
+      const gw = await createTestServer({ authMethods: ["publickey"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["publickey"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw", name: "gateway", host: "127.0.0.1", port: gw.port, auth: { username: "u1", privateKey: userPrivateKey.private } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u2", privateKey: userPrivateKey.private } },
+          ],
+          timeout: 10000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await gw.cleanup(); await target.cleanup() }
+    })
+  })
+
+  describe("3-hop: mixed auth methods", () => {
+    it("pw -> pw -> key", async () => {
+      const gw1 = await createTestServer({ authMethods: ["password"], enableForwarding: true })
+      const gw2 = await createTestServer({ authMethods: ["password"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["publickey"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw1", name: "gw1", host: "127.0.0.1", port: gw1.port, auth: { username: "u1", password: "testpass" } },
+            { id: "gw2", name: "gw2", host: "127.0.0.1", port: gw2.port, auth: { username: "u2", password: "testpass" } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u3", privateKey: userPrivateKey.private } },
+          ],
+          timeout: 15000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await gw1.cleanup(); await gw2.cleanup(); await target.cleanup() }
+    })
+
+    it("key -> pw -> pw", async () => {
+      const gw1 = await createTestServer({ authMethods: ["publickey"], enableForwarding: true })
+      const gw2 = await createTestServer({ authMethods: ["password"], enableForwarding: true })
+      const target = await createTestServer({ authMethods: ["password"] })
+      try {
+        const conn = new SSHConnection()
+        await conn.connect({
+          chain: [
+            { id: "gw1", name: "gw1", host: "127.0.0.1", port: gw1.port, auth: { username: "u1", privateKey: userPrivateKey.private } },
+            { id: "gw2", name: "gw2", host: "127.0.0.1", port: gw2.port, auth: { username: "u2", password: "testpass" } },
+            { id: "t1", name: "target", host: "127.0.0.1", port: target.port, auth: { username: "u3", password: "testpass" } },
+          ],
+          timeout: 15000,
+        })
+        assert.equal(conn.isConnected(), true)
+        await conn.disconnect()
+      } finally { await gw1.cleanup(); await gw2.cleanup(); await target.cleanup() }
+    })
+  })
+
+  describe("authentication failures", () => {
+    it("wrong password on hop1 fails", async () => {
+      const srv = await createTestServer({ authMethods: ["password"] })
+      try {
+        const conn = new SSHConnection()
+        await assert.rejects(
+          () => conn.connect({
+            chain: [{ id: "t1", name: "test", host: "127.0.0.1", port: srv.port, auth: { username: "testuser", password: "wrong" } }],
+            timeout: 5000,
+          }),
+        )
+        assert.equal(conn.isConnected(), false)
+      } finally { await srv.cleanup() }
+    })
+
+    it("wrong auth method rejects", async () => {
+      const srv = await createTestServer({ authMethods: ["publickey"] })
+      try {
+        const conn = new SSHConnection()
+        await assert.rejects(
+          () => conn.connect({
+            chain: [{ id: "t1", name: "test", host: "127.0.0.1", port: srv.port, auth: { username: "testuser", password: "testpass" } }],
+            timeout: 5000,
+          }),
+        )
+        assert.equal(conn.isConnected(), false)
+      } finally { await srv.cleanup() }
+    })
+  })
+})
