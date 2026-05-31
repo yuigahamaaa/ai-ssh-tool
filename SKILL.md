@@ -226,22 +226,62 @@ npm install && npm run build
 
 ## 测试
 
+### 快速开始 - 日常开发使用
 ```bash
-npm test
+# 日常开发首选 - 快速单元测试（推荐）
+npm run test:fast
+
+# 需要时运行慢速测试
+npm run test:slow
+
+# 集成测试
+npm run test:integration
+
+# 性能测试
+npm run test:performance
+
+# 完整测试
+npm run test:all
 ```
 
-| 测试文件 | 覆盖模块 | 用例数 |
-|----------|----------|--------|
-| `daemon.test.ts` | IPC Protocol、Config Hash | 14 |
-| `session-manager.test.ts` | SSHSessionManager | 20 |
-| `remote-shell.test.ts` | remoteExec、execOnChain | 10 |
-| `profile-manager.test.ts` | ProfileManager CRUD | 18 |
-| `daemon-lifecycle.test.ts` | Daemon IPC 生命周期 | 6 |
-| `connection.test.ts` | SSHConnection | 13 |
-| `remote-fs.test.ts` | SFTP 文件操作 | 17 |
-| `remote-tools.test.ts` | RemoteTools 工具集 | 22 |
-| `gateway.test.ts` | SSHGateway 门面 | 17 |
-| **总计** | | **161** |
+### 测试分组说明 (2025-06-01 更新)
+| 命令 | 说明 | 适用场景 | 包含文件 |
+|------|------|----------|----------|
+| `npm run test:fast` | 快速单元测试 | 日常开发、CI、PR检查 | 18个核心测试 |
+| `npm run test:slow` | 慢速 IPC/daemon 测试 | 发布前验证 | `daemon-lifecycle.test.ts` |
+| `npm run test:integration` | 集成测试 | 冒烟测试、完整工作流 | `integration.test.ts` |
+| `npm run test:performance` | 性能测试 | 性能回归检查 | `performance.test.ts` |
+
+### 重要提示
+- **日常开发请使用 `npm run test:fast`**，避免被慢速测试阻塞
+- 完整测试审查报告详见：[TEST_REVIEW_20250601.md](./TEST_REVIEW_20250601.md)
+- 测试设计文档：[TEST_DESIGN.md](./TEST_DESIGN.md)
+
+### 所有测试文件清单
+| 测试文件 | 覆盖模块 | 用例数 | 类型 |
+|----------|----------|--------|------|
+| `daemon.test.ts` | IPC Protocol、Config Hash | 14 | 快速 |
+| `daemon-lifecycle.test.ts` | Daemon IPC 生命周期 | 8 | 慢速 |
+| `session-manager.test.ts` | SSHSessionManager | 20 | 快速 |
+| `profile-manager.test.ts` | ProfileManager CRUD | 18 | 快速 |
+| `remote-shell.test.ts` | remoteExec、execOnChain | 10 | 快速 |
+| `remote-fs.test.ts` | SFTP 文件操作 | 17 | 快速 |
+| `remote-tools.test.ts` | RemoteTools 工具集 | 22 | 快速 |
+| `connection.test.ts` | SSHConnection | 13 | 快速 |
+| `gateway.test.ts` | SSHGateway 门面 | 17 | 快速 |
+| `logger.test.ts` | 日志模块 | - | 快速 |
+| `multi-hop-auth.test.ts` | 多跳认证 | 10+ | 快速 |
+| `file-transfer.test.ts` | 文件传输 | 10+ | 快速 |
+| `background-exec.test.ts` | 后台执行 | 8+ | 快速 |
+| `port-forwarding.test.ts` | 端口转发 | 6+ | 快速 |
+| `error-handling.test.ts` | 错误处理 | 12+ | 快速 |
+| `mcp-server.test.ts` | MCP 工具集成 | 20+ | 快速 |
+| `session-reuse.test.ts` | Session 复用 | 10+ | 快速 |
+| `daemon-ipc.test.ts` | Daemon IPC 协议 | 20+ | 快速 |
+| `agent-auth.test.ts` | Agent 认证 | 10+ | 快速 |
+| `integration.test.ts` | 完整工作流集成 | 20+ | 集成 |
+| `performance.test.ts` | 性能基准测试 | 10+ | 性能 |
+| **总计** | | **~250+** | |
 
 ---
 
