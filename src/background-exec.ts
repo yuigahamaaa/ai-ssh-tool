@@ -49,6 +49,7 @@ export interface BackgroundTaskOptions {
 interface RunningTask {
   stream: ClientChannel
   task: BackgroundTask
+  client: Client
 }
 
 export class BackgroundExecManager {
@@ -77,8 +78,8 @@ export class BackgroundExecManager {
     }
 
     let wrappedCommand: string
-    if (detached) {
-      wrappedCommand = `echo $$; exec ${fullCommand}`
+    if (persistent || detached) {
+      wrappedCommand = `echo $$; exec setsid bash -c 'nohup ${fullCommand} </dev/null >/dev/null 2>&1 &' 2>/dev/null || exec bash -c 'nohup ${fullCommand} </dev/null >/dev/null 2>&1 &'`
     } else {
       wrappedCommand = `echo $$; exec ${fullCommand}`
     }
@@ -160,7 +161,7 @@ export class BackgroundExecManager {
           log("bg-exec", `[${id}] Stream error: ${streamErr.message}`)
         })
 
-        this.tasks.set(id, { stream, task })
+        this.tasks.set(id, { stream, task, client })
         resolve(task)
       })
     })
@@ -200,13 +201,27 @@ export class BackgroundExecManager {
     const signal = options?.signal ?? "TERM"
 
     if (entry.task.pid) {
-      const killCmd = `kill -${signal} ${entry.task.pid} 2>/dev/null`
+      const killCmd = `kill -${signal} ${entry.task.pid} 2>/dev/null; sleep 1; kill -0 ${entry.task.pid} 2>/dev/null && kill -KILL ${entry.task.pid} 2>/dev/null; true`
+      log("bg-exec", `[${id}] Cancelling PID ${entry.task.pid} with signal ${signal}`)
+      
       const stream = entry.stream
       try {
         stream.close()
       } catch {
         // ignore
       }
+      
+      setTimeout(() => {
+        entry.client.exec(killCmd, (err, killStream) => {
+          if (err) {
+            log("bg-exec", `[${id}] Failed to send kill signal: ${err.message}`)
+          } else {
+            killStream.on("close", () => {
+              log("bg-exec", `[${id}] Kill signal sent to PID ${entry.task.pid}`)
+            })
+          }
+        })
+      }, 100)
     }
 
     log("bg-exec", `[${id}] Cancelled (sent ${signal})`)

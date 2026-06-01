@@ -91,6 +91,57 @@ async function remotePathExists(client: Client, remotePath: string): Promise<boo
   }
 }
 
+/** Check if a remote path is a symbolic link */
+async function remoteIsSymlink(client: Client, remotePath: string): Promise<boolean> {
+  try {
+    const result = await remoteExec(client, `test -L ${JSON.stringify(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
+    return result.stdout.trim() === "YES"
+  } catch {
+    return false
+  }
+}
+
+/** Convert line endings in text */
+function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Buffer {
+  if (fromEol === toEol || fromEol === "binary" || toEol === "binary") {
+    return content
+  }
+  
+  const text = content.toString("utf-8")
+  let converted: string
+  
+  if (fromEol === "crlf" && toEol === "lf") {
+    converted = text.replace(/\r\n/g, "\n")
+  } else if (fromEol === "lf" && toEol === "crlf") {
+    converted = text.replace(/\n/g, "\r\n")
+  } else {
+    converted = text
+  }
+  
+  return Buffer.from(converted, "utf-8")
+}
+
+/** Detect line ending style in text */
+function detectLineEnding(content: Buffer): "lf" | "crlf" | "mixed" {
+  const text = content.toString("utf-8")
+  const crlfCount = (text.match(/\r\n/g) || []).length
+  const lfOnlyCount = (text.match(/[^\r]\n/g) || []).length
+  
+  if (crlfCount > 0 && lfOnlyCount > 0) return "mixed"
+  if (crlfCount > lfOnlyCount) return "crlf"
+  return "lf"
+}
+
+/** Convert encoding */
+function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncoding: string): Buffer {
+  if (fromEncoding === toEncoding as BufferEncoding) {
+    return content
+  }
+  
+  const text = content.toString(fromEncoding)
+  return Buffer.from(text, toEncoding as BufferEncoding)
+}
+
 /**
  * Upload a single file to remote server via SFTP streaming.
  * Uses streaming for large files - never loads entire file into memory.
@@ -107,6 +158,16 @@ export async function uploadFile(
 
   const statInfo = statSync(localPath)
   const totalSize = statInfo.size
+
+  if (options?.skipSymlinks && statInfo.isSymbolicLink()) {
+    log("transfer", `Skipping symbolic link: ${localPath}`)
+    return {
+      success: true,
+      path: remotePath,
+      size: 0,
+      duration: 0,
+    }
+  }
 
   const shouldUseStreaming = totalSize > fileSizeThreshold
 
@@ -182,7 +243,24 @@ async function uploadFileDirect(
   const totalSize = Number(statInfo.size)
 
   const fs = await import("fs")
-  const data = fs.readFileSync(localPath)
+  let data = fs.readFileSync(localPath)
+
+  if (options?.lineEnding || options?.encoding) {
+    let lineEnding = options.lineEnding ?? "auto"
+    let encoding = options.encoding ?? "auto"
+    
+    if (encoding !== "binary" && encoding !== "auto") {
+      data = convertEncoding(data, "utf-8", encoding)
+    }
+    
+    if (lineEnding === "auto") {
+      lineEnding = process.platform === "win32" ? "crlf" : "lf"
+    }
+    
+    if (lineEnding !== "binary") {
+      data = convertLineEndings(data, detectLineEnding(data), lineEnding)
+    }
+  }
 
   return new Promise((resolve, reject) => {
     client.sftp((err, sftp) => {
@@ -250,6 +328,21 @@ export function downloadFile(
         }
 
         const totalSize = Number(stats.size)
+        
+        if (options?.skipSymlinks) {
+          const isSymlink = await remoteIsSymlink(client, remotePath)
+          if (isSymlink) {
+            log("transfer", `Skipping symbolic link: ${remotePath}`)
+            sftp.end()
+            return resolve({
+              success: true,
+              path: localPath,
+              size: 0,
+              duration: 0,
+            })
+          }
+        }
+        
         const shouldUseStreaming = totalSize > fileSizeThreshold
 
         if (!shouldUseStreaming) {
@@ -359,8 +452,16 @@ export async function uploadFolder(
     // Step 2: Compress local folder using child_process (spawn for streaming)
     const { execSync } = await import("child_process")
     const parentDir = dirname(localPath)
+    
+    let tarOptions = ""
+    if (options?.skipSymlinks) {
+      tarOptions = "--no-recursion --ignore-failed-read"
+    } else if (options?.followSymlinks) {
+      tarOptions = "--dereference"
+    }
+    
     execSync(
-      `tar -czf ${JSON.stringify(tmpFile)} -C ${JSON.stringify(parentDir)} ${JSON.stringify(folderName)}`,
+      `tar -czf ${JSON.stringify(tmpFile)} ${tarOptions} -C ${JSON.stringify(parentDir)} ${JSON.stringify(folderName)}`,
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
@@ -432,7 +533,15 @@ export async function downloadFolder(
 
     // Step 2: Compress on remote
     const remoteParent = dirname(remotePath)
-    const compressCmd = `tar -czf ${JSON.stringify(remoteTmp)} -C ${JSON.stringify(remoteParent)} ${JSON.stringify(folderName)}`
+    
+    let tarOptions = ""
+    if (options?.skipSymlinks) {
+      tarOptions = "--no-recursion --ignore-failed-read"
+    } else if (options?.followSymlinks) {
+      tarOptions = "--dereference"
+    }
+    
+    const compressCmd = `tar -czf ${JSON.stringify(remoteTmp)} ${tarOptions} -C ${JSON.stringify(remoteParent)} ${JSON.stringify(folderName)}`
     await remoteExec(client, compressCmd, { timeout })
 
     // Get remote archive size
