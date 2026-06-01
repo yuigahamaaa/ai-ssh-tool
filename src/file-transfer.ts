@@ -143,13 +143,15 @@ function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncodi
   return Buffer.from(text, toEncoding as BufferEncoding)
 }
 
-/** Transform stream for encoding and line ending conversion */
+/** Transform stream for encoding and line ending conversion (true streaming) */
 class FileTransformStream extends Transform {
-  private buffer: Buffer = Buffer.alloc(0)
   private lineEnding?: "auto" | "lf" | "crlf" | "binary"
   private encoding?: "auto" | "utf8" | "gbk" | "latin1"
   private targetLineEnding?: "lf" | "crlf" | "binary"
   private targetEncoding?: "utf8" | "gbk" | "latin1"
+  private detectedSourceLineEnding: "lf" | "crlf" | null = null
+  private leftover: Buffer = Buffer.alloc(0)
+  private needsConversion: boolean
 
   constructor(options?: {
     lineEnding?: "auto" | "lf" | "crlf" | "binary"
@@ -167,26 +169,71 @@ class FileTransformStream extends Transform {
     if (this.encoding !== "auto") {
       this.targetEncoding = this.encoding as any
     }
+    
+    // Check if any conversion is needed
+    this.needsConversion = (
+      (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") ||
+      (this.targetLineEnding && this.targetLineEnding !== "binary")
+    )
   }
 
   _transform(chunk: Buffer, encoding: any, callback: any) {
-    this.buffer = Buffer.concat([this.buffer, chunk])
+    // If no conversion needed, just pass through (true streaming)
+    if (!this.needsConversion) {
+      this.push(chunk)
+      callback()
+      return
+    }
+    
+    // Add leftover from previous chunk and prepend to current chunk
+    let data = Buffer.concat([this.leftover, chunk])
+    this.leftover = Buffer.alloc(0)
+    
+    // Check for a trailing \r (could be start of \r\n across chunk boundary)
+    if (this.targetLineEnding && this.targetLineEnding !== "binary" && data.length > 0) {
+      if (data[data.length - 1] === 0x0d) { // 0x0d = '\r'
+        this.leftover = Buffer.from([0x0d])
+        data = data.slice(0, data.length - 1)
+      }
+    }
+    
+    let output = data
+    
+    // For line ending conversion, detect source line ending on first chunk
+    if (!this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
+      this.detectedSourceLineEnding = detectLineEnding(data)
+    }
+    
+    // Encoding conversion (if needed)
+    if (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") {
+      output = convertEncoding(output, "utf-8", this.targetEncoding)
+    }
+    
+    // Line ending conversion (if needed)
+    if (this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
+      output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
+    }
+    
+    this.push(output)
     callback()
   }
 
   _flush(callback: any) {
-    let data = this.buffer
-    
-    if (this.targetEncoding && this.targetEncoding !== "binary") {
-      data = convertEncoding(data, "utf-8", this.targetEncoding)
+    // Flush any remaining leftover
+    if (this.leftover.length > 0) {
+      let output = this.leftover
+      
+      // Apply conversions to leftover
+      if (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") {
+        output = convertEncoding(output, "utf-8", this.targetEncoding)
+      }
+      
+      if (this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
+        output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
+      }
+      
+      this.push(output)
     }
-    
-    if (this.targetLineEnding && this.targetLineEnding !== "binary") {
-      const detected = detectLineEnding(data)
-      data = convertLineEndings(data, detected, this.targetLineEnding)
-    }
-    
-    this.push(data)
     callback()
   }
 }
