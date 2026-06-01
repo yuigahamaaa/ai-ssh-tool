@@ -36,7 +36,7 @@ AI coding agents (Claude, Cursor, Copilot, etc.) need to work on remote servers 
 |---------|-------------|
 | **N-hop jump hosts** | Declarative JSON config, connect through any number of bastions |
 | **Daemon mode** | Background process keeps connections alive, commands execute instantly |
-| **MCP Server** | Standard Model Context Protocol — 17 tools for AI agents |
+| **MCP Server** | Standard Model Context Protocol — 21 tools for AI agents |
 | **File streaming** | Upload/download large files without loading into memory |
 | **Folder transfer** | Compress → transfer → decompress, fully automated |
 | **Background exec** | Detached commands with status polling and log streaming |
@@ -116,8 +116,15 @@ node dist/cli/ssh-exec.js --config server.json --command "df -h"
 # Inline JSON config
 node dist/cli/ssh-exec.js --config-json '{"target":{"host":"10.0.0.1","username":"root"}}' --command "uptime"
 
+# Use saved profile name
+node dist/cli/ssh-exec.js --profile-name my-server --command "uptime"
+
+# Use inline profile JSON
+node dist/cli/ssh-exec.js --profile-json '{"name":"my-server","chain":[{"name":"target","host":"10.0.0.1","port":22,"auth":{"username":"root","password":"pass"}}]}' --command "uptime"
+
 # Interactive shell
 node dist/cli/ssh-exec.js --config server.json --shell
+node dist/cli/ssh-exec.js --profile-name my-server --shell
 ```
 
 #### 2. Daemon — Persistent Connections (Recommended)
@@ -126,6 +133,9 @@ node dist/cli/ssh-exec.js --config server.json --shell
 # First call auto-starts daemon, subsequent calls reuse connection
 node dist/cli/ssh-exec.js daemon exec --config server.json --command "free -h"
 node dist/cli/ssh-exec.js daemon exec --config server.json --command "docker ps"
+
+# Or use profile
+node dist/cli/ssh-exec.js daemon exec --profile-name my-server --command "free -h"
 
 # Manage sessions
 node dist/cli/ssh-exec.js daemon sessions
@@ -208,26 +218,34 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
   --sub cancel --task-id <taskId>
 ```
 
-### MCP Tools (17 total)
+### MCP Tools (21 total)
 
 | Category | Tool | Description |
 |----------|------|-------------|
-| Execution | `remote_exec` | Run shell command on remote server |
-| File Read | `remote_read_file` | Read file content |
-| File Write | `remote_write_file` | Write content to file |
-| Directory | `remote_list_dir` | List directory contents |
-| Check | `remote_exists` | Check if path exists |
-| Stats | `remote_stat` | Get file/dir stats |
-| Search | `remote_grep` | Search patterns in files |
-| Find | `remote_find` | Find files by name/type |
-| Upload | `upload_file` | Upload file via SFTP streaming |
-| Download | `download_file` | Download file via SFTP streaming |
-| Upload Dir | `upload_folder` | Upload folder (compress → transfer) |
-| Download Dir | `download_folder` | Download folder (transfer → decompress) |
-| Background | `exec_background` | Start detached command |
-| Status | `exec_status` | Get background task status and output |
-| Cancel | `exec_cancel` | Cancel running task |
-| List | `list_tasks` | List all background tasks |
+| Execution | `ssh_exec` | Run shell command on remote server |
+| File Read | `ssh_read_file` | Read file content |
+| File Write | `ssh_write_file` | Write content to file |
+| Directory | `ssh_list_dir` | List directory contents |
+| Check | `ssh_exists` | Check if path exists |
+| Stats | `ssh_stat` | Get file/dir stats |
+| Search | `ssh_grep` | Search patterns in files |
+| Find | `ssh_find` | Find files by name/type |
+| Upload | `ssh_upload_file` | Upload file via SFTP streaming |
+| Download | `ssh_download_file` | Download file via SFTP streaming |
+| Upload Dir | `ssh_upload_folder` | Upload folder (compress → transfer) |
+| Download Dir | `ssh_download_folder` | Download folder (transfer → decompress) |
+| Background | `ssh_exec_background` | Start detached command |
+| Status | `ssh_exec_status` | Get background task status and output |
+| Cancel | `ssh_exec_cancel` | Cancel running task |
+| List Tasks | `ssh_list_tasks` | List all background tasks |
+| Port Forward | `ssh_local_forward` | Local port forwarding (local:port -> remote:port |
+| Remote Forward | `ssh_remote_forward` | Remote port forwarding (remote:port -> local:port |
+| Stop Forward | `ssh_stop_forward` | Stop port forwarding by id |
+| List Forwards | `ssh_list_forwards` | List active port forwards |
+| Change Dir | `ssh_cd` | Change working directory on remote |
+| Profiles | `ssh_list_profiles` | List saved connection profiles |
+| Sessions | `ssh_list_sessions` | List active SSH sessions |
+| Disconnect | `ssh_disconnect` | Disconnect a session |
 
 ### Configuration
 
@@ -267,6 +285,8 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 |---------|-------------|
 | `--config <file>` | SSH config file path |
 | `--config-json '<JSON>'` | Inline JSON config |
+| `--profile-name <name>` | Use saved profile name |
+| `--profile-json '<JSON>'` | Inline profile JSON |
 | `--command "<cmd>"` | Command to execute |
 | `--shell` | Interactive shell |
 | `--debug` | Enable debug logging |
@@ -379,7 +399,7 @@ AI 编程助手（Claude、Cursor、Copilot 等）需要通过 SSH 操作远程�
 |------|------|
 | **N 级跳板机** | JSON 声明式配置，支持任意级跳转 |
 | **Daemon 持久化** | 后台进程保持连接，命令秒级执行 |
-| **MCP Server** | 标准 MCP 协议，17 个工具供 AI 调用 |
+| **MCP Server** | 标准 MCP 协议，21 个工具供 AI 调用 |
 | **流式文件传输** | 大文件上传/下载，不占内存 |
 | **文件夹传输** | 压缩 → 传输 → 解压，全自动 |
 | **后台执行** | detach 模式，支持状态查询和日志读取 |
@@ -461,8 +481,15 @@ node dist/cli/ssh-exec.js --config server.json --command "df -h"
 # 直接传 JSON（不需要配置文件）
 node dist/cli/ssh-exec.js --config-json '{"target":{"host":"10.0.0.1","username":"root"}}' --command "uptime"
 
+# 使用保存的配置
+node dist/cli/ssh-exec.js --profile-name my-server --command "uptime"
+
+# 使用直接传 profile JSON
+node dist/cli/ssh-exec.js --profile-json '{"name":"my-server","chain":[{"name":"target","host":"10.0.0.1","port":22,"auth":{"username":"root","password":"pass"}}]}' --command "uptime"
+
 # 交互式 shell
 node dist/cli/ssh-exec.js --config server.json --shell
+node dist/cli/ssh-exec.js --profile-name my-server --shell
 ```
 
 #### 2. Daemon 持久化模式（推荐）
@@ -553,26 +580,34 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
   --sub cancel --task-id <taskId>
 ```
 
-### MCP 工具列表（共 17 个）
+### MCP 工具列表（共 21 个）
 
 | 类别 | 工具名 | 说明 |
 |------|--------|------|
-| 执行 | `remote_exec` | 在远程服务器执行 shell 命令 |
-| 读文件 | `remote_read_file` | 读取远程文件内容 |
-| 写文件 | `remote_write_file` | 写入远程文件 |
-| 目录 | `remote_list_dir` | 列出目录内容 |
-| 检查 | `remote_exists` | 检查路径是否存在 |
-| 信息 | `remote_stat` | 获取文件/目录 stat 信息 |
-| 搜索 | `remote_grep` | 在远程文件中搜索正则 |
-| 查找 | `remote_find` | 按名称/类型查找文件 |
-| 上传 | `upload_file` | SFTP 流式上传文件 |
-| 下载 | `download_file` | SFTP 流式下载文件 |
-| 上传目录 | `upload_folder` | 文件夹压缩上传 |
-| 下载目录 | `download_folder` | 文件夹下载解压 |
-| 后台 | `exec_background` | 启动后台命令 |
-| 状态 | `exec_status` | 查询后台任务状态和输出 |
-| 取消 | `exec_cancel` | 取消运行中的任务 |
-| 列表 | `list_tasks` | 列出所有后台任务 |
+| 执行 | `ssh_exec` | 在远程服务器执行 shell 命令 |
+| 读文件 | `ssh_read_file` | 读取远程文件内容 |
+| 写文件 | `ssh_write_file` | 写入远程文件 |
+| 目录 | `ssh_list_dir` | 列出目录内容 |
+| 检查 | `ssh_exists` | 检查路径是否存在 |
+| 信息 | `ssh_stat` | 获取文件/目录 stat 信息 |
+| 搜索 | `ssh_grep` | 在远程文件中搜索正则 |
+| 查找 | `ssh_find` | 按名称/类型查找文件 |
+| 上传 | `ssh_upload_file` | SFTP 流式上传文件 |
+| 下载 | `ssh_download_file` | SFTP 流式下载文件 |
+| 上传目录 | `ssh_upload_folder` | 文件夹压缩上传 |
+| 下载目录 | `ssh_download_folder` | 文件夹下载解压 |
+| 后台 | `ssh_exec_background` | 启动后台命令 |
+| 状态 | `ssh_exec_status` | 查询后台任务状态和输出 |
+| 取消 | `ssh_exec_cancel` | 取消运行中的任务 |
+| 任务列表 | `ssh_list_tasks` | 列出所有后台任务 |
+| 端口转发 | `ssh_local_forward` | 本地端口转发（本地端口 → 远程端口） |
+| 远程转发 | `ssh_remote_forward` | 远程端口转发（远程端口 → 本地端口） |
+| 停止转发 | `ssh_stop_forward` | 按 id 停止端口转发 |
+| 转发列表 | `ssh_list_forwards` | 列出活跃的端口转发 |
+| 切换目录 | `ssh_cd` | 切换远程工作目录 |
+| 配置列表 | `ssh_list_profiles` | 列出保存的连接配置 |
+| 会话列表 | `ssh_list_sessions` | 列出活跃的 SSH 会话 |
+| 断开连接 | `ssh_disconnect` | 断开指定会话 |
 
 ### 配置说明
 
@@ -612,6 +647,8 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 |------|------|
 | `--config <文件>` | 配置文件路径 |
 | `--config-json '<JSON>'` | 直接传 JSON 配置 |
+| `--profile-name <名称>` | 使用保存的配置名称 |
+| `--profile-json '<JSON>'` | 直接传 profile JSON |
 | `--command "<命令>"` | 要执行的命令 |
 | `--shell` | 交互式 shell |
 | `--debug` | 调试日志 |
