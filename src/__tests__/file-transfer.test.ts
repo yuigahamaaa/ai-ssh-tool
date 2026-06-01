@@ -5,7 +5,7 @@ import { join } from "path"
 import { tmpdir } from "os"
 import ssh2 from "ssh2"
 import { SSHConnection } from "../connection.js"
-import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "../file-transfer.js"
+import { uploadFile, downloadFile } from "../file-transfer.js"
 import type { TransferResult } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
