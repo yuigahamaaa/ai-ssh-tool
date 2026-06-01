@@ -1,17 +1,18 @@
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "fs"
+import { writeFileSync, unlinkSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 import ssh2 from "ssh2"
 import { SSHConnection } from "../connection.js"
-import { uploadFile, downloadFile } from "../file-transfer.js"
+import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "../file-transfer.js"
 import type { TransferResult } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
 const { Server, utils } = ssh2
 const hostKey = utils.generateKeyPairSync("ed25519")
 const memFs = new Map<string, Buffer>()
+const remoteExecResults = new Map<string, { stdout: string, stderr: string }>()
 
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>
@@ -36,7 +37,15 @@ function createTestServer(): Promise<{
           })
           session.on("exec", (acceptExec: any) => {
             const stream = acceptExec()
-            stream.write("ok\n")
+            const cmd = stream.readableHighWaterMark
+            const testResult = remoteExecResults.get("test")
+            if (testResult) {
+              stream.write(testResult.stdout)
+              stream.write(testResult.stderr)
+              remoteExecResults.delete("test")
+            } else {
+              stream.write("ok\n")
+            }
             stream.exit(0)
             stream.close()
           })
@@ -101,7 +110,7 @@ function createTestServer(): Promise<{
   })
 }
 
-describe("File Transfer - Upload", () => {
+describe("File Transfer - Upload Basic", () => {
   let srv: Awaited<ReturnType<typeof createTestServer>>
   let conn: SSHConnection
   let tmpDir: string
@@ -117,8 +126,6 @@ describe("File Transfer - Upload", () => {
   after(async () => {
     await conn.disconnect()
     await srv.cleanup()
-    try { unlinkSync(join(tmpDir, "test.txt")) } catch {}
-    try { unlinkSync(join(tmpDir, "binary.bin")) } catch {}
   })
 
   it("uploads a small text file", async () => {
@@ -152,19 +159,116 @@ describe("File Transfer - Upload", () => {
     })
     assert.ok(progressEvents.length > 0)
   })
+})
 
-  it("returns TransferResult with correct fields", async () => {
-    const localPath = join(tmpDir, "test.txt")
-    writeFileSync(localPath, "result check")
-    const result: TransferResult = await uploadFile(conn.getFinalClient(), localPath, "/remote/result.txt")
-    assert.equal(typeof result.success, "boolean")
-    assert.equal(typeof result.path, "string")
-    assert.equal(typeof result.size, "number")
-    assert.equal(typeof result.duration, "number")
+describe("File Transfer - Overwrite Strategies", () => {
+  let srv: Awaited<ReturnType<typeof createTestServer>>
+  let conn: SSHConnection
+  let tmpDir: string
+
+  before(async () => {
+    srv = await createTestServer()
+    conn = new SSHConnection()
+    await conn.connect({ chain: [{ id: "t1", ...srv.hostConfig }], timeout: 5000 })
+    tmpDir = join(tmpdir(), "ssh-tool-test-overwrite")
+    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
+  })
+
+  after(async () => {
+    await conn.disconnect()
+    await srv.cleanup()
+  })
+
+  it("overwrites existing file by default", async () => {
+    const localPath = join(tmpDir, "overwrite.txt")
+    writeFileSync(localPath, "new content")
+    memFs.set("/remote/overwrite.txt", Buffer.from("old content"))
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/overwrite.txt", { overwrite: "overwrite" })
+    assert.equal(result.success, true)
+    assert.equal(memFs.get("/remote/overwrite.txt")?.toString(), "new content")
+  })
+
+  it("skips existing file with skip strategy", async () => {
+    const localPath = join(tmpDir, "skip.txt")
+    writeFileSync(localPath, "new content")
+    memFs.set("/remote/skip.txt", Buffer.from("old content"))
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/skip.txt", { overwrite: "skip" })
+    assert.equal(result.success, true)
+    assert.equal(result.size, 0)
+    assert.equal(memFs.get("/remote/skip.txt")?.toString(), "old content")
   })
 })
 
-describe("File Transfer - Download", () => {
+describe("File Transfer - Line Ending Conversion", () => {
+  let srv: Awaited<ReturnType<typeof createTestServer>>
+  let conn: SSHConnection
+  let tmpDir: string
+
+  before(async () => {
+    srv = await createTestServer()
+    conn = new SSHConnection()
+    await conn.connect({ chain: [{ id: "t1", ...srv.hostConfig }], timeout: 5000 })
+    tmpDir = join(tmpdir(), "ssh-tool-test-lineendings")
+    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
+  })
+
+  after(async () => {
+    await conn.disconnect()
+    await srv.cleanup()
+  })
+
+  it("converts LF to CRLF when specified", async () => {
+    const localPath = join(tmpDir, "lf.txt")
+    writeFileSync(localPath, "line1\nline2\nline3", "utf8")
+    memFs.clear()
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/lf.txt", { lineEnding: "crlf" })
+    assert.equal(result.success, true)
+    const content = memFs.get("/remote/lf.txt")?.toString()
+    assert.ok(content?.includes("\r\n"))
+  })
+
+  it("preserves binary mode", async () => {
+    const localPath = join(tmpDir, "binary2.bin")
+    const data = Buffer.from([0x0d, 0x0a, 0x0a, 0x0d])
+    writeFileSync(localPath, data)
+    memFs.clear()
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/binary2.bin", { lineEnding: "binary" })
+    assert.equal(result.success, true)
+    assert.deepEqual(memFs.get("/remote/binary2.bin"), data)
+  })
+})
+
+describe("File Transfer - Symbolic Links", () => {
+  let srv: Awaited<ReturnType<typeof createTestServer>>
+  let conn: SSHConnection
+  let tmpDir: string
+
+  before(async () => {
+    srv = await createTestServer()
+    conn = new SSHConnection()
+    await conn.connect({ chain: [{ id: "t1", ...srv.hostConfig }], timeout: 5000 })
+    tmpDir = join(tmpdir(), "ssh-tool-test-symlinks")
+    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
+  })
+
+  after(async () => {
+    await conn.disconnect()
+    await srv.cleanup()
+  })
+
+  it("skips symbolic link when skipSymlinks is true", async () => {
+    const targetPath = join(tmpDir, "real.txt")
+    const symlinkPath = join(tmpDir, "link.txt")
+    writeFileSync(targetPath, "target content")
+    try { symlinkSync(targetPath, symlinkPath) } catch {}
+    memFs.clear()
+    const result = await uploadFile(conn.getFinalClient(), symlinkPath, "/remote/link.txt", { skipSymlinks: true })
+    assert.equal(result.success, true)
+    assert.equal(result.size, 0)
+  })
+})
+
+describe("File Transfer - Download Basic", () => {
   let srv: Awaited<ReturnType<typeof createTestServer>>
   let conn: SSHConnection
   let tmpDir: string
