@@ -35,6 +35,8 @@ import { createRequest } from "../ipc-protocol.js"
 import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "../file-transfer.js"
 import { BackgroundExecManager } from "../background-exec.js"
 import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
+import { ProfileManager } from "../profile-manager.js"
+import type { SSHProfile } from "../types.js"
 
 interface HostConfig {
   host: string
@@ -50,10 +52,20 @@ interface SshExecConfig {
   timeout?: number
 }
 
-function parseArgs(): { configPath?: string; configJson?: string; command?: string; shell: boolean; debug: boolean } {
+function parseArgs(): { 
+  configPath?: string; 
+  configJson?: string; 
+  profileName?: string; 
+  profileJson?: string;
+  command?: string; 
+  shell: boolean; 
+  debug: boolean 
+} {
   const args = process.argv.slice(2)
   let configPath: string | undefined
   let configJson: string | undefined
+  let profileName: string | undefined
+  let profileJson: string | undefined
   let command: string | undefined
   let shell = false
   let debug = false
@@ -63,6 +75,10 @@ function parseArgs(): { configPath?: string; configJson?: string; command?: stri
       configPath = args[++i]
     } else if (args[i] === "--config-json" && i + 1 < args.length) {
       configJson = args[++i]
+    } else if (args[i] === "--profile-name" && i + 1 < args.length) {
+      profileName = args[++i]
+    } else if (args[i] === "--profile-json" && i + 1 < args.length) {
+      profileJson = args[++i]
     } else if (args[i] === "--command" && i + 1 < args.length) {
       command = args[++i]
     } else if (args[i] === "--shell") {
@@ -73,35 +89,102 @@ function parseArgs(): { configPath?: string; configJson?: string; command?: stri
       console.log(`用法:
   ssh-exec [--debug] --config <json文件> --command <命令>       执行命令（单次连接）
   ssh-exec [--debug] --config-json '<json串>' --command <命令>  同上，但直接传 JSON
+  ssh-exec [--debug] --profile-name <profile名称> --command <命令>  使用保存的 profile 执行命令
+  ssh-exec [--debug] --profile-json '<json串>' --command <命令> 使用内联 profile JSON 执行命令
   ssh-exec [--debug] --config <json文件> --shell                交互式 shell
+  ssh-exec [--debug] --profile-name <profile名称> --shell       使用保存的 profile 启动交互式 shell
   ssh-exec daemon start                                         启动持久化 daemon
   ssh-exec daemon stop                                          停止 daemon
   ssh-exec daemon exec --config <json文件> --command <命令>      通过 daemon 执行（复用连接）
   ssh-exec daemon exec --config-json '<json串>' --command <命令> 同上，但直接传 JSON
+  ssh-exec daemon exec --profile-name <profile名称> --command <命令> 使用保存的 profile 通过 daemon 执行
+  ssh-exec daemon exec --profile-json '<json串>' --command <命令> 使用内联 profile JSON 通过 daemon 执行
   ssh-exec daemon sessions                                      查看活跃会话
   ssh-exec daemon disconnect <sessionId>                        断开指定会话
   ssh-exec daemon ping                                          检查 daemon 状态
 
---config <文件>       SSH 配置文件路径
---config-json <JSON>  直接传入 SSH 配置 JSON 字符串（和 --config 二选一）
---debug               开启调试日志
+配置方式 (任选其一):
+  --config <文件>           SSH 配置文件路径（旧格式）
+  --config-json <JSON>      直接传入 SSH 配置 JSON 字符串（旧格式）
+  --profile-name <名称>    使用保存的 profile（推荐，通过 MCP 或其他方式添加）
+  --profile-json <JSON>     直接传入完整的 SSHProfile JSON 字符串
+
+--debug                   开启调试日志
 
 持久化模式（daemon）:
   首次 exec 自动启动 daemon，后续命令复用已有 SSH 连接，无需重复握手。
   空闲 10 分钟后自动断开连接。
 
-配置格式:
+旧格式配置:
 {
   "gateways": [
     { "host": "跳板机", "port": 22, "username": "user", "password": "pass" }
   ],
   "target": { "host": "目标机", "port": 22, "username": "root", "password": "xxx" }
+}
+
+Profile 格式:
+{
+  "name": "my-server",
+  "chain": [
+    { "name": "jump", "host": "jump.example.com", "port": 22, "auth": { "username": "user", "password": "pass" } },
+    { "name": "target", "host": "target.example.com", "port": 22, "auth": { "username": "root", "password": "pass" } }
+  ],
+  "tags": ["production"]
 }`)
       process.exit(0)
     }
   }
 
-  return { configPath, configJson, command, shell, debug }
+  return { configPath, configJson, profileName, profileJson, command, shell, debug }
+}
+
+/**
+ * Convert a profile (or legacy config) to SshExecConfig
+ */
+function profileToLegacyConfig(profile: SSHProfile): SshExecConfig {
+  const chain = profile.chain
+  const target = chain[chain.length - 1]
+  const gateways = chain.slice(0, -1)
+  
+  return {
+    gateways: gateways.map(g => ({
+      host: g.host,
+      port: g.port,
+      username: g.auth.username,
+      password: g.auth.password,
+      privateKey: g.auth.privateKey
+    })),
+    target: {
+      host: target.host,
+      port: target.port,
+      username: target.auth.username,
+      password: target.auth.password,
+      privateKey: target.auth.privateKey
+    }
+  }
+}
+
+/**
+ * Load config from profile name
+ */
+function loadConfigFromProfileName(name: string): SshExecConfig {
+  const pm = new ProfileManager()
+  pm.load()
+  const profile = pm.getByName(name)
+  if (!profile) {
+    throw new Error(`Profile not found: ${name}`)
+  }
+  pm.markUsed(profile.id)
+  return profileToLegacyConfig(profile)
+}
+
+/**
+ * Load config from profile JSON string
+ */
+function loadConfigFromProfileJson(jsonStr: string): SshExecConfig {
+  const profile = JSON.parse(jsonStr) as SSHProfile
+  return profileToLegacyConfig(profile)
 }
 
 function loadConfigFromJson(jsonStr: string): SshExecConfig {
@@ -258,6 +341,8 @@ function createClient(): DaemonClient {
 export async function handleDaemonTransfer(args: string[]): Promise<void> {
   let configPath: string | undefined
   let configJson: string | undefined
+  let profileName: string | undefined
+  let profileJson: string | undefined
   let action: string | undefined
   let localPath: string | undefined
   let remotePath: string | undefined
@@ -267,6 +352,10 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
       configPath = args[++i]
     } else if (args[i] === "--config-json" && i + 1 < args.length) {
       configJson = args[++i]
+    } else if (args[i] === "--profile-name" && i + 1 < args.length) {
+      profileName = args[++i]
+    } else if (args[i] === "--profile-json" && i + 1 < args.length) {
+      profileJson = args[++i]
     } else if (args[i] === "--action" && i + 1 < args.length) {
       action = args[++i]
     } else if (args[i] === "--local" && i + 1 < args.length) {
@@ -276,8 +365,8 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
     }
   }
 
-  if (!configPath && !configJson) {
-    console.error("Error: --config or --config-json is required")
+  if (!configPath && !configJson && !profileName && !profileJson) {
+    console.error("Error: --config, --config-json, --profile-name, or --profile-json is required")
     process.exitCode = 1
     return
   }
@@ -295,6 +384,13 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
     let connectResp
     if (configJson) {
       connectResp = await client.connectHostJson(configJson)
+    } else if (profileJson) {
+      // 将 profile 转换为旧格式的 config json
+      const config = loadConfigFromProfileJson(profileJson)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
+    } else if (profileName) {
+      const config = loadConfigFromProfileName(profileName)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
     } else {
       connectResp = await client.connectHost(resolve(configPath!))
     }
@@ -338,6 +434,8 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
 export async function handleDaemonBgExec(args: string[]): Promise<void> {
   let configPath: string | undefined
   let configJson: string | undefined
+  let profileName: string | undefined
+  let profileJson: string | undefined
   let command: string | undefined
   let subcommand = "start"
 
@@ -346,6 +444,10 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
       configPath = args[++i]
     } else if (args[i] === "--config-json" && i + 1 < args.length) {
       configJson = args[++i]
+    } else if (args[i] === "--profile-name" && i + 1 < args.length) {
+      profileName = args[++i]
+    } else if (args[i] === "--profile-json" && i + 1 < args.length) {
+      profileJson = args[++i]
     } else if (args[i] === "--command" && i + 1 < args.length) {
       command = args[++i]
     } else if (args[i] === "--task-id" && i + 1 < args.length) {
@@ -355,8 +457,8 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
     }
   }
 
-  if (!configPath && !configJson) {
-    console.error("Error: --config or --config-json is required")
+  if (!configPath && !configJson && !profileName && !profileJson) {
+    console.error("Error: --config, --config-json, --profile-name, or --profile-json is required")
     process.exitCode = 1
     return
   }
@@ -369,6 +471,12 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
     let connectResp
     if (configJson) {
       connectResp = await client.connectHostJson(configJson)
+    } else if (profileJson) {
+      const config = loadConfigFromProfileJson(profileJson)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
+    } else if (profileName) {
+      const config = loadConfigFromProfileName(profileName)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
     } else {
       connectResp = await client.connectHost(resolve(configPath!))
     }
@@ -403,6 +511,8 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
 export async function handleDaemonPortForward(args: string[]): Promise<void> {
   let configPath: string | undefined
   let configJson: string | undefined
+  let profileName: string | undefined
+  let profileJson: string | undefined
   let subcommand = "list"
   let type = "local"
   let bindAddr = "127.0.0.1"
@@ -416,6 +526,10 @@ export async function handleDaemonPortForward(args: string[]): Promise<void> {
       configPath = args[++i]
     } else if (args[i] === "--config-json" && i + 1 < args.length) {
       configJson = args[++i]
+    } else if (args[i] === "--profile-name" && i + 1 < args.length) {
+      profileName = args[++i]
+    } else if (args[i] === "--profile-json" && i + 1 < args.length) {
+      profileJson = args[++i]
     } else if (args[i] === "--sub" && i + 1 < args.length) {
       subcommand = args[++i]
     } else if (args[i] === "--type" && i + 1 < args.length) {
@@ -433,8 +547,8 @@ export async function handleDaemonPortForward(args: string[]): Promise<void> {
     }
   }
 
-  if (!configPath && !configJson) {
-    console.error("Error: --config or --config-json is required")
+  if (!configPath && !configJson && !profileName && !profileJson) {
+    console.error("Error: --config, --config-json, --profile-name, or --profile-json is required")
     process.exitCode = 1
     return
   }
@@ -447,6 +561,12 @@ export async function handleDaemonPortForward(args: string[]): Promise<void> {
     let connectResp
     if (configJson) {
       connectResp = await client.connectHostJson(configJson)
+    } else if (profileJson) {
+      const config = loadConfigFromProfileJson(profileJson)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
+    } else if (profileName) {
+      const config = loadConfigFromProfileName(profileName)
+      connectResp = await client.connectHostJson(JSON.stringify(config))
     } else {
       connectResp = await client.connectHost(resolve(configPath!))
     }
@@ -579,15 +699,21 @@ async function main() {
   }
 
   // Original behavior: direct connection (no daemon)
-  const { configPath, configJson, command, shell } = parseArgs()
+  const { configPath, configJson, profileName, profileJson, command, shell } = parseArgs()
 
-  if (!configPath && !configJson) {
-    console.error("错误: 必须指定 --config <json 文件路径> 或 --config-json '<json 字符串>'")
+  if (!configPath && !configJson && !profileName && !profileJson) {
+    console.error("错误: 必须指定 --config <json 文件路径> 或 --config-json '<json 字符串>' 或 --profile-name <profile 名称> 或 --profile-json '<json 字符串>'")
     process.exit(1)
   }
 
   let config: SshExecConfig
-  if (configJson) {
+  if (profileName) {
+    log("main", `Config: profile name ${profileName}`)
+    config = loadConfigFromProfileName(profileName)
+  } else if (profileJson) {
+    log("main", "Config: profile inline JSON")
+    config = loadConfigFromProfileJson(profileJson)
+  } else if (configJson) {
     log("main", "Config: inline JSON")
     config = loadConfigFromJson(configJson)
   } else {

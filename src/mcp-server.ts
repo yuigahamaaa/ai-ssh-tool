@@ -8,6 +8,11 @@
  *   node mcp-server.js --config-json '<json>'
  *
  * Runs as a stdio-based MCP server for AI agents (Claude, etc.)
+ *
+ * Features:
+ * - Dynamic profile switching: each tool call can specify a profile
+ * - Session reuse: maintains connections for performance
+ * - All tools support profile parameter
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
@@ -20,8 +25,10 @@ import { remoteExec } from "./remote-shell.js"
 import { BackgroundExecManager } from "./background-exec.js"
 import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
+import { ProfileManager } from "./profile-manager.js"
 import { enableDebug, log, logError } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
+import type { SSHProfile, SSHHostConfig } from "./types.js"
 
 interface HostConfig {
   host: string
@@ -37,7 +44,7 @@ interface SshConfig {
   timeout?: number
 }
 
-function loadConfig(): SshConfig {
+function loadConfig(): SshConfig | null {
   const args = process.argv.slice(2)
   let configPath: string | undefined
   let configJson: string | undefined
@@ -69,46 +76,116 @@ function loadConfig(): SshConfig {
     return config
   }
 
-  throw new Error("Must provide --config <file> or --config-json '<json>'")
+  return null // No default config, require profile parameter
+}
+
+// Type for client cache entry
+interface ClientCacheEntry {
+  client: any
+  forwardManager: PortForwardManager
 }
 
 async function main() {
   checkDeps()
 
-  const config = loadConfig()
-  log("mcp", `Connecting to ${config.target.host}...`)
+  const initialConfig = loadConfig()
 
   const gw = new SSHGateway({
-    connectionTimeout: config.timeout ?? 15000,
-    maxSessions: 1,
+    connectionTimeout: initialConfig?.timeout ?? 15000,
+    maxSessions: 10, // Allow more concurrent sessions
   })
+
+  const profileManager = new ProfileManager()
+  profileManager.load()
 
   const bgManager = new BackgroundExecManager()
 
-  const jumpHosts = (config.gateways ?? []).map((g) => ({
-    host: g.host,
-    port: g.port ?? 22,
-    username: g.username,
-    password: g.password,
-    privateKey: g.privateKey,
-  }))
+  // Client cache: profile name -> { client, forwardManager }
+  const clientCache = new Map<string, ClientCacheEntry>()
 
-  const session = await gw.connectSimple({
-    host: config.target.host,
-    port: config.target.port ?? 22,
-    username: config.target.username,
-    password: config.target.password,
-    privateKey: config.target.privateKey,
-    jumpHosts,
-    name: `mcp-${config.target.host}`,
-  })
+  // Helper: Get or create SSH connection for a profile
+  async function getClientForProfile(
+    profileName: string | undefined,
+    profileJson: string | undefined,
+  ): Promise<{ client: any; forwardManager: PortForwardManager }> {
+    let profile: SSHProfile | undefined
 
-  const connection = gw.sessions.getConnection(session.id)
-  if (!connection) throw new Error("Failed to establish SSH connection")
-  const client = connection.getFinalClient()
+    if (profileName) {
+      profile = profileManager.getByName(profileName)
+      if (!profile) {
+        throw new Error(`Profile not found: ${profileName}`)
+      }
+      profileManager.markUsed(profile.id!)
+    } else if (profileJson) {
+      profile = JSON.parse(profileJson) as SSHProfile
+    } else if (initialConfig) {
+      profile = {
+        id: "default",
+        name: "default",
+        chain: [
+          ...(initialConfig.gateways || []).map((g: HostConfig) => ({
+            name: g.host,
+            host: g.host,
+            port: g.port ?? 22,
+            auth: {
+              username: g.username,
+              password: g.password,
+              privateKey: g.privateKey,
+            },
+          })),
+          {
+            name: initialConfig.target.host,
+            host: initialConfig.target.host,
+            port: initialConfig.target.port ?? 22,
+            auth: {
+              username: initialConfig.target.username,
+              password: initialConfig.target.password,
+              privateKey: initialConfig.target.privateKey,
+            },
+          },
+        ],
+      } as SSHProfile
+    } else {
+      throw new Error("Must provide either profile_name, profile_json, or initial config")
+    }
 
-  const forwardManager = new PortForwardManager(client)
-  log("mcp", `Connected to ${config.target.host}, session: ${session.id.slice(0, 8)}`)
+    const cacheKey = profileName || JSON.stringify(profile)
+
+    if (clientCache.has(cacheKey)) {
+      const cached = clientCache.get(cacheKey)!
+      return cached
+    }
+
+    const currentProfile = profile
+    const jumpHosts = currentProfile.chain.slice(0, -1).map((h) => ({
+      host: h.host,
+      port: h.port ?? 22,
+      username: h.auth.username,
+      password: h.auth.password,
+      privateKey: h.auth.privateKey,
+    }))
+
+    const targetHost = currentProfile.chain[currentProfile.chain.length - 1]
+    const session = await gw.connectSimple({
+      host: targetHost.host,
+      port: targetHost.port ?? 22,
+      username: targetHost.auth.username,
+      password: targetHost.auth.password,
+      privateKey: targetHost.auth.privateKey,
+      jumpHosts,
+      name: `mcp-${currentProfile.name}`,
+    })
+
+    const connection = gw.sessions.getConnection(session.id)
+    if (!connection) throw new Error("Failed to establish SSH connection")
+    const client = connection.getFinalClient()
+
+    const forwardManager = new PortForwardManager(client)
+    log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
+
+    clientCache.set(cacheKey, { client, forwardManager })
+    return { client, forwardManager }
+  }
 
   const server = new McpServer({
     name: "ssh-tool",
@@ -123,8 +200,11 @@ async function main() {
       command: z.string().describe("Shell command to execute"),
       cwd: z.string().optional().describe("Working directory"),
       timeout: z.number().optional().describe("Timeout in ms (default: 30000)"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ command, cwd, timeout }) => {
+    async ({ command, cwd, timeout, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await remoteExec(client, command, { timeout: timeout ?? 30000, cwd })
       return {
         content: [{
@@ -143,8 +223,11 @@ async function main() {
       path: z.string().describe("File path on remote server"),
       offset: z.number().optional().describe("Start line (0-based)"),
       limit: z.number().optional().describe("Max lines to read"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path, offset, limit }) => {
+    async ({ path, offset, limit, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await remoteExec(client, `cat ${JSON.stringify(path)}`, { timeout: 30000 })
       if (result.code !== 0) {
         return { content: [{ type: "text" as const, text: `Error reading file: ${result.stderr}` }] }
@@ -165,8 +248,11 @@ async function main() {
       path: z.string().describe("File path on remote server"),
       content: z.string().describe("Content to write"),
       mode: z.string().optional().describe("File permissions (octal string, e.g. '644')"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path, content, mode }) => {
+    async ({ path, content, mode, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const dirCmd = `mkdir -p ${JSON.stringify(path.replace(/\/[^\/]*$/, ""))}`
       await remoteExec(client, dirCmd, { timeout: 10000 })
       const b64 = Buffer.from(content).toString("base64")
@@ -187,8 +273,11 @@ async function main() {
     {
       path: z.string().describe("Directory path"),
       show_hidden: z.boolean().optional().describe("Show hidden files"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path, show_hidden }) => {
+    async ({ path, show_hidden, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const flag = show_hidden ? "-la" : "-l"
       const result = await remoteExec(client, `ls ${flag} ${JSON.stringify(path)}`, { timeout: 15000 })
       if (result.code !== 0) {
@@ -203,8 +292,11 @@ async function main() {
     "Check if a file or directory exists on the remote server.",
     {
       path: z.string().describe("Path to check"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path }) => {
+    async ({ path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await remoteExec(client, `test -e ${JSON.stringify(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
       return { content: [{ type: "text" as const, text: result.stdout.trim() }] }
     },
@@ -215,8 +307,11 @@ async function main() {
     "Get file/directory stats (size, permissions, timestamps) on the remote server.",
     {
       path: z.string().describe("Path to stat"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path }) => {
+    async ({ path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await remoteExec(client, `stat ${JSON.stringify(path)}`, { timeout: 10000 })
       if (result.code !== 0) {
         return { content: [{ type: "text" as const, text: `Error: ${result.stderr}` }] }
@@ -233,8 +328,11 @@ async function main() {
       path: z.string().describe("Directory or file to search"),
       glob: z.string().optional().describe("File glob pattern to filter"),
       case_insensitive: z.boolean().optional().describe("Case insensitive search"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ pattern, path, glob, case_insensitive }) => {
+    async ({ pattern, path, glob, case_insensitive, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       let cmd = "grep -rn"
       if (case_insensitive) cmd += "i"
       if (glob) cmd += ` --include=${JSON.stringify(glob)}`
@@ -252,8 +350,11 @@ async function main() {
       name: z.string().optional().describe("Filename pattern (glob)"),
       type: z.enum(["f", "d", "l"]).optional().describe("File type: f=file, d=directory, l=symlink"),
       max_depth: z.number().optional().describe("Maximum search depth"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ path, name, type, max_depth }) => {
+    async ({ path, name, type, max_depth, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       let cmd = `find ${JSON.stringify(path)}`
       if (max_depth) cmd += ` -maxdepth ${max_depth}`
       if (type) cmd += ` -type ${type}`
@@ -270,8 +371,11 @@ async function main() {
     {
       local_path: z.string().describe("Local file path to upload"),
       remote_path: z.string().describe("Destination path on remote server"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ local_path, remote_path }) => {
+    async ({ local_path, remote_path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await uploadFile(client, local_path, remote_path)
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -283,8 +387,11 @@ async function main() {
     {
       remote_path: z.string().describe("Remote file path to download"),
       local_path: z.string().describe("Local destination path"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ remote_path, local_path }) => {
+    async ({ remote_path, local_path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await downloadFile(client, remote_path, local_path)
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -297,8 +404,11 @@ async function main() {
       local_path: z.string().describe("Local folder path to upload"),
       remote_path: z.string().describe("Destination folder path on remote server"),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ local_path, remote_path, compression_level }) => {
+    async ({ local_path, remote_path, compression_level, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await uploadFolder(client, local_path, remote_path, { compressionLevel: compression_level })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -310,8 +420,11 @@ async function main() {
     {
       remote_path: z.string().describe("Remote folder path to download"),
       local_path: z.string().describe("Local destination folder path"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ remote_path, local_path }) => {
+    async ({ remote_path, local_path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const result = await downloadFolder(client, remote_path, local_path)
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -324,8 +437,11 @@ async function main() {
     {
       command: z.string().describe("Command to execute in background"),
       cwd: z.string().optional().describe("Working directory"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ command, cwd }) => {
+    async ({ command, cwd, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
       const task = await bgManager.start(client, command, { cwd })
       return { content: [{ type: "text" as const, text: JSON.stringify({ taskId: task.id, status: task.status, pid: task.pid, command: task.command }) }] }
     },
@@ -383,8 +499,11 @@ async function main() {
       remote_host: z.string().describe("Remote host to connect to (e.g., 'db-server' or '127.0.0.1')"),
       remote_port: z.number().describe("Remote port to connect to"),
       local_addr: z.string().optional().describe("Local address to bind (default: 127.0.0.1)"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ local_port, remote_host, remote_port, local_addr }) => {
+    async ({ local_port, remote_host, remote_port, local_addr, profile_name, profile_json }) => {
+      const { forwardManager } = await getClientForProfile(profile_name, profile_json)
       const forward = await forwardManager.localForward(local_addr ?? "127.0.0.1", local_port, remote_host, remote_port)
       return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
     },
@@ -398,8 +517,11 @@ async function main() {
       local_host: z.string().describe("Local host to forward to (e.g., '127.0.0.1')"),
       local_port: z.number().describe("Local port to forward to"),
       remote_addr: z.string().optional().describe("Remote address to bind (default: 127.0.0.1)"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ remote_port, local_host, local_port, remote_addr }) => {
+    async ({ remote_port, local_host, local_port, remote_addr, profile_name, profile_json }) => {
+      const { forwardManager } = await getClientForProfile(profile_name, profile_json)
       const forward = await forwardManager.remoteForward(remote_addr ?? "127.0.0.1", remote_port, local_host, local_port)
       return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
     },
@@ -410,8 +532,11 @@ async function main() {
     "Stop a port forward by its ID.",
     {
       forward_id: z.string().describe("Forward ID to stop"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ forward_id }) => {
+    async ({ forward_id, profile_name, profile_json }) => {
+      const { forwardManager } = await getClientForProfile(profile_name, profile_json)
       const stopped = await forwardManager.stop(forward_id)
       return { content: [{ type: "text" as const, text: stopped ? `Forward ${forward_id} stopped` : `Forward ${forward_id} not found` }] }
     },
@@ -420,10 +545,25 @@ async function main() {
   server.tool(
     "list_forwards",
     "List all active port forwards.",
-    {},
-    async () => {
+    {
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
+    },
+    async ({ profile_name, profile_json }) => {
+      const { forwardManager } = await getClientForProfile(profile_name, profile_json)
       const forwards = forwardManager.list()
       return { content: [{ type: "text" as const, text: JSON.stringify(forwards) }] }
+    },
+  )
+
+  // --- Profile management ---
+  server.tool(
+    "list_profiles",
+    "List all available SSH profiles.",
+    {},
+    async () => {
+      const profiles = profileManager.list()
+      return { content: [{ type: "text" as const, text: JSON.stringify(profiles) }] }
     },
   )
 

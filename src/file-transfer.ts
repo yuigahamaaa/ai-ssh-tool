@@ -13,9 +13,12 @@ import { createReadStream, createWriteStream, statSync, existsSync, mkdirSync, w
 import { basename, dirname, join } from "path"
 import { tmpdir } from "os"
 import { randomUUID } from "crypto"
-import { Transform } from "stream"
+import { Transform, pipeline } from "stream"
+import { promisify } from "util"
 import { remoteExec } from "./remote-shell.js"
 import { log } from "./logger.js"
+
+const pipelineAsync = promisify(pipeline)
 
 export interface TransferProgress {
   filename: string
@@ -103,7 +106,7 @@ async function remoteIsSymlink(client: Client, remotePath: string): Promise<bool
 }
 
 /** Convert line endings in text */
-function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Buffer {
+function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Buffer<ArrayBufferLike> {
   if (fromEol === toEol || fromEol === "binary" || toEol === "binary") {
     return content
   }
@@ -119,7 +122,7 @@ function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Bu
     converted = text
   }
   
-  return Buffer.from(converted, "utf-8")
+  const result = Buffer.alloc(converted.length * 2); result.write(converted, "utf-8"); return result.slice(0, result.length)
 }
 
 /** Detect line ending style in text */
@@ -134,13 +137,13 @@ function detectLineEnding(content: Buffer): "lf" | "crlf" | "mixed" {
 }
 
 /** Convert encoding */
-function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncoding: string): Buffer {
+function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncoding: string): Buffer<ArrayBufferLike> {
   if (fromEncoding === toEncoding as BufferEncoding) {
     return content
   }
   
   const text = content.toString(fromEncoding)
-  return Buffer.from(text, toEncoding as BufferEncoding)
+  const result2 = Buffer.alloc(text.length * 2); result2.write(text, toEncoding as BufferEncoding); return result2.slice(0, result2.length)
 }
 
 /** Transform stream for encoding and line ending conversion (true streaming) */
@@ -148,8 +151,8 @@ class FileTransformStream extends Transform {
   private lineEnding?: "auto" | "lf" | "crlf" | "binary"
   private encoding?: "auto" | "utf8" | "gbk" | "latin1"
   private targetLineEnding?: "lf" | "crlf" | "binary"
-  private targetEncoding?: "utf8" | "gbk" | "latin1"
-  private detectedSourceLineEnding: "lf" | "crlf" | null = null
+  private targetEncoding?: "utf8" | "gbk" | "latin1" | undefined
+  private detectedSourceLineEnding: "lf" | "crlf" | "mixed" | null = null
   private leftover: Buffer = Buffer.alloc(0)
   private needsConversion: boolean
 
@@ -166,15 +169,13 @@ class FileTransformStream extends Transform {
     } else {
       this.targetLineEnding = this.lineEnding
     }
-    if (this.encoding !== "auto") {
-      this.targetEncoding = this.encoding as any
+    if (this.encoding && this.encoding !== "auto") {
+      this.targetEncoding = this.encoding
     }
     
-    // Check if any conversion is needed
-    this.needsConversion = (
-      (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") ||
-      (this.targetLineEnding && this.targetLineEnding !== "binary")
-    )
+    const hasTargetEncoding = this.targetEncoding !== undefined && this.targetEncoding !== "utf8"
+    const hasTargetLineEnding = this.targetLineEnding !== undefined && this.targetLineEnding !== "binary"
+    this.needsConversion = Boolean(hasTargetEncoding || hasTargetLineEnding)
   }
 
   _transform(chunk: Buffer, encoding: any, callback: any) {
@@ -191,13 +192,13 @@ class FileTransformStream extends Transform {
     
     // Check for a trailing \r (could be start of \r\n across chunk boundary)
     if (this.targetLineEnding && this.targetLineEnding !== "binary" && data.length > 0) {
-      if (data[data.length - 1] === 0x0d) { // 0x0d = '\r'
+      if (data[data.length - 1] === 0x0d) {
         this.leftover = Buffer.from([0x0d])
         data = data.slice(0, data.length - 1)
       }
     }
     
-    let output = data
+    let output: Buffer<ArrayBufferLike> = data
     
     // For line ending conversion, detect source line ending on first chunk
     if (!this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
@@ -205,7 +206,7 @@ class FileTransformStream extends Transform {
     }
     
     // Encoding conversion (if needed)
-    if (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") {
+    if (this.targetEncoding && this.targetEncoding !== "utf8") {
       output = convertEncoding(output, "utf-8", this.targetEncoding)
     }
     
@@ -214,17 +215,17 @@ class FileTransformStream extends Transform {
       output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
     }
     
-    this.push(output)
+    this.push(output as unknown as Buffer)
     callback()
   }
 
   _flush(callback: any) {
     // Flush any remaining leftover
     if (this.leftover.length > 0) {
-      let output = this.leftover
+      let output: Buffer<ArrayBufferLike> = this.leftover
       
       // Apply conversions to leftover
-      if (this.targetEncoding && this.targetEncoding !== "binary" && this.targetEncoding !== "utf8") {
+      if (this.targetEncoding && this.targetEncoding !== "utf8") {
         output = convertEncoding(output, "utf-8", this.targetEncoding)
       }
       
@@ -232,7 +233,7 @@ class FileTransformStream extends Transform {
         output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
       }
       
-      this.push(output)
+      this.push(output as unknown as Buffer)
     }
     callback()
   }
@@ -328,36 +329,50 @@ export async function uploadFile(
     return uploadFileDirect(client, localPath, finalRemotePath, options, statInfo)
   }
 
+  // Use streaming with pipeline for better error handling
   return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
+    client.sftp(async (err, sftp) => {
       if (err) {
         reject(new Error(`Failed to open SFTP: ${err.message}`))
         return
       }
 
-      const readStream = createReadStream(localPath)
-      let transformStream: Transform | null = null
-      
-      if (options?.lineEnding || options?.encoding) {
-        transformStream = new FileTransformStream({
-          lineEnding: options.lineEnding,
-          encoding: options.encoding,
+      try {
+        const readStream = createReadStream(localPath)
+        let transformStream: Transform | null = null
+        
+        if (options?.lineEnding || options?.encoding) {
+          transformStream = new FileTransformStream({
+            lineEnding: options.lineEnding,
+            encoding: options.encoding,
+          })
+        }
+
+        const writeStream = sftp.createWriteStream(finalRemotePath, {
+          mode: options?.mode ?? statInfo.mode,
         })
-      }
 
-      const writeStream = sftp.createWriteStream(finalRemotePath, {
-        mode: options?.mode ?? statInfo.mode,
-      })
+        let transferred = 0
+        
+        // Track progress
+        readStream.on("data", (chunk: string | Buffer) => {
+          transferred += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length
+          if (options?.onProgress && totalSize > 0) {
+            options.onProgress({
+              filename: basename(localPath),
+              transferred,
+              total: totalSize,
+              percent: Math.round((transferred / totalSize) * 100),
+            })
+          }
+        })
 
-      let transferred = 0
+                if (transformStream) {
+          await pipelineAsync(readStream, transformStream, writeStream)
+        } else {
+          await pipelineAsync(readStream, writeStream)
+        }
 
-      writeStream.on("error", (streamErr: Error) => {
-        readStream.destroy()
-        if (transformStream) transformStream.destroy()
-        reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`))
-      })
-
-      writeStream.on("close", () => {
         sftp.end()
         const duration = Date.now() - startTime
         log("transfer", `Upload (streaming) complete: ${localPath} -> ${finalRemotePath} (${totalSize} bytes, ${duration}ms)`)
@@ -367,30 +382,9 @@ export async function uploadFile(
           size: totalSize,
           duration,
         })
-      })
-
-      readStream.on("data", (chunk: string | Buffer) => {
-        transferred += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length
-        if (options?.onProgress && totalSize > 0) {
-          options.onProgress({
-            filename: basename(localPath),
-            transferred,
-            total: totalSize,
-            percent: Math.round((transferred / totalSize) * 100),
-          })
-        }
-      })
-
-      readStream.on("error", (streamErr: Error) => {
-        writeStream.destroy()
-        if (transformStream) transformStream.destroy()
-        reject(new Error(`Failed to read local file ${localPath}: ${streamErr.message}`))
-      })
-
-      if (transformStream) {
-        readStream.pipe(transformStream).pipe(writeStream)
-      } else {
-        readStream.pipe(writeStream)
+      } catch (pipelineErr: any) {
+        sftp.end()
+        reject(new Error(`Upload failed for ${localPath}: ${pipelineErr.message}`))
       }
     })
   })
@@ -410,13 +404,13 @@ async function uploadFileDirect(
   const startTime = Date.now()
   const totalSize = Number(statInfo.size)
 
-  let data = readFileSync(localPath)
+  let data: Buffer<ArrayBufferLike> = readFileSync(localPath)
 
   if (options?.lineEnding || options?.encoding) {
     let lineEnding = options.lineEnding ?? "auto"
     let encoding = options.encoding ?? "auto"
     
-    if (encoding !== "binary" && encoding !== "auto") {
+    if (encoding !== "auto") {
       data = convertEncoding(data, "utf-8", encoding)
     }
     
@@ -516,15 +510,19 @@ export async function downloadFile(
         return
       }
 
-      sftp.stat(remotePath, async (statErr, stats) => {
-        if (statErr) {
-          sftp.end()
-          reject(new Error(`Failed to stat remote file ${remotePath}: ${statErr.message}`))
-          return
-        }
+      try {
+        const stats = await new Promise<{ size: number; mode?: number }>((resolve, reject) => {
+          sftp.stat(remotePath, (statErr, stats) => {
+            if (statErr) {
+              reject(new Error(`Failed to stat remote file ${remotePath}: ${statErr.message}`))
+            } else {
+              resolve(stats as any)
+            }
+          })
+        })
 
         const totalSize = Number(stats.size)
-        const remoteMode = (stats as any).mode ? ((stats as any).mode & 0o777) : 0o644
+        const remoteMode = stats.mode ? ((stats.mode as number) & 0o777) : 0o644
         
         if (options?.skipSymlinks) {
           const isSymlink = await remoteIsSymlink(client, remotePath)
@@ -543,54 +541,49 @@ export async function downloadFile(
         const shouldUseStreaming = totalSize > fileSizeThreshold
 
         if (!shouldUseStreaming) {
-          const readStream = sftp.createReadStream(remotePath)
+          // Direct download for small files
           const chunks: Buffer[] = []
-
-          readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
-
-          readStream.on("close", () => {
-            let data = Buffer.concat(chunks)
-            
-            if (options?.lineEnding || options?.encoding) {
-              let lineEnding = options.lineEnding ?? "auto"
-              let encoding = options.encoding ?? "auto"
-              
-              if (lineEnding === "auto") {
-                lineEnding = process.platform === "win32" ? "crlf" : "lf"
-              }
-              
-              if (encoding !== "binary" && encoding !== "auto") {
-                data = convertEncoding(data, "utf-8", encoding)
-              }
-              
-              if (lineEnding !== "binary") {
-                data = convertLineEndings(data, detectLineEnding(data), lineEnding)
-              }
-            }
-            
-            writeFileSync(localPath, data, { mode: options?.mode ?? remoteMode })
-            
-            sftp.end()
-            const duration = Date.now() - startTime
-            log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
-            resolve({
-              success: true,
-              path: localPath,
-              size: totalSize,
-              duration,
-            })
-          })
-
-          readStream.on("error", (streamErr: Error) => {
-            sftp.end()
-            reject(new Error(`Failed to read remote file ${remotePath}: ${streamErr.message}`))
+          const readStream = sftp.createReadStream(remotePath)
+          
+          await new Promise<void>((resolve, reject) => {
+            readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
+            readStream.on("close", resolve)
+            readStream.on("error", reject)
           })
           
-          return
+          let data: Buffer<ArrayBufferLike> = Buffer.concat(chunks)
+          
+          if (options?.lineEnding || options?.encoding) {
+            let lineEnding = options.lineEnding ?? "auto"
+            let encoding = options.encoding ?? "auto"
+            
+            if (lineEnding === "auto") {
+              lineEnding = process.platform === "win32" ? "crlf" : "lf"
+            }
+            
+            if (encoding !== "auto") {
+              data = convertEncoding(data, "utf-8", encoding)
+            }
+            
+            if (lineEnding !== "binary") {
+              data = convertLineEndings(data, detectLineEnding(data), lineEnding)
+            }
+          }
+          
+          writeFileSync(localPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
+          
+          sftp.end()
+          const duration = Date.now() - startTime
+          log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+          return resolve({
+            success: true,
+            path: localPath,
+            size: totalSize,
+            duration,
+          })
         }
 
-        let transferred = 0
-
+        // Streaming download with pipeline for large files
         const readStream = sftp.createReadStream(remotePath)
         let transformStream: Transform | null = null
         
@@ -605,25 +598,9 @@ export async function downloadFile(
           mode: options?.mode ?? remoteMode,
         })
 
-        writeStream.on("error", (streamErr: Error) => {
-          readStream.destroy()
-          if (transformStream) transformStream.destroy()
-          sftp.end()
-          reject(new Error(`Download write failed for ${localPath}: ${streamErr.message}`))
-        })
-
-        writeStream.on("close", () => {
-          sftp.end()
-          const duration = Date.now() - startTime
-          log("transfer", `Download (streaming) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
-          resolve({
-            success: true,
-            path: localPath,
-            size: totalSize,
-            duration,
-          })
-        })
-
+        let transferred = 0
+        
+        // Track progress
         readStream.on("data", (chunk: string | Buffer) => {
           transferred += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length
           if (options?.onProgress && totalSize > 0) {
@@ -636,19 +613,25 @@ export async function downloadFile(
           }
         })
 
-        readStream.on("error", (streamErr: Error) => {
-          writeStream.destroy()
-          if (transformStream) transformStream.destroy()
-          sftp.end()
-          reject(new Error(`Download read failed for ${remotePath}: ${streamErr.message}`))
-        })
-
-        if (transformStream) {
-          readStream.pipe(transformStream).pipe(writeStream)
+                if (transformStream) {
+          await pipelineAsync(readStream, transformStream, writeStream)
         } else {
-          readStream.pipe(writeStream)
+          await pipelineAsync(readStream, writeStream)
         }
-      })
+
+        sftp.end()
+        const duration = Date.now() - startTime
+        log("transfer", `Download (streaming) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+        resolve({
+          success: true,
+          path: localPath,
+          size: totalSize,
+          duration,
+        })
+      } catch (error: any) {
+        sftp.end()
+        reject(new Error(`Download failed: ${error.message}`))
+      }
     })
   })
 }
