@@ -194,7 +194,7 @@ async function main() {
 
   // --- Remote execution ---
   server.tool(
-    "remote_exec",
+    "ssh_exec",
     "Execute a shell command on the remote server. Returns stdout, stderr, and exit code.",
     {
       command: z.string().describe("Shell command to execute"),
@@ -217,7 +217,7 @@ async function main() {
 
   // --- File operations ---
   server.tool(
-    "remote_read_file",
+    "ssh_read_file",
     "Read a file from the remote server. Returns file content as text.",
     {
       path: z.string().describe("File path on remote server"),
@@ -242,7 +242,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_write_file",
+    "ssh_write_file",
     "Write content to a file on the remote server. Creates parent directories if needed.",
     {
       path: z.string().describe("File path on remote server"),
@@ -268,7 +268,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_list_dir",
+    "ssh_list_dir",
     "List files and directories on the remote server.",
     {
       path: z.string().describe("Directory path"),
@@ -288,7 +288,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_exists",
+    "ssh_exists",
     "Check if a file or directory exists on the remote server.",
     {
       path: z.string().describe("Path to check"),
@@ -303,7 +303,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_stat",
+    "ssh_stat",
     "Get file/directory stats (size, permissions, timestamps) on the remote server.",
     {
       path: z.string().describe("Path to stat"),
@@ -321,7 +321,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_grep",
+    "ssh_grep",
     "Search for patterns in files on the remote server using grep.",
     {
       pattern: z.string().describe("Search pattern (regex)"),
@@ -343,7 +343,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_find",
+    "ssh_find",
     "Find files and directories on the remote server.",
     {
       path: z.string().describe("Start directory"),
@@ -366,7 +366,7 @@ async function main() {
 
   // --- File transfer ---
   server.tool(
-    "upload_file",
+    "ssh_upload_file",
     "Upload a local file to the remote server via SFTP streaming. Supports large files.",
     {
       local_path: z.string().describe("Local file path to upload"),
@@ -382,7 +382,7 @@ async function main() {
   )
 
   server.tool(
-    "download_file",
+    "ssh_download_file",
     "Download a remote file to local machine via SFTP streaming. Supports large files.",
     {
       remote_path: z.string().describe("Remote file path to download"),
@@ -398,7 +398,7 @@ async function main() {
   )
 
   server.tool(
-    "upload_folder",
+    "ssh_upload_folder",
     "Upload a local folder to the remote server. Compresses locally, transfers, then decompresses on remote.",
     {
       local_path: z.string().describe("Local folder path to upload"),
@@ -415,7 +415,7 @@ async function main() {
   )
 
   server.tool(
-    "download_folder",
+    "ssh_download_folder",
     "Download a remote folder to local machine. Compresses on remote, transfers, then decompresses locally.",
     {
       remote_path: z.string().describe("Remote folder path to download"),
@@ -432,7 +432,7 @@ async function main() {
 
   // --- Background execution ---
   server.tool(
-    "exec_background",
+    "ssh_exec_background",
     "Start a command in the background on the remote server. Returns a task handle for status queries.",
     {
       command: z.string().describe("Command to execute in background"),
@@ -448,7 +448,7 @@ async function main() {
   )
 
   server.tool(
-    "exec_status",
+    "ssh_exec_status",
     "Get the status and output of a background task.",
     {
       task_id: z.string().describe("Task ID from exec_background"),
@@ -469,7 +469,7 @@ async function main() {
   )
 
   server.tool(
-    "exec_cancel",
+    "ssh_exec_cancel",
     "Cancel a running background task.",
     {
       task_id: z.string().describe("Task ID to cancel"),
@@ -481,7 +481,7 @@ async function main() {
   )
 
   server.tool(
-    "list_tasks",
+    "ssh_list_tasks",
     "List all background tasks and their statuses.",
     {},
     async () => {
@@ -492,7 +492,7 @@ async function main() {
 
   // --- Port forwarding ---
   server.tool(
-    "local_forward",
+    "ssh_local_forward",
     "Start local port forwarding (like ssh -L). Maps a remote service to localhost. Useful for accessing remote databases, APIs, or web UIs that are only available on the internal network.",
     {
       local_port: z.number().describe("Local port to listen on"),
@@ -510,7 +510,7 @@ async function main() {
   )
 
   server.tool(
-    "remote_forward",
+    "ssh_remote_forward",
     "Start remote port forwarding (like ssh -R). Exposes a local service to the remote server. Useful for exposing local dev servers to remote machines.",
     {
       remote_port: z.number().describe("Port to listen on remote server"),
@@ -528,7 +528,7 @@ async function main() {
   )
 
   server.tool(
-    "stop_forward",
+    "ssh_stop_forward",
     "Stop a port forward by its ID.",
     {
       forward_id: z.string().describe("Forward ID to stop"),
@@ -543,7 +543,7 @@ async function main() {
   )
 
   server.tool(
-    "list_forwards",
+    "ssh_list_forwards",
     "List all active port forwards.",
     {
       profile_name: z.string().optional().describe("Name of the SSH profile to use"),
@@ -558,12 +558,68 @@ async function main() {
 
   // --- Profile management ---
   server.tool(
-    "list_profiles",
+    "ssh_list_profiles",
     "List all available SSH profiles.",
     {},
     async () => {
       const profiles = profileManager.list()
       return { content: [{ type: "text" as const, text: JSON.stringify(profiles) }] }
+    },
+  )
+
+  // --- Session management ---
+  server.tool(
+    "ssh_list_sessions",
+    "List all active SSH sessions managed by this MCP server. Shows session ID, name, status, hops, and idle time.",
+    {},
+    async () => {
+      const sessions = gw.sessions.listSessions()
+      const sessionList = sessions.map((s: any) => ({
+        id: s.id,
+        name: s.name,
+        status: s.status,
+        hops: s.hops,
+        chainSummary: s.chainSummary,
+        createdAt: s.createdAt,
+        lastActivity: s.lastActivity,
+        idleSeconds: Math.floor((Date.now() - s.lastActivity) / 1000)
+      }))
+      return { content: [{ type: "text" as const, text: JSON.stringify(sessionList, null, 2) }] }
+    },
+  )
+
+  server.tool(
+    "ssh_disconnect",
+    "Disconnect a specific SSH session by its ID. Use ssh_list_sessions to find session IDs.",
+    {
+      session_id: z.string().describe("Session ID to disconnect"),
+    },
+    async ({ session_id }) => {
+      const session = gw.sessions.getSession(session_id)
+      if (!session) {
+        return { content: [{ type: "text" as const, text: `Session ${session_id} not found` }] }
+      }
+      await gw.sessions.disconnect(session_id)
+      return { content: [{ type: "text" as const, text: `Session ${session_id} disconnected` }] }
+    },
+  )
+
+  server.tool(
+    "ssh_cd",
+    "Change the working directory for subsequent commands. Creates the directory if it doesn't exist.",
+    {
+      path: z.string().describe("Directory path to change to"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
+    },
+    async ({ path, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
+      const mkdirResult = await remoteExec(client, `mkdir -p ${JSON.stringify(path)} && cd ${JSON.stringify(path)} && pwd`, { timeout: 10000 })
+      if (mkdirResult.code !== 0) {
+        return { content: [{ type: "text" as const, text: `Failed to change directory: ${mkdirResult.stderr}` }] }
+      }
+      const cwd = mkdirResult.stdout.trim()
+      return { content: [{ type: "text" as const, text: `Changed directory to: ${cwd}` }] }
     },
   )
 
