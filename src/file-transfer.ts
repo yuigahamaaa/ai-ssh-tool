@@ -9,10 +9,11 @@
  */
 
 import type { Client } from "ssh2"
-import { createReadStream, createWriteStream, statSync, existsSync, mkdirSync } from "fs"
-import { basename, dirname, join, resolve as pathResolve } from "path"
+import { createReadStream, createWriteStream, statSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs"
+import { basename, dirname, join } from "path"
 import { tmpdir } from "os"
 import { randomUUID } from "crypto"
+import { Transform } from "stream"
 import { remoteExec } from "./remote-shell.js"
 import { log } from "./logger.js"
 
@@ -142,6 +143,100 @@ function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncodi
   return Buffer.from(text, toEncoding as BufferEncoding)
 }
 
+/** Transform stream for encoding and line ending conversion */
+class FileTransformStream extends Transform {
+  private buffer: Buffer = Buffer.alloc(0)
+  private lineEnding?: "auto" | "lf" | "crlf" | "binary"
+  private encoding?: "auto" | "utf8" | "gbk" | "latin1"
+  private targetLineEnding?: "lf" | "crlf" | "binary"
+  private targetEncoding?: "utf8" | "gbk" | "latin1"
+
+  constructor(options?: {
+    lineEnding?: "auto" | "lf" | "crlf" | "binary"
+    encoding?: "auto" | "utf8" | "gbk" | "latin1"
+  }) {
+    super()
+    this.lineEnding = options?.lineEnding
+    this.encoding = options?.encoding
+    
+    if (this.lineEnding === "auto") {
+      this.targetLineEnding = process.platform === "win32" ? "crlf" : "lf"
+    } else {
+      this.targetLineEnding = this.lineEnding
+    }
+    if (this.encoding !== "auto") {
+      this.targetEncoding = this.encoding as any
+    }
+  }
+
+  _transform(chunk: Buffer, encoding: any, callback: any) {
+    this.buffer = Buffer.concat([this.buffer, chunk])
+    callback()
+  }
+
+  _flush(callback: any) {
+    let data = this.buffer
+    
+    if (this.targetEncoding && this.targetEncoding !== "binary") {
+      data = convertEncoding(data, "utf-8", this.targetEncoding)
+    }
+    
+    if (this.targetLineEnding && this.targetLineEnding !== "binary") {
+      const detected = detectLineEnding(data)
+      data = convertLineEndings(data, detected, this.targetLineEnding)
+    }
+    
+    this.push(data)
+    callback()
+  }
+}
+
+/** Check overwrite strategy and decide action */
+async function checkOverwrite(
+  client: Client,
+  remotePath: string,
+  options: FileTransferOptions | undefined
+): Promise<{ proceed: boolean; targetPath: string }> {
+  const exists = await remotePathExists(client, remotePath)
+  if (!exists) {
+    return { proceed: true, targetPath: remotePath }
+  }
+
+  const strategy = options?.overwrite ?? "overwrite"
+  
+  switch (strategy) {
+    case true:
+    case "overwrite":
+      return { proceed: true, targetPath: remotePath }
+    
+    case false:
+    case "skip":
+      log("transfer", `Skipping existing file: ${remotePath}`)
+      return { proceed: false, targetPath: remotePath }
+    
+    case "backup":
+      const backupPath = `${remotePath}.bak`
+      log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
+      await remoteExec(client, `mv ${JSON.stringify(remotePath)} ${JSON.stringify(backupPath)}`, { timeout: 5000 })
+      return { proceed: true, targetPath: remotePath }
+    
+    case "rename":
+      let counter = 1
+      let newPath: string
+      do {
+        newPath = `${remotePath}.${counter}`
+        counter++
+      } while (await remotePathExists(client, newPath))
+      log("transfer", `Renaming to avoid overwrite: ${remotePath} -> ${newPath}`)
+      return { proceed: true, targetPath: newPath }
+    
+    case "ask":
+    default:
+      log("transfer", `File exists, defaulting to overwrite: ${remotePath}`)
+      return { proceed: true, targetPath: remotePath }
+  }
+}
+
 /**
  * Upload a single file to remote server via SFTP streaming.
  * Uses streaming for large files - never loads entire file into memory.
@@ -169,10 +264,21 @@ export async function uploadFile(
     }
   }
 
+  const checkResult = await checkOverwrite(client, remotePath, options)
+  if (!checkResult.proceed) {
+    return {
+      success: true,
+      path: remotePath,
+      size: 0,
+      duration: Date.now() - startTime,
+    }
+  }
+  const finalRemotePath = checkResult.targetPath
+
   const shouldUseStreaming = totalSize > fileSizeThreshold
 
   if (!shouldUseStreaming) {
-    return uploadFileDirect(client, localPath, remotePath, options, statInfo)
+    return uploadFileDirect(client, localPath, finalRemotePath, options, statInfo)
   }
 
   return new Promise((resolve, reject) => {
@@ -183,7 +289,16 @@ export async function uploadFile(
       }
 
       const readStream = createReadStream(localPath)
-      const writeStream = sftp.createWriteStream(remotePath, {
+      let transformStream: Transform | null = null
+      
+      if (options?.lineEnding || options?.encoding) {
+        transformStream = new FileTransformStream({
+          lineEnding: options.lineEnding,
+          encoding: options.encoding,
+        })
+      }
+
+      const writeStream = sftp.createWriteStream(finalRemotePath, {
         mode: options?.mode ?? statInfo.mode,
       })
 
@@ -191,16 +306,17 @@ export async function uploadFile(
 
       writeStream.on("error", (streamErr: Error) => {
         readStream.destroy()
+        if (transformStream) transformStream.destroy()
         reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`))
       })
 
       writeStream.on("close", () => {
         sftp.end()
         const duration = Date.now() - startTime
-        log("transfer", `Upload (streaming) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
+        log("transfer", `Upload (streaming) complete: ${localPath} -> ${finalRemotePath} (${totalSize} bytes, ${duration}ms)`)
         resolve({
           success: true,
-          path: remotePath,
+          path: finalRemotePath,
           size: totalSize,
           duration,
         })
@@ -220,10 +336,15 @@ export async function uploadFile(
 
       readStream.on("error", (streamErr: Error) => {
         writeStream.destroy()
+        if (transformStream) transformStream.destroy()
         reject(new Error(`Failed to read local file ${localPath}: ${streamErr.message}`))
       })
 
-      readStream.pipe(writeStream)
+      if (transformStream) {
+        readStream.pipe(transformStream).pipe(writeStream)
+      } else {
+        readStream.pipe(writeStream)
+      }
     })
   })
 }
@@ -242,8 +363,7 @@ async function uploadFileDirect(
   const startTime = Date.now()
   const totalSize = Number(statInfo.size)
 
-  const fs = await import("fs")
-  let data = fs.readFileSync(localPath)
+  let data = readFileSync(localPath)
 
   if (options?.lineEnding || options?.encoding) {
     let lineEnding = options.lineEnding ?? "auto"
@@ -299,7 +419,7 @@ async function uploadFileDirect(
  * Download a single file from remote server via SFTP streaming.
  * Small files (< threshold) are downloaded directly for better performance.
  */
-export function downloadFile(
+export async function downloadFile(
   client: Client,
   remotePath: string,
   localPath: string,
@@ -308,19 +428,48 @@ export function downloadFile(
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
 
-  return new Promise((resolve, reject) => {
-    const dir = dirname(localPath)
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
-    }
+  const dir = dirname(localPath)
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+  }
 
-    client.sftp((err, sftp) => {
+  if (existsSync(localPath)) {
+    const strategy = options?.overwrite ?? "overwrite"
+    switch (strategy) {
+      case false:
+      case "skip":
+        log("transfer", `Skipping existing file: ${localPath}`)
+        return {
+          success: true,
+          path: localPath,
+          size: 0,
+          duration: Date.now() - startTime,
+        }
+      case "backup":
+        const backupPath = `${localPath}.bak`
+        log("transfer", `Backing up existing file: ${localPath} -> ${backupPath}`)
+        try {
+          if (existsSync(backupPath)) {
+            const { unlinkSync } = await import("fs")
+            unlinkSync(backupPath)
+          }
+          const { renameSync } = await import("fs")
+          renameSync(localPath, backupPath)
+        } catch (e) {
+          log("transfer", `Backup failed, skipping: ${(e as Error).message}`)
+        }
+        break
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    client.sftp(async (err, sftp) => {
       if (err) {
         reject(new Error(`Failed to open SFTP: ${err.message}`))
         return
       }
 
-      sftp.stat(remotePath, (statErr, stats) => {
+      sftp.stat(remotePath, async (statErr, stats) => {
         if (statErr) {
           sftp.end()
           reject(new Error(`Failed to stat remote file ${remotePath}: ${statErr.message}`))
@@ -328,6 +477,7 @@ export function downloadFile(
         }
 
         const totalSize = Number(stats.size)
+        const remoteMode = (stats as any).mode ? ((stats as any).mode & 0o777) : 0o644
         
         if (options?.skipSymlinks) {
           const isSymlink = await remoteIsSymlink(client, remotePath)
@@ -338,7 +488,7 @@ export function downloadFile(
               success: true,
               path: localPath,
               size: 0,
-              duration: 0,
+              duration: Date.now() - startTime,
             })
           }
         }
@@ -346,43 +496,71 @@ export function downloadFile(
         const shouldUseStreaming = totalSize > fileSizeThreshold
 
         if (!shouldUseStreaming) {
-          return new Promise((resolve, reject) => {
-            const readStream = sftp.createReadStream(remotePath)
-            const chunks: Buffer[] = []
+          const readStream = sftp.createReadStream(remotePath)
+          const chunks: Buffer[] = []
 
-            readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
+          readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
 
-            readStream.on("close", () => {
-              sftp.end()
-              const data = Buffer.concat(chunks)
-              const fs = require("fs")
-              fs.writeFileSync(localPath, data)
-              const duration = Date.now() - startTime
-              log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
-              resolve({
-                success: true,
-                path: localPath,
-                size: totalSize,
-                duration,
-              })
-            })
-
-            readStream.on("error", (err: Error) => {
-              sftp.end()
-              reject(new Error(`Failed to read remote file ${remotePath}: ${err.message}`))
+          readStream.on("close", () => {
+            let data = Buffer.concat(chunks)
+            
+            if (options?.lineEnding || options?.encoding) {
+              let lineEnding = options.lineEnding ?? "auto"
+              let encoding = options.encoding ?? "auto"
+              
+              if (lineEnding === "auto") {
+                lineEnding = process.platform === "win32" ? "crlf" : "lf"
+              }
+              
+              if (encoding !== "binary" && encoding !== "auto") {
+                data = convertEncoding(data, "utf-8", encoding)
+              }
+              
+              if (lineEnding !== "binary") {
+                data = convertLineEndings(data, detectLineEnding(data), lineEnding)
+              }
+            }
+            
+            writeFileSync(localPath, data, { mode: options?.mode ?? remoteMode })
+            
+            sftp.end()
+            const duration = Date.now() - startTime
+            log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+            resolve({
+              success: true,
+              path: localPath,
+              size: totalSize,
+              duration,
             })
           })
+
+          readStream.on("error", (streamErr: Error) => {
+            sftp.end()
+            reject(new Error(`Failed to read remote file ${remotePath}: ${streamErr.message}`))
+          })
+          
+          return
         }
 
         let transferred = 0
 
         const readStream = sftp.createReadStream(remotePath)
+        let transformStream: Transform | null = null
+        
+        if (options?.lineEnding || options?.encoding) {
+          transformStream = new FileTransformStream({
+            lineEnding: options.lineEnding,
+            encoding: options.encoding,
+          })
+        }
+
         const writeStream = createWriteStream(localPath, {
-          mode: options?.mode,
+          mode: options?.mode ?? remoteMode,
         })
 
         writeStream.on("error", (streamErr: Error) => {
           readStream.destroy()
+          if (transformStream) transformStream.destroy()
           sftp.end()
           reject(new Error(`Download write failed for ${localPath}: ${streamErr.message}`))
         })
@@ -413,11 +591,16 @@ export function downloadFile(
 
         readStream.on("error", (streamErr: Error) => {
           writeStream.destroy()
+          if (transformStream) transformStream.destroy()
           sftp.end()
           reject(new Error(`Download read failed for ${remotePath}: ${streamErr.message}`))
         })
 
-        readStream.pipe(writeStream)
+        if (transformStream) {
+          readStream.pipe(transformStream).pipe(writeStream)
+        } else {
+          readStream.pipe(writeStream)
+        }
       })
     })
   })
@@ -446,10 +629,8 @@ export async function uploadFolder(
   const remoteTmp = `/tmp/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
 
   try {
-    // Step 1: Create remote parent directory
     await remoteExec(client, `mkdir -p ${JSON.stringify(remotePath)}`, { timeout: 10000 })
 
-    // Step 2: Compress local folder using child_process (spawn for streaming)
     const { execSync } = await import("child_process")
     const parentDir = dirname(localPath)
     
@@ -468,7 +649,6 @@ export async function uploadFolder(
     const localStat = statSync(tmpFile)
     log("transfer", `Compressed ${localPath} -> ${tmpFile} (${localStat.size} bytes)`)
 
-    // Step 3: Upload compressed archive via streaming
     const uploadResult = await uploadFile(client, tmpFile, remoteTmp, {
       onProgress: options?.onProgress
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (uploading archive)` })
@@ -476,7 +656,6 @@ export async function uploadFolder(
       timeout,
     })
 
-    // Step 4: Extract on remote
     const extractCmd = `tar -xzf ${JSON.stringify(remoteTmp)} -C ${JSON.stringify(remotePath)} ${options?.overwrite ? "--overwrite" : ""} && rm -f ${JSON.stringify(remoteTmp)}`
     await remoteExec(client, extractCmd, { timeout })
 
@@ -497,12 +676,10 @@ export async function uploadFolder(
       error: err.message,
     }
   } finally {
-    // Cleanup local temp file
     try {
       const { unlinkSync } = await import("fs")
       if (existsSync(tmpFile)) unlinkSync(tmpFile)
     } catch {
-      // ignore
     }
   }
 }
@@ -525,13 +702,11 @@ export async function downloadFolder(
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
 
   try {
-    // Step 1: Verify remote path exists and is a directory
     const isDir = await remoteIsDir(client, remotePath)
     if (!isDir) {
       throw new Error(`Remote path is not a directory: ${remotePath}`)
     }
 
-    // Step 2: Compress on remote
     const remoteParent = dirname(remotePath)
     
     let tarOptions = ""
@@ -544,12 +719,10 @@ export async function downloadFolder(
     const compressCmd = `tar -czf ${JSON.stringify(remoteTmp)} ${tarOptions} -C ${JSON.stringify(remoteParent)} ${JSON.stringify(folderName)}`
     await remoteExec(client, compressCmd, { timeout })
 
-    // Get remote archive size
     const sizeResult = await remoteExec(client, `stat -c %s ${JSON.stringify(remoteTmp)} 2>/dev/null || wc -c < ${JSON.stringify(remoteTmp)}`, { timeout: 10000 })
     const remoteSize = parseInt(sizeResult.stdout.trim()) || 0
     log("transfer", `Compressed on remote: ${remotePath} -> ${remoteTmp} (${remoteSize} bytes)`)
 
-    // Step 3: Download compressed archive via streaming
     const downloadResult = await downloadFile(client, remoteTmp, tmpFile, {
       onProgress: options?.onProgress
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (downloading archive)` })
@@ -557,7 +730,6 @@ export async function downloadFolder(
       timeout,
     })
 
-    // Step 4: Extract locally
     if (!existsSync(localPath)) {
       mkdirSync(localPath, { recursive: true })
     }
@@ -567,7 +739,6 @@ export async function downloadFolder(
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
-    // Step 5: Cleanup remote temp file
     await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
 
     const duration = Date.now() - startTime
@@ -587,14 +758,15 @@ export async function downloadFolder(
       error: err.message,
     }
   } finally {
-    // Cleanup temp files
     try {
       const { unlinkSync } = await import("fs")
       if (existsSync(tmpFile)) unlinkSync(tmpFile)
     } catch {
-      // ignore
     }
-    await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
+    try {
+      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 })
+    } catch {
+    }
   }
 }
 
