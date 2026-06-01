@@ -4,6 +4,42 @@
 
 ---
 
+## 🔐 安全最佳实践（必读！）
+
+### ✅ 推荐方式：使用 SSH 私钥（最安全）
+
+**强烈推荐使用 SSH 密钥认证，而不是密码！**
+
+```json
+{
+  "target": {
+    "host": "192.168.1.100",
+    "username": "root",
+    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...你的私钥内容...\n-----END OPENSSH PRIVATE KEY-----"
+  }
+}
+```
+
+或者更好的方式：**直接读取本地私钥文件**（更安全，不用把私钥写在 JSON 里）
+
+### ⚠️ 密码使用注意事项
+
+如果你必须使用密码：
+1. **不要把配置文件提交到 Git！**
+2. **配置文件权限已设置为 600**（仅你可读写）
+3. ProfileManager 使用的 XOR 混淆**不是加密**，仅防止随手查看
+4. 生产环境建议使用 SSH Agent 或系统钥匙串
+
+### 🛡️ ProfileManager 的安全措施
+
+| 措施 | 说明 |
+|------|------|
+| 文件权限 | `profiles.json` 权限为 600（仅所有者可读） |
+| 目录权限 | `~/.opencode/ssh/` 权限为 700（仅所有者可访问） |
+| 密码混淆 | XOR 混淆（非加密，仅防随手看） |
+
+---
+
 ## 核心能力
 
 | 能力 | 说明 |
@@ -29,7 +65,19 @@ npm run build
 
 ## 配置
 
-### 最简配置（直连）
+### 🎯 方式一：使用 SSH 私钥（推荐，最安全）
+
+```json
+{
+  "target": {
+    "host": "192.168.1.100",
+    "username": "root",
+    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAACFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAgEAx...\n-----END OPENSSH PRIVATE KEY-----"
+  }
+}
+```
+
+### 🔑 方式二：使用密码（⚠️ 仅用于测试环境）
 
 ```json
 {
@@ -41,32 +89,46 @@ npm run build
 }
 ```
 
-### 通过跳板机连接
+**⚠️ 重要警告：**
+- 不要把包含密码的配置文件提交到 Git！
+- 在 `.gitignore` 中添加你的配置文件！
+- 生产环境必须使用 SSH 密钥！
+
+### 🚪 通过跳板机连接
 
 ```json
 {
   "gateways": [
-    { "host": "跳板机IP", "username": "用户", "password": "密码" }
+    {
+      "host": "bastion.company.com",
+      "port": 22,
+      "username": "ops",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...跳板机私钥...\n-----END OPENSSH PRIVATE KEY-----"
+    }
   ],
   "target": {
-    "host": "目标机IP",
-    "username": "用户",
-    "password": "密码"
+    "host": "10.0.0.50",
+    "username": "deploy",
+    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...目标机私钥...\n-----END OPENSSH PRIVATE KEY-----"
   }
 }
 ```
 
-### 全部字段
+### 📋 全部配置字段
 
 | 字段 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `target.host` | 是 | - | 服务器地址 |
+| `target.host` | 是 | - | 服务器地址（IP 或域名） |
 | `target.username` | 是 | - | 登录用户名 |
 | `target.password` | 否 | - | 密码（和 privateKey 二选一） |
+| `target.privateKey` | 否 | - | 私钥内容（推荐） |
 | `target.port` | 否 | 22 | SSH 端口 |
-| `target.privateKey` | 否 | - | 私钥内容 |
-| `gateways` | 否 | [] | 跳板机列表 |
-| `timeout` | 否 | 30000 | 超时时间（毫秒） |
+| `gateways` | 否 | [] | 跳板机列表（按连接顺序） |
+| `gateways[].host` | 是 | - | 跳板机地址 |
+| `gateways[].username` | 是 | - | 跳板机用户名 |
+| `gateways[].password` | 否 | - | 跳板机密码 |
+| `gateways[].privateKey` | 否 | - | 跳板机私钥 |
+| `timeout` | 否 | 30000 | 连接超时（毫秒） |
 
 ---
 

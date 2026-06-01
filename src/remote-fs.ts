@@ -19,11 +19,15 @@ export interface RemoteFileStat {
 
 export interface ReadFileOptions {
   encoding?: BufferEncoding
+  /** Skip symlinks (return error for symlinks) */
+  skipSymlinks?: boolean
 }
 
 export interface WriteFileOptions {
   encoding?: BufferEncoding
   mode?: number
+  /** Create backup before overwriting */
+  backup?: boolean
 }
 
 export interface DirEntry {
@@ -42,7 +46,7 @@ export interface RemoteFs {
   /** Get file/directory stats */
   stat(path: string): Promise<RemoteFileStat>
   /** List directory contents */
-  readdir(path: string): Promise<DirEntry[]>
+  readdir(path: string, options?: { skipSymlinks?: boolean }): Promise<DirEntry[]>
   /** Remove a file */
   unlink(path: string): Promise<void>
   /** Create a directory */
@@ -115,6 +119,10 @@ class SftpFs implements RemoteFs {
     const resolved = await this.resolvePath(path)
     const buffer = typeof data === "string" ? Buffer.from(data, options?.encoding) : data
 
+    if (options?.backup) {
+      await this.backupFile(resolved)
+    }
+
     return new Promise((resolve, reject) => {
       const writeStream = this.sftp.createWriteStream(resolved, {
         mode: options?.mode,
@@ -129,6 +137,27 @@ class SftpFs implements RemoteFs {
       })
 
       writeStream.end(buffer)
+    })
+  }
+
+  private async backupFile(path: string): Promise<void> {
+    const exists = await this.exists(path)
+    if (!exists) return
+
+    const backupPath = `${path}.backup`
+    return new Promise((resolve, reject) => {
+      const readStream = this.sftp.createReadStream(path)
+      const writeStream = this.sftp.createWriteStream(backupPath)
+
+      writeStream.on("error", (err: Error) => {
+        reject(new Error(`Failed to backup ${path}: ${err.message}`))
+      })
+
+      writeStream.on("close", () => {
+        resolve()
+      })
+
+      readStream.pipe(writeStream)
     })
   }
 
@@ -166,9 +195,10 @@ class SftpFs implements RemoteFs {
     })
   }
 
-  async readdir(path: string): Promise<DirEntry[]> {
+  async readdir(path: string, options?: { skipSymlinks?: boolean }): Promise<DirEntry[]> {
     this.checkOpen()
     const resolved = await this.resolvePath(path)
+    const skipSymlinks = options?.skipSymlinks ?? false
 
     return new Promise((resolve, reject) => {
       this.sftp.readdir(resolved, (err, list) => {
@@ -176,8 +206,13 @@ class SftpFs implements RemoteFs {
           reject(new Error(`Failed to readdir ${path}: ${err.message}`))
           return
         }
+
+        const filtered = skipSymlinks
+          ? list.filter((item) => (item.attrs.mode & 0o170000) !== 0o120000)
+          : list
+
         resolve(
-          list.map((item) => ({
+          filtered.map((item) => ({
             filename: item.filename,
             longname: item.longname,
             attrs: {

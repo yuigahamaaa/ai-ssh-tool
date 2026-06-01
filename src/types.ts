@@ -86,6 +86,8 @@ export interface ConnectionOptions {
   terminalSize?: TerminalSize
   /** Connection timeout in ms (per hop) */
   timeout?: number
+  /** Reuse existing session for same config hash (default: true) */
+  reuseSession?: boolean
 }
 
 /** Stored SSH profile (saved connection config) */

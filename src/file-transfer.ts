@@ -38,8 +38,20 @@ export interface FolderTransferOptions {
   /** Timeout for the entire operation in ms, default 5 minutes */
   timeout?: number
   /** Overwrite existing files on destination */
-  overwrite?: boolean
+  overwrite?: OverwriteStrategy
+  /** File size threshold for streaming vs direct read/write (default: 10MB) */
+  fileSizeThreshold?: number
+  /** Skip symbolic links */
+  skipSymlinks?: boolean
+  /** Follow symbolic links (resolve target) */
+  followSymlinks?: boolean
+  /** Line ending for text files: auto|lf|crlf|binary */
+  lineEnding?: "auto" | "lf" | "crlf" | "binary"
+  /** File encoding for text files: auto|utf8|gbk|latin1 */
+  encoding?: "auto" | "utf8" | "gbk" | "latin1"
 }
+
+export type OverwriteStrategy = boolean | "ask" | "skip" | "overwrite" | "rename" | "backup"
 
 export interface FileTransferOptions {
   onProgress?: (progress: TransferProgress) => void
@@ -47,6 +59,16 @@ export interface FileTransferOptions {
   mode?: number
   /** Timeout in ms, default 2 minutes */
   timeout?: number
+  /** Overwrite strategy */
+  overwrite?: OverwriteStrategy
+  /** File size threshold for streaming vs direct read/write (default: 10MB) */
+  fileSizeThreshold?: number
+  /** Skip symbolic links */
+  skipSymlinks?: boolean
+  /** Line ending for text files: auto|lf|crlf|binary */
+  lineEnding?: "auto" | "lf" | "crlf" | "binary"
+  /** File encoding for text files: auto|utf8|gbk|latin1 */
+  encoding?: "auto" | "utf8" | "gbk" | "latin1"
 }
 
 /** Check if a remote path is a directory */
@@ -72,19 +94,27 @@ async function remotePathExists(client: Client, remotePath: string): Promise<boo
 /**
  * Upload a single file to remote server via SFTP streaming.
  * Uses streaming for large files - never loads entire file into memory.
+ * Small files (< threshold) are read directly for better performance.
  */
-export function uploadFile(
+export async function uploadFile(
   client: Client,
   localPath: string,
   remotePath: string,
   options?: FileTransferOptions,
 ): Promise<TransferResult> {
   const startTime = Date.now()
+  const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
+
+  const statInfo = statSync(localPath)
+  const totalSize = statInfo.size
+
+  const shouldUseStreaming = totalSize > fileSizeThreshold
+
+  if (!shouldUseStreaming) {
+    return uploadFileDirect(client, localPath, remotePath, options, statInfo)
+  }
 
   return new Promise((resolve, reject) => {
-    const stat = statSync(localPath)
-    const totalSize = stat.size
-
     client.sftp((err, sftp) => {
       if (err) {
         reject(new Error(`Failed to open SFTP: ${err.message}`))
@@ -93,7 +123,7 @@ export function uploadFile(
 
       const readStream = createReadStream(localPath)
       const writeStream = sftp.createWriteStream(remotePath, {
-        mode: options?.mode ?? stat.mode,
+        mode: options?.mode ?? statInfo.mode,
       })
 
       let transferred = 0
@@ -106,7 +136,7 @@ export function uploadFile(
       writeStream.on("close", () => {
         sftp.end()
         const duration = Date.now() - startTime
-        log("transfer", `Upload complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
+        log("transfer", `Upload (streaming) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
         resolve({
           success: true,
           path: remotePath,
@@ -138,7 +168,58 @@ export function uploadFile(
 }
 
 /**
+ * Direct file upload for small files (< threshold)
+ * Reads entire file into memory for better performance on small files
+ */
+async function uploadFileDirect(
+  client: Client,
+  localPath: string,
+  remotePath: string,
+  options: FileTransferOptions | undefined,
+  statInfo: { size: number; mode: number },
+): Promise<TransferResult> {
+  const startTime = Date.now()
+  const totalSize = Number(statInfo.size)
+
+  const fs = await import("fs")
+  const data = fs.readFileSync(localPath)
+
+  return new Promise((resolve, reject) => {
+    client.sftp((err, sftp) => {
+      if (err) {
+        reject(new Error(`Failed to open SFTP: ${err.message}`))
+        return
+      }
+
+      const writeStream = sftp.createWriteStream(remotePath, {
+        mode: options?.mode ?? statInfo.mode,
+      })
+
+      writeStream.on("error", (streamErr: Error) => {
+        sftp.end()
+        reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`))
+      })
+
+      writeStream.on("close", () => {
+        sftp.end()
+        const duration = Date.now() - startTime
+        log("transfer", `Upload (direct) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
+        resolve({
+          success: true,
+          path: remotePath,
+          size: totalSize,
+          duration,
+        })
+      })
+
+      writeStream.end(data)
+    })
+  })
+}
+
+/**
  * Download a single file from remote server via SFTP streaming.
+ * Small files (< threshold) are downloaded directly for better performance.
  */
 export function downloadFile(
   client: Client,
@@ -147,6 +228,7 @@ export function downloadFile(
   options?: FileTransferOptions,
 ): Promise<TransferResult> {
   const startTime = Date.now()
+  const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
 
   return new Promise((resolve, reject) => {
     const dir = dirname(localPath)
@@ -167,7 +249,38 @@ export function downloadFile(
           return
         }
 
-        const totalSize = stats.size
+        const totalSize = Number(stats.size)
+        const shouldUseStreaming = totalSize > fileSizeThreshold
+
+        if (!shouldUseStreaming) {
+          return new Promise((resolve, reject) => {
+            const readStream = sftp.createReadStream(remotePath)
+            const chunks: Buffer[] = []
+
+            readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
+
+            readStream.on("close", () => {
+              sftp.end()
+              const data = Buffer.concat(chunks)
+              const fs = require("fs")
+              fs.writeFileSync(localPath, data)
+              const duration = Date.now() - startTime
+              log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+              resolve({
+                success: true,
+                path: localPath,
+                size: totalSize,
+                duration,
+              })
+            })
+
+            readStream.on("error", (err: Error) => {
+              sftp.end()
+              reject(new Error(`Failed to read remote file ${remotePath}: ${err.message}`))
+            })
+          })
+        }
+
         let transferred = 0
 
         const readStream = sftp.createReadStream(remotePath)
@@ -184,7 +297,7 @@ export function downloadFile(
         writeStream.on("close", () => {
           sftp.end()
           const duration = Date.now() - startTime
-          log("transfer", `Download complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+          log("transfer", `Download (streaming) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
           resolve({
             success: true,
             path: localPath,

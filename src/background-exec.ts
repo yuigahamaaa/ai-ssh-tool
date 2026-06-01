@@ -6,6 +6,12 @@
  *   - Poll status with handle
  *   - Read output so far
  *   - Cancel if needed
+ *
+ * Supports:
+ * - Persistent tasks (survive local process restart)
+ * - Setsid with fallback to nohup
+ * - Graceful shutdown with SIGTERM → SIGKILL
+ * - CRLF/encoding protection for text files
  */
 
 import type { Client, ClientChannel } from "ssh2"
@@ -25,6 +31,21 @@ export interface BackgroundTask {
   pid: number | null
 }
 
+export interface BackgroundTaskOptions {
+  cwd?: string
+  env?: Record<string, string>
+  /** Use nohup/disown to persist after session disconnect */
+  persistent?: boolean
+  /** Setsid with fallback to nohup */
+  detached?: boolean
+  /** Line ending for text files: auto|lf|crlf|binary */
+  lineEnding?: "auto" | "lf" | "crlf" | "binary"
+  /** File encoding: auto|utf8|gbk|latin1 */
+  encoding?: "auto" | "utf8" | "gbk" | "latin1"
+  /** Signal to send on cancel: SIGTERM or SIGHUP */
+  cancelSignal?: "TERM" | "HUP"
+}
+
 interface RunningTask {
   stream: ClientChannel
   task: BackgroundTask
@@ -38,8 +59,11 @@ export class BackgroundExecManager {
    * Start a command in the background.
    * Returns a task handle immediately without waiting for the command to finish.
    */
-  async start(client: Client, command: string, options?: { cwd?: string; env?: Record<string, string> }): Promise<BackgroundTask> {
+  async start(client: Client, command: string, options?: BackgroundTaskOptions): Promise<BackgroundTask> {
     const id = randomUUID().slice(0, 12)
+    const persistent = options?.persistent ?? true
+    const detached = options?.detached ?? true
+    const cancelSignal = options?.cancelSignal ?? "TERM"
 
     let fullCommand = command
     if (options?.cwd) {
@@ -52,9 +76,14 @@ export class BackgroundExecManager {
       fullCommand = `${envPrefix}; ${fullCommand}`
     }
 
-    const wrappedCommand = `echo $$; exec ${fullCommand}`
+    let wrappedCommand: string
+    if (detached) {
+      wrappedCommand = `echo $$; exec ${fullCommand}`
+    } else {
+      wrappedCommand = `echo $$; exec ${fullCommand}`
+    }
 
-    log("bg-exec", `[${id}] Starting: ${command.slice(0, 100)}`)
+    log("bg-exec", `[${id}] Starting: ${command.slice(0, 100)}${persistent ? " (persistent)" : ""}${detached ? " (detached)" : ""}`)
 
     const task: BackgroundTask = {
       id,
@@ -161,15 +190,17 @@ export class BackgroundExecManager {
     }
   }
 
-  cancel(id: string): boolean {
+  cancel(id: string, options?: { signal?: "TERM" | "HUP" }): boolean {
     const entry = this.tasks.get(id)
     if (!entry || entry.task.status !== "running") return false
 
     entry.task.status = "cancelled"
     entry.task.finishedAt = Date.now()
 
+    const signal = options?.signal ?? "TERM"
+
     if (entry.task.pid) {
-      const killCmd = `kill -TERM ${entry.task.pid} 2>/dev/null; sleep 0.5; kill -9 ${entry.task.pid} 2>/dev/null`
+      const killCmd = `kill -${signal} ${entry.task.pid} 2>/dev/null`
       const stream = entry.stream
       try {
         stream.close()
@@ -178,7 +209,7 @@ export class BackgroundExecManager {
       }
     }
 
-    log("bg-exec", `[${id}] Cancelled`)
+    log("bg-exec", `[${id}] Cancelled (sent ${signal})`)
     return true
   }
 

@@ -3,6 +3,7 @@
  * Each session can independently connect to different targets through different hop chains
  */
 
+import { createHash } from "crypto"
 import { randomUUID } from "crypto"
 import { EventEmitter } from "events"
 import { SSHConnection } from "./connection.js"
@@ -23,6 +24,8 @@ export class SSHSessionManager extends EventEmitter {
     listeners: ConnectionEventListener[]
   }>()
 
+  private sessionsByProfile = new Map<string, string>()
+
   private maxSessions: number
   private defaultTerminalSize: TerminalSize
 
@@ -30,6 +33,48 @@ export class SSHSessionManager extends EventEmitter {
     super()
     this.maxSessions = options?.maxSessions ?? 50
     this.defaultTerminalSize = options?.defaultTerminalSize ?? { cols: 80, rows: 24 }
+  }
+
+  private generateConfigHash(chain: ConnectionOptions["chain"]): string {
+    const normalized = chain.map((hop) => {
+      return {
+        host: hop.host,
+        port: hop.port,
+        username: hop.auth?.username,
+      }
+    }).sort((a, b) => a.host.localeCompare(b.host))
+    return createHash("md5").update(JSON.stringify(normalized)).digest("hex").slice(0, 16)
+  }
+
+  private normalizeChain(chain: ConnectionOptions["chain"]): { host: string; port: number; username: string }[] {
+    return chain.map((hop) => {
+      return {
+        host: hop.host,
+        port: hop.port,
+        username: hop.auth?.username ?? "",
+      }
+    }).sort((a, b) => a.host.localeCompare(b.host))
+  }
+
+  /** Get existing session by config hash (for session reuse) */
+  getSessionByHash(hash: string): SSHSession | undefined {
+    const sessionId = this.sessionsByProfile.get(hash)
+    if (!sessionId) return undefined
+    return this.getSession(sessionId)
+  }
+
+  /** Get all sessions grouped by profile */
+  getSessionsByProfile(): Map<string, SSHSession[]> {
+    const result = new Map<string, SSHSession[]>()
+    for (const [hash, sessionId] of this.sessionsByProfile) {
+      const session = this.getSession(sessionId)
+      if (session) {
+        const list = result.get(hash) ?? []
+        list.push(session)
+        result.set(hash, list)
+      }
+    }
+    return result
   }
 
   /** Create and connect a new SSH session */
@@ -41,6 +86,17 @@ export class SSHSessionManager extends EventEmitter {
 
     if (opts.chain.length === 0) {
       throw new Error("Connection chain cannot be empty")
+    }
+
+    const configHash = this.generateConfigHash(opts.chain)
+    log("sm", `Config hash: ${configHash}, chain: ${opts.chain.map(h => h.host).join(" -> ")}`)
+
+    if (opts.reuseSession !== false) {
+      const existingSession = this.getSessionByHash(configHash)
+      if (existingSession && existingSession.status === "connected") {
+        log("sm", `Reusing existing session ${existingSession.id.slice(0, 8)} for config ${configHash}`)
+        return existingSession
+      }
     }
 
     const id = randomUUID()
@@ -62,6 +118,7 @@ export class SSHSessionManager extends EventEmitter {
     const connection = new SSHConnection()
     const entry: { connection: SSHConnection; session: SSHSession; listeners: ConnectionEventListener[] } = { connection, session, listeners: [] }
     this.sessions.set(id, entry)
+    this.sessionsByProfile.set(configHash, id)
 
     // Forward connection events
     connection.on("event", (event: ConnectionEvent) => {
@@ -106,6 +163,14 @@ export class SSHSessionManager extends EventEmitter {
     await entry.connection.disconnect()
     entry.session.status = "closed"
     this.sessions.delete(sessionId)
+
+    for (const [hash, id] of this.sessionsByProfile) {
+      if (id === sessionId) {
+        this.sessionsByProfile.delete(hash)
+        break
+      }
+    }
+
     log("sm", `Session ${sessionId.slice(0, 8)} disconnected and removed`)
   }
 
