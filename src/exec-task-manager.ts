@@ -56,11 +56,11 @@ function getTaskFilePath(taskId: string): string {
 }
 
 function getHostIdentifier(client: Client): string {
-  const sock: any = client
-  if (sock._client && sock._client._config && sock._client._config.host) {
-    return sock._client._config.host
-  }
-  return "unknown"
+  const clientObj = client as Record<string, unknown>
+  const innerClient = clientObj._client as Record<string, unknown> | undefined
+  const config = innerClient?._config as Record<string, unknown> | undefined
+  const host = config?.host as string | undefined
+  return host ?? "unknown"
 }
 
 export class ExecTaskManager {
@@ -330,8 +330,17 @@ export class ExecTaskManager {
           setTimeout(() => {
             const currentTask = this.tasks.get(id)
             if (currentTask && currentTask.task.status === "running") {
-              this.cancel(id, client, "TERM")
-              this.finishTask(id, "timeout", 124, undefined)
+              const pid = currentTask.task.pid
+              if (pid && client) {
+                const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+                client.exec(killCmd, () => {})
+              }
+              if (currentTask.stream) {
+                try {
+                  currentTask.stream.close()
+                } catch {}
+              }
+              this.finishTask(id, "timeout", 124, "TERM")
               reject(new Error(`Command timed out after ${options.timeout}ms`))
             }
           }, options.timeout)

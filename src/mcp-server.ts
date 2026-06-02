@@ -487,15 +487,20 @@ async function main() {
     },
     async ({ profile_name, profile_json }) => {
       const entry = await getClientForProfile(profile_name, profile_json)
+      const clientObj = entry.client as Record<string, unknown>
+      const innerClient = clientObj._client as Record<string, unknown> | undefined
+      const config = innerClient?._config as Record<string, unknown> | undefined
+      const hostname = config?.host as string | undefined
+      
       const uptimeResult = await remoteExec(entry.client, "uptime", { timeout: 10000 })
       const memResult = await remoteExec(entry.client, "free -h", { timeout: 10000 })
       const procResult = await remoteExec(entry.client, "ps aux --no-headers | wc -l", { timeout: 10000 })
       const loadInfo = {
-        hostname: entry.client,
+        hostname: hostname ?? "unknown",
         uptime: uptimeResult.stdout.trim(),
         memory: memResult.stdout.trim(),
         processCount: procResult.stdout.trim(),
-        tasks: taskManager.list((entry.client as any)?._client?._config?.host || undefined),
+        tasks: taskManager.list(hostname),
       }
       return { content: [{ type: "text", text: JSON.stringify(loadInfo, null, 2) }] }
     },

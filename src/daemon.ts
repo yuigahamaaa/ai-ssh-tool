@@ -453,7 +453,7 @@ export class SSHDaemon {
         }
         case "cancel": {
           if (!taskId) return { id: req.id, ok: false, error: "taskId is required" }
-          const cancelled = this.bgManager.cancel(taskId)
+          const cancelled = this.bgManager.cancel(taskId, { client })
           return { id: req.id, ok: true, data: { cancelled } }
         }
         case "list": {

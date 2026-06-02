@@ -81,7 +81,11 @@ export class BackgroundExecManager {
     const taskManager = getGlobalTaskManager()
     const client = options?.client
     const signal = options?.signal ?? "TERM"
-    return taskManager.cancel(taskId, client!, signal)
+    if (!client) {
+      log("bg-exec", `Cannot cancel task ${taskId}: no client provided`)
+      return false
+    }
+    return taskManager.cancel(taskId, client, signal)
   }
 
   async wait(taskId: string, timeoutMs?: number): Promise<BackgroundTask> {
