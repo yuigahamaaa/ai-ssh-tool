@@ -113,11 +113,9 @@ describe("MCP Server Tools", () => {
   it("remote_stat works", async () => { ... })
   it("remote_grep works", async () => { ... })
   it("remote_find works", async () => { ... })
-  // 文件传输
-  it("upload_file works", async () => { ... })
-  it("download_file works", async () => { ... })
-  it("upload_folder works", async () => { ... })
-  it("download_folder works", async () => { ... })
+  // 文件传输（自动判断文件 / 文件夹）
+  it("upload works (auto-detect file vs folder)", async () => { ... })
+  it("download works (auto-detect file vs folder)", async () => { ... })
   // 后台执行
   it("exec_background works", async () => { ... })
   it("exec_status works", async () => { ... })

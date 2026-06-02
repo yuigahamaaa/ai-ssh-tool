@@ -32,7 +32,7 @@ import {
 } from "./daemon-commands.js"
 import { DaemonClient } from "../daemon-client.js"
 import { createRequest } from "../ipc-protocol.js"
-import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "../file-transfer.js"
+import { upload, download } from "../file-transfer.js"
 import { BackgroundExecManager } from "../background-exec.js"
 import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
 import { ProfileManager } from "../profile-manager.js"
@@ -371,7 +371,12 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
     return
   }
   if (!action || !localPath || !remotePath) {
-    console.error("Error: --action (upload/download/upload-folder/download-folder), --local, and --remote are required")
+    console.error("Error: --action (upload/download), --local, and --remote are required")
+    process.exitCode = 1
+    return
+  }
+  if (action !== "upload" && action !== "download") {
+    console.error(`Error: --action must be 'upload' or 'download' (got: ${action}). Path is auto-detected as file or folder.`)
     process.exitCode = 1
     return
   }

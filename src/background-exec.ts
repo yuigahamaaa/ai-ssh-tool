@@ -1,245 +1,103 @@
 /**
- * Background Exec - run remote commands in detached mode
+ * Background Exec - wrapper around ExecTaskManager for background-specific operations
  *
- * For long-running commands that the AI agent doesn't want to wait for:
- *   - Start command → get handle immediately
- *   - Poll status with handle
- *   - Read output so far
- *   - Cancel if needed
- *
- * Supports:
- * - Persistent tasks (survive local process restart)
- * - Setsid with fallback to nohup
- * - Graceful shutdown with SIGTERM → SIGKILL
- * - CRLF/encoding protection for text files
+ * This module provides backward compatibility and convenience methods
+ * for background execution tasks. The actual task management is handled
+ * by the unified ExecTaskManager.
  */
 
-import type { Client, ClientChannel } from "ssh2"
-import { randomUUID } from "crypto"
+import type { Client } from "ssh2"
+import { getGlobalTaskManager, type ExecTask, type TaskType } from "./exec-task-manager.js"
 import { log } from "./logger.js"
 
-export interface BackgroundTask {
-  id: string
-  command: string
-  status: "running" | "completed" | "failed" | "cancelled"
-  exitCode: number | null
-  signal: string | null
-  stdout: string
-  stderr: string
-  startedAt: number
-  finishedAt: number | null
-  pid: number | null
+export interface BackgroundTask extends ExecTask {
+  // Background-specific fields
 }
 
 export interface BackgroundTaskOptions {
   cwd?: string
   env?: Record<string, string>
-  /** Use nohup/disown to persist after session disconnect */
   persistent?: boolean
-  /** Setsid with fallback to nohup */
   detached?: boolean
-  /** Line ending for text files: auto|lf|crlf|binary */
   lineEnding?: "auto" | "lf" | "crlf" | "binary"
-  /** File encoding: auto|utf8|gbk|latin1 */
   encoding?: "auto" | "utf8" | "gbk" | "latin1"
-  /** Signal to send on cancel: SIGTERM or SIGHUP */
   cancelSignal?: "TERM" | "HUP"
 }
 
-interface RunningTask {
-  stream: ClientChannel
-  task: BackgroundTask
-  client: Client
-}
-
 export class BackgroundExecManager {
-  private tasks = new Map<string, RunningTask>()
-  private maxOutputBuffer = 10 * 1024 * 1024 // 10MB per task
+  private hostnameOverride: string | null = null
 
-  /**
-   * Start a command in the background.
-   * Returns a task handle immediately without waiting for the command to finish.
-   */
+  constructor(hostnameOverride?: string) {
+    if (hostnameOverride) {
+      this.hostnameOverride = hostnameOverride
+    }
+  }
+
   async start(client: Client, command: string, options?: BackgroundTaskOptions): Promise<BackgroundTask> {
-    const id = randomUUID().slice(0, 12)
-    const persistent = options?.persistent ?? true
-    const detached = options?.detached ?? true
-    const cancelSignal = options?.cancelSignal ?? "TERM"
+    const taskManager = getGlobalTaskManager()
+    const hostname = this.hostnameOverride || this.getHostIdentifier(client)
 
-    let fullCommand = command
-    if (options?.cwd) {
-      fullCommand = `cd ${JSON.stringify(options.cwd)} && ${fullCommand}`
-    }
-    if (options?.env) {
-      const envPrefix = Object.entries(options.env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(v)}`)
-        .join(" ")
-      fullCommand = `${envPrefix}; ${fullCommand}`
-    }
-
-    let wrappedCommand: string
-    if (persistent || detached) {
-      wrappedCommand = `echo $$; exec setsid bash -c 'nohup ${fullCommand} </dev/null >/dev/null 2>&1 &' 2>/dev/null || exec bash -c 'nohup ${fullCommand} </dev/null >/dev/null 2>&1 &'`
-    } else {
-      wrappedCommand = `echo $$; exec ${fullCommand}`
-    }
-
-    log("bg-exec", `[${id}] Starting: ${command.slice(0, 100)}${persistent ? " (persistent)" : ""}${detached ? " (detached)" : ""}`)
-
-    const task: BackgroundTask = {
-      id,
-      command,
-      status: "running",
-      exitCode: null,
-      signal: null,
-      stdout: "",
-      stderr: "",
-      startedAt: Date.now(),
-      finishedAt: null,
-      pid: null,
-    }
-
-    return new Promise((resolve, reject) => {
-      client.exec(wrappedCommand, (err, stream) => {
-        if (err) {
-          task.status = "failed"
-          task.finishedAt = Date.now()
-          log("bg-exec", `[${id}] exec() failed: ${err.message}`)
-          reject(new Error(`Failed to start background command: ${err.message}`))
-          return
-        }
-
-        let pidCaptured = false
-        let firstLine = ""
-
-        stream.on("data", (data: Buffer) => {
-          const text = data.toString()
-          if (!pidCaptured) {
-            firstLine += text
-            if (firstLine.includes("\n")) {
-              const pidStr = firstLine.split("\n")[0].trim()
-              const pid = parseInt(pidStr)
-              if (!isNaN(pid)) {
-                task.pid = pid
-                pidCaptured = true
-                const remaining = firstLine.slice(firstLine.indexOf("\n") + 1) + text.slice(firstLine.length)
-                if (remaining) {
-                  task.stdout += remaining
-                  this.trimBuffer(task, "stdout")
-                }
-              } else {
-                pidCaptured = true
-                task.stdout += firstLine
-                this.trimBuffer(task, "stdout")
-              }
-              firstLine = ""
-            }
-          } else {
-            task.stdout += text
-            this.trimBuffer(task, "stdout")
-          }
-        })
-
-        stream.stderr.on("data", (data: Buffer) => {
-          task.stderr += data.toString()
-          this.trimBuffer(task, "stderr")
-        })
-
-        stream.on("close", (code?: number, signal?: string) => {
-          task.status = code === 0 ? "completed" : "failed"
-          task.exitCode = code ?? 0
-          task.signal = signal ?? null
-          task.finishedAt = Date.now()
-          log("bg-exec", `[${id}] Finished: code=${code}, signal=${signal}, duration=${task.finishedAt - task.startedAt}ms`)
-          setTimeout(() => this.tasks.delete(id), 30 * 60 * 1000)
-        })
-
-        stream.on("error", (streamErr: Error) => {
-          task.status = "failed"
-          task.finishedAt = Date.now()
-          task.stderr += `\nStream error: ${streamErr.message}`
-          log("bg-exec", `[${id}] Stream error: ${streamErr.message}`)
-        })
-
-        this.tasks.set(id, { stream, task, client })
-        resolve(task)
-      })
+    const { id, promise } = taskManager.start(client, command, {
+      type: "background",
+      cwd: options?.cwd,
+      env: options?.env,
     })
+
+    const task = taskManager.getStatus(id)
+    if (!task) {
+      throw new Error("Failed to create background task")
+    }
+
+    log("bg-exec", `[${id}] Started background task: ${command.slice(0, 100)}`)
+    return task as BackgroundTask
   }
 
-  getStatus(id: string): BackgroundTask | null {
-    const entry = this.tasks.get(id)
-    return entry ? { ...entry.task } : null
+  getStatus(taskId: string): BackgroundTask | null {
+    const taskManager = getGlobalTaskManager()
+    return taskManager.getStatus(taskId) as BackgroundTask | null
   }
 
-  list(): BackgroundTask[] {
-    return Array.from(this.tasks.values()).map(e => ({ ...e.task }))
+  list(hostname?: string): BackgroundTask[] {
+    const taskManager = getGlobalTaskManager()
+    const allTasks = taskManager.list(hostname)
+    return allTasks.filter(t => t.type === "background") as BackgroundTask[]
   }
 
-  getOutput(id: string): { stdout: string; stderr: string } | null {
-    const entry = this.tasks.get(id)
-    if (!entry) return null
-    return { stdout: entry.task.stdout, stderr: entry.task.stderr }
+  getOutput(taskId: string): { stdout: string; stderr: string } | null {
+    const taskManager = getGlobalTaskManager()
+    return taskManager.getOutput(taskId)
   }
 
-  getOutputSince(id: string, stdoutOffset: number, stderrOffset: number): { stdout: string; stderr: string } | null {
-    const entry = this.tasks.get(id)
-    if (!entry) return null
+  getOutputSince(taskId: string, stdoutOffset: number, stderrOffset: number): { stdout: string; stderr: string } | null {
+    const output = this.getOutput(taskId)
+    if (!output) return null
     return {
-      stdout: entry.task.stdout.slice(stdoutOffset),
-      stderr: entry.task.stderr.slice(stderrOffset),
+      stdout: output.stdout.slice(stdoutOffset),
+      stderr: output.stderr.slice(stderrOffset),
     }
   }
 
-  cancel(id: string, options?: { signal?: "TERM" | "HUP" }): boolean {
-    const entry = this.tasks.get(id)
-    if (!entry || entry.task.status !== "running") return false
-
-    entry.task.status = "cancelled"
-    entry.task.finishedAt = Date.now()
-
+  cancel(taskId: string, options?: { signal?: "TERM" | "HUP"; client?: Client }): boolean {
+    const taskManager = getGlobalTaskManager()
+    const client = options?.client
     const signal = options?.signal ?? "TERM"
-
-    if (entry.task.pid) {
-      const killCmd = `kill -${signal} ${entry.task.pid} 2>/dev/null; sleep 1; kill -0 ${entry.task.pid} 2>/dev/null && kill -KILL ${entry.task.pid} 2>/dev/null; true`
-      log("bg-exec", `[${id}] Cancelling PID ${entry.task.pid} with signal ${signal}`)
-      
-      const stream = entry.stream
-      try {
-        stream.close()
-      } catch {
-        // ignore
-      }
-      
-      setTimeout(() => {
-        entry.client.exec(killCmd, (err, killStream) => {
-          if (err) {
-            log("bg-exec", `[${id}] Failed to send kill signal: ${err.message}`)
-          } else {
-            killStream.on("close", () => {
-              log("bg-exec", `[${id}] Kill signal sent to PID ${entry.task.pid}`)
-            })
-          }
-        })
-      }, 100)
-    }
-
-    log("bg-exec", `[${id}] Cancelled (sent ${signal})`)
-    return true
+    return taskManager.cancel(taskId, client!, signal)
   }
 
-  async wait(id: string, timeoutMs?: number): Promise<BackgroundTask> {
-    const entry = this.tasks.get(id)
-    if (!entry) throw new Error(`Task ${id} not found`)
-    if (entry.task.status !== "running") return { ...entry.task }
+  async wait(taskId: string, timeoutMs?: number): Promise<BackgroundTask> {
+    const taskManager = getGlobalTaskManager()
+    const checkTask = () => taskManager.getStatus(taskId)
+    let entry = checkTask()
+    if (!entry) throw new Error(`Task ${taskId} not found`)
+    if (entry.status !== "running") return entry as BackgroundTask
 
     return new Promise((resolve, reject) => {
       const check = setInterval(() => {
-        const e = this.tasks.get(id)
-        if (!e || e.task.status !== "running") {
+        const e = checkTask()
+        if (!e || e.status !== "running") {
           clearInterval(check)
           if (timer) clearTimeout(timer)
-          resolve({ ...e!.task })
+          resolve(e as BackgroundTask)
         }
       }, 500)
 
@@ -253,13 +111,19 @@ export class BackgroundExecManager {
     })
   }
 
-  remove(id: string): boolean {
-    return this.tasks.delete(id)
+  remove(taskId: string): boolean {
+    const taskManager = getGlobalTaskManager()
+    return taskManager.remove(taskId)
   }
 
-  private trimBuffer(task: BackgroundTask, field: "stdout" | "stderr"): void {
-    if (task[field].length > this.maxOutputBuffer) {
-      task[field] = task[field].slice(-this.maxOutputBuffer)
+  private getHostIdentifier(client: Client): string {
+    const sock: any = client
+    if (sock._client && sock._client._config && sock._client._config.host) {
+      return sock._client._config.host
     }
+    return "unknown"
   }
 }
+
+export { getGlobalTaskManager }
+export type { ExecTask, TaskType, TaskStatus, ExecResult } from "./exec-task-manager.js"

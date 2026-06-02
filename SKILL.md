@@ -168,33 +168,31 @@ node dist/mcp-server.js --config server.json
 node dist/cli/ssh-exec.js mcp --config server.json
 ```
 
-MCP 暴露 17 个工具：
+MCP 暴露 21 个工具：
 - `remote_exec` — 执行远程命令
 - `remote_read_file` / `remote_write_file` — 读写文件
 - `remote_list_dir` / `remote_exists` / `remote_stat` — 目录/文件操作
 - `remote_grep` / `remote_find` — 搜索
-- `upload_file` / `download_file` — 单文件传输（流式）
-- `upload_folder` / `download_folder` — 文件夹传输（压缩）
-- `exec_background` / `exec_status` / `exec_cancel` / `list_tasks` — 后台执行
+- `upload` / `download` — 自动判断文件 / 文件夹，单一接口（文件走 SFTP，文件夹走 tar+gzip）
+- `exec_background` / `exec_status` / `exec_cancel` / `list_tasks` — 后台执行（跨进程可见）
+- `get_host_load` — 获取远程主机负载（CPU、内存、进程数、运行中任务）
 
 ### 4. 文件传输
 
+`upload` / `download` 自动判断路径是文件还是文件夹，不再分两个子命令。
+
 ```bash
-# 上传文件
+# 上传文件 / 文件夹（自动判断）
 node dist/cli/ssh-exec.js daemon transfer --config server.json \
   --action upload --local ./app.tar.gz --remote /tmp/app.tar.gz
+node dist/cli/ssh-exec.js daemon transfer --config server.json \
+  --action upload --local ./my-project --remote /opt/my-project
 
-# 下载文件
+# 下载文件 / 文件夹（自动判断）
 node dist/cli/ssh-exec.js daemon transfer --config server.json \
   --action download --remote /var/log/syslog --local ./syslog.txt
-
-# 上传文件夹（自动压缩传输解压）
 node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action upload-folder --local ./my-project --remote /opt/my-project
-
-# 下载文件夹
-node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action download-folder --remote /opt/my-project --local ./downloaded
+  --action download --remote /opt/my-project --local ./downloaded
 ```
 
 ### 5. 后台执行（detach）
@@ -353,7 +351,7 @@ npm run test:all
 |------|--------|----------|----------|----------------|
 | N-hop 跳板机 | JSON 声明 | ProxyJump | jumpHost | 自动 |
 | 连接复用 | Daemon 自动 | 手动 | 不支持 | 自动 |
-| AI 工具集成 | 17 个 MCP 工具 | 无 | 无 | Copilot |
+| AI 工具集成 | 21 个 MCP 工具 | 无 | 无 | Copilot |
 | 文件夹传输 | 压缩自动传输 | 需 scp | 无 | 内置 |
 | 后台执行 | detach 模式 | screen/tmux | 无 | 无 |
 | 运行时依赖 | Node.js | 系统自带 | Node.js | VS Code |

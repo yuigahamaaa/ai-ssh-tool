@@ -801,8 +801,71 @@ export async function downloadFolder(
 }
 
 /**
- * Smart transfer: automatically detects file vs folder and chooses the right method.
- * Upload if direction is "up", download if direction is "down".
+ * Smart upload: automatically detects whether local path is a file or a folder,
+ * and dispatches to the right underlying method.
+ *
+ * - File  → streaming SFTP upload (large files) or direct read/write (small files)
+ * - Folder → tar+gzip local → upload archive → untar on remote
+ */
+export async function upload(
+  client: Client,
+  localPath: string,
+  remotePath: string,
+  options?: FolderTransferOptions,
+): Promise<TransferResult> {
+  if (!existsSync(localPath)) {
+    throw new Error(`Local path does not exist: ${localPath}`)
+  }
+  const statInfo = statSync(localPath)
+  if (statInfo.isDirectory()) {
+    return uploadFolder(client, localPath, remotePath, options)
+  }
+  const fileOptions: FileTransferOptions = {
+    onProgress: options?.onProgress,
+    mode: undefined,
+    timeout: options?.timeout,
+    overwrite: options?.overwrite,
+    fileSizeThreshold: options?.fileSizeThreshold,
+    skipSymlinks: options?.skipSymlinks,
+    lineEnding: options?.lineEnding,
+    encoding: options?.encoding,
+  }
+  return uploadFile(client, localPath, remotePath, fileOptions)
+}
+
+/**
+ * Smart download: automatically detects whether remote path is a file or a folder,
+ * and dispatches to the right underlying method.
+ *
+ * - File  → streaming SFTP download
+ * - Folder → tar+gzip on remote → download archive → untar locally
+ */
+export async function download(
+  client: Client,
+  remotePath: string,
+  localPath: string,
+  options?: FolderTransferOptions,
+): Promise<TransferResult> {
+  const isDir = await remoteIsDir(client, remotePath)
+  if (isDir) {
+    return downloadFolder(client, remotePath, localPath, options)
+  }
+  const fileOptions: FileTransferOptions = {
+    onProgress: options?.onProgress,
+    mode: undefined,
+    timeout: options?.timeout,
+    overwrite: options?.overwrite,
+    fileSizeThreshold: options?.fileSizeThreshold,
+    skipSymlinks: options?.skipSymlinks,
+    lineEnding: options?.lineEnding,
+    encoding: options?.encoding,
+  }
+  return downloadFile(client, remotePath, localPath, fileOptions)
+}
+
+/**
+ * Generic smart transfer: automatically detects file vs folder.
+ * Provided for back-compat with existing callers that pass an explicit direction.
  */
 export async function transfer(
   client: Client,
@@ -812,16 +875,7 @@ export async function transfer(
   options?: FolderTransferOptions,
 ): Promise<TransferResult> {
   if (direction === "up") {
-    const isDir = statSync(source).isDirectory()
-    if (isDir) {
-      return uploadFolder(client, source, destination, options)
-    }
-    return uploadFile(client, source, destination, options)
+    return upload(client, source, destination, options)
   }
-
-  const isDir = await remoteIsDir(client, source)
-  if (isDir) {
-    return downloadFolder(client, source, destination, options)
-  }
-  return downloadFile(client, source, destination, options)
+  return download(client, source, destination, options)
 }

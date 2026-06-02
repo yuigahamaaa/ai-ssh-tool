@@ -17,7 +17,7 @@ import { createHash } from "crypto"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
 import { BackgroundExecManager } from "./background-exec.js"
-import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "./file-transfer.js"
+import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
 import { enableDebug, log, logError } from "./logger.js"
 import {
@@ -411,16 +411,10 @@ export class SSHDaemon {
       let result
       switch (action) {
         case "upload":
-          result = await uploadFile(client, localPath, remotePath)
+          result = await upload(client, localPath, remotePath)
           break
         case "download":
-          result = await downloadFile(client, remotePath, localPath)
-          break
-        case "upload-folder":
-          result = await uploadFolder(client, localPath, remotePath)
-          break
-        case "download-folder":
-          result = await downloadFolder(client, remotePath, localPath)
+          result = await download(client, remotePath, localPath)
           break
         default:
           return { id: req.id, ok: false, error: `Unknown transfer action: ${action}` }
