@@ -22,12 +22,12 @@ import { readFileSync } from "fs"
 import { resolve } from "path"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
-import { BackgroundExecManager } from "./background-exec.js"
-import { uploadFile, downloadFile, uploadFolder, downloadFolder } from "./file-transfer.js"
+import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
 import { ProfileManager } from "./profile-manager.js"
-import { enableDebug, log, logError } from "./logger.js"
+import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
+import { getGlobalTaskManager } from "./exec-task-manager.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 
 interface HostConfig {
@@ -98,7 +98,7 @@ async function main() {
   const profileManager = new ProfileManager()
   profileManager.load()
 
-  const bgManager = new BackgroundExecManager()
+  const taskManager = getGlobalTaskManager()
 
   // Client cache: profile name -> { client, forwardManager }
   const clientCache = new Map<string, ClientCacheEntry>()
@@ -366,66 +366,47 @@ async function main() {
 
   // --- File transfer ---
   server.tool(
-    "ssh_upload_file",
-    "Upload a local file to the remote server via SFTP streaming. Supports large files.",
+    "ssh_upload",
+    "Upload a local file or folder to the remote server. Automatically detects file/folder type.",
     {
-      local_path: z.string().describe("Local file path to upload"),
+      local_path: z.string().describe("Local file/folder path to upload"),
       remote_path: z.string().describe("Destination path on remote server"),
-      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
-      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
-    },
-    async ({ local_path, remote_path, profile_name, profile_json }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json)
-      const result = await uploadFile(client, local_path, remote_path)
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
-    },
-  )
-
-  server.tool(
-    "ssh_download_file",
-    "Download a remote file to local machine via SFTP streaming. Supports large files.",
-    {
-      remote_path: z.string().describe("Remote file path to download"),
-      local_path: z.string().describe("Local destination path"),
-      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
-      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
-    },
-    async ({ remote_path, local_path, profile_name, profile_json }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json)
-      const result = await downloadFile(client, remote_path, local_path)
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
-    },
-  )
-
-  server.tool(
-    "ssh_upload_folder",
-    "Upload a local folder to the remote server. Compresses locally, transfers, then decompresses on remote.",
-    {
-      local_path: z.string().describe("Local folder path to upload"),
-      remote_path: z.string().describe("Destination folder path on remote server"),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
+      overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
+      skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       profile_name: z.string().optional().describe("Name of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ local_path, remote_path, compression_level, profile_name, profile_json }) => {
+    async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, profile_name, profile_json }) => {
       const { client } = await getClientForProfile(profile_name, profile_json)
-      const result = await uploadFolder(client, local_path, remote_path, { compressionLevel: compression_level })
+      const result = await upload(client, local_path, remote_path, {
+        compressionLevel: compression_level,
+        overwrite: overwrite as any,
+        skipSymlinks: skip_symlinks,
+      })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
   )
 
   server.tool(
-    "ssh_download_folder",
-    "Download a remote folder to local machine. Compresses on remote, transfers, then decompresses locally.",
+    "ssh_download",
+    "Download a remote file or folder to the local machine. Automatically detects file/folder type.",
     {
-      remote_path: z.string().describe("Remote folder path to download"),
-      local_path: z.string().describe("Local destination folder path"),
+      remote_path: z.string().describe("Remote file/folder path to download"),
+      local_path: z.string().describe("Local destination path"),
+      compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
+      overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
+      skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       profile_name: z.string().optional().describe("Name of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
     },
-    async ({ remote_path, local_path, profile_name, profile_json }) => {
+    async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, profile_name, profile_json }) => {
       const { client } = await getClientForProfile(profile_name, profile_json)
-      const result = await downloadFolder(client, remote_path, local_path)
+      const result = await download(client, remote_path, local_path, {
+        compressionLevel: compression_level,
+        overwrite: overwrite as any,
+        skipSymlinks: skip_symlinks,
+      })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
   )
@@ -442,8 +423,9 @@ async function main() {
     },
     async ({ command, cwd, profile_name, profile_json }) => {
       const { client } = await getClientForProfile(profile_name, profile_json)
-      const task = await bgManager.start(client, command, { cwd })
-      return { content: [{ type: "text" as const, text: JSON.stringify({ taskId: task.id, status: task.status, pid: task.pid, command: task.command }) }] }
+      const { id } = taskManager.start(client, command, { type: "background", cwd })
+      const task = taskManager.getStatus(id)
+      return { content: [{ type: "text" as const, text: JSON.stringify({ taskId: task?.id, status: task?.status, pid: task?.pid, command: task?.command }) }] }
     },
   )
 
@@ -456,12 +438,12 @@ async function main() {
       stderr_offset: z.number().optional().describe("Read stderr from this byte offset (default: 0, returns all)"),
     },
     async ({ task_id, stdout_offset, stderr_offset }) => {
-      const task = bgManager.getStatus(task_id)
+      const task = taskManager.getStatus(task_id)
       if (!task) {
         return { content: [{ type: "text" as const, text: `Task ${task_id} not found` }] }
       }
       if (stdout_offset || stderr_offset) {
-        const partial = bgManager.getOutputSince(task_id, stdout_offset ?? 0, stderr_offset ?? 0)
+        const partial = taskManager.getOutputSince(task_id, stdout_offset ?? 0, stderr_offset ?? 0)
         return { content: [{ type: "text" as const, text: JSON.stringify({ ...task, ...partial }) }] }
       }
       return { content: [{ type: "text" as const, text: JSON.stringify(task) }] }
@@ -473,20 +455,49 @@ async function main() {
     "Cancel a running background task.",
     {
       task_id: z.string().describe("Task ID to cancel"),
+      profile_name: z.string().optional().describe("Name of the SSH profile to use (for cancellation)"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile (for cancellation)"),
     },
-    async ({ task_id }) => {
-      const cancelled = bgManager.cancel(task_id)
+    async ({ task_id, profile_name, profile_json }) => {
+      const { client } = await getClientForProfile(profile_name, profile_json)
+      const cancelled = taskManager.cancel(task_id, client)
       return { content: [{ type: "text" as const, text: cancelled ? `Task ${task_id} cancelled` : `Task ${task_id} not found or already finished` }] }
     },
   )
 
   server.tool(
     "ssh_list_tasks",
-    "List all background tasks and their statuses.",
-    {},
-    async () => {
-      const tasks = bgManager.list()
+    "List all SSH tasks (both regular exec and background tasks).",
+    {
+      hostname: z.string().optional().describe("Filter tasks by remote hostname"),
+    },
+    async ({ hostname }) => {
+      const tasks = taskManager.list(hostname)
       return { content: [{ type: "text" as const, text: JSON.stringify(tasks) }] }
+    },
+  )
+
+  // --- Host load monitoring ---
+  server.tool(
+    "ssh_get_host_load",
+    "Get current load information for a remote machine, including CPU load average, memory usage, process count, and running tasks.",
+    {
+      profile_name: z.string().optional().describe("Name of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile to use (if not using a named profile)"),
+    },
+    async ({ profile_name, profile_json }) => {
+      const entry = await getClientForProfile(profile_name, profile_json)
+      const uptimeResult = await remoteExec(entry.client, "uptime", { timeout: 10000 })
+      const memResult = await remoteExec(entry.client, "free -h", { timeout: 10000 })
+      const procResult = await remoteExec(entry.client, "ps aux --no-headers | wc -l", { timeout: 10000 })
+      const loadInfo = {
+        hostname: entry.client,
+        uptime: uptimeResult.stdout.trim(),
+        memory: memResult.stdout.trim(),
+        processCount: procResult.stdout.trim(),
+        tasks: taskManager.list((entry.client as any)?._client?._config?.host || undefined),
+      }
+      return { content: [{ type: "text", text: JSON.stringify(loadInfo, null, 2) }] }
     },
   )
 
