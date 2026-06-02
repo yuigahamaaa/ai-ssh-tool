@@ -56,7 +56,7 @@ function getTaskFilePath(taskId: string): string {
 }
 
 function getHostIdentifier(client: Client): string {
-  const clientObj = client as Record<string, unknown>
+  const clientObj = client as unknown as Record<string, unknown>
   const innerClient = clientObj._client as Record<string, unknown> | undefined
   const config = innerClient?._config as Record<string, unknown> | undefined
   const host = config?.host as string | undefined
