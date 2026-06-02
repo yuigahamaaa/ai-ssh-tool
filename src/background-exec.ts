@@ -41,6 +41,7 @@ export class BackgroundExecManager {
       type: "background",
       cwd: options?.cwd,
       env: options?.env,
+      detached: options?.detached ?? true,
     })
 
     const task = taskManager.getStatus(id)

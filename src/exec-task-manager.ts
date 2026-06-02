@@ -193,12 +193,14 @@ export class ExecTaskManager {
       cwd?: string
       env?: Record<string, string>
       timeout?: number
+      detached?: boolean
     }
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
     const taskType = options?.type ?? "exec"
     const isBackground = taskType === "background" || options?.timeout === undefined
     const persistImmediate = taskType === "background"
+    const useDetached = options?.detached || isBackground
 
     let fullCommand = command
     if (options?.cwd) {
@@ -242,7 +244,10 @@ export class ExecTaskManager {
     }
 
     const promise = new Promise<ExecResult>((resolve, reject) => {
-      const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
+      // 对于后台任务，先保持简单，我们先不用复杂的 nohup 包装，避免转义问题
+      // 保持原来的简单逻辑：echo SSH_TOOL_PID，然后执行命令
+      // 后续我们可以再改进，但先让代码能正常工作
+      let wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
 
       client.exec(wrappedCommand, (err, stream) => {
         if (err) {
@@ -290,11 +295,16 @@ export class ExecTaskManager {
         stream.stderr.on("data", (data: Buffer) => {
           const text = data.toString()
           if (!pidCaptured) {
-            const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+            // 尝试匹配 SSH_TOOL_PID
+            let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+            if (!pidMatch) {
+              // 尝试匹配 SSH_TOOL_NOHUP_PID
+              pidMatch = text.match(/SSH_TOOL_NOHUP_PID:(\d+)/)
+            }
             if (pidMatch) {
               task.pid = parseInt(pidMatch[1])
               pidCaptured = true
-              const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, "")
+              const remaining = text.replace(/SSH_TOOL_(NOHUP_)?PID:\d+\n?/g, "")
               if (remaining) {
                 task.stderr += remaining
                 this.trimBuffer(task, "stderr")

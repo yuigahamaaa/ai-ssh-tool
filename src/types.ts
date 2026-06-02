@@ -94,6 +94,8 @@ export interface ConnectionOptions {
 export interface SSHProfile {
   id: string
   name: string
+  /** Alias for quick reference */
+  alias?: string
   /** Ordered host chain */
   chain: Omit<SSHHostConfig, "id">[]
   tags?: string[]

@@ -124,17 +124,23 @@ export class ProfileManager {
     return this.profiles.find((p) => p.name === name)
   }
 
+  /** Get a profile by alias */
+  getByAlias(alias: string): SSHProfile | undefined {
+    return this.profiles.find((p) => p.alias === alias)
+  }
+
   /** List all profiles */
   list(): SSHProfile[] {
     return [...this.profiles]
   }
 
-  /** Search profiles by name or tag */
+  /** Search profiles by name, alias or tag */
   search(query: string): SSHProfile[] {
     const q = query.toLowerCase()
     return this.profiles.filter(
       (p) =>
         p.name.toLowerCase().includes(q) ||
+        p.alias?.toLowerCase().includes(q) ||
         p.tags?.some((t) => t.toLowerCase().includes(q))
     )
   }
