@@ -657,6 +657,7 @@ export async function uploadFolder(
   const folderName = basename(localPath)
   const tmpFile = join(tmpdir(), `ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`)
   const remoteTmp = `/tmp/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
+  let uploadResult: TransferResult | null = null
 
   try {
     await remoteExec(client, `mkdir -p ${JSON.stringify(remotePath)}`, { timeout: 10000 })
@@ -679,14 +680,14 @@ export async function uploadFolder(
     const localStat = statSync(tmpFile)
     log("transfer", `Compressed ${localPath} -> ${tmpFile} (${localStat.size} bytes)`)
 
-    const uploadResult = await uploadFile(client, tmpFile, remoteTmp, {
+    uploadResult = await uploadFile(client, tmpFile, remoteTmp, {
       onProgress: options?.onProgress
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (uploading archive)` })
         : undefined,
       timeout,
     })
 
-    const extractCmd = `tar -xzf ${JSON.stringify(remoteTmp)} -C ${JSON.stringify(remotePath)} ${options?.overwrite ? "--overwrite" : ""} && rm -f ${JSON.stringify(remoteTmp)}`
+    const extractCmd = `tar -xzf ${JSON.stringify(remoteTmp)} -C ${JSON.stringify(remotePath)} ${options?.overwrite ? "--overwrite" : ""}`
     await remoteExec(client, extractCmd, { timeout })
 
     const duration = Date.now() - startTime
@@ -698,18 +699,28 @@ export async function uploadFolder(
       duration,
     }
   } catch (err: any) {
+    log("transfer", `Folder upload failed: ${err.message}`)
     return {
       success: false,
       path: remotePath,
-      size: 0,
+      size: uploadResult?.size ?? 0,
       duration: Date.now() - startTime,
       error: err.message,
     }
   } finally {
+    // 清理本地临时文件
     try {
       const { unlinkSync } = await import("fs")
       if (existsSync(tmpFile)) unlinkSync(tmpFile)
     } catch {
+      // 忽略删除错误
+    }
+    
+    // 清理远程临时文件
+    try {
+      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
+    } catch {
+      // 忽略远程删除错误
     }
   }
 }
@@ -730,6 +741,7 @@ export async function downloadFolder(
   const folderName = basename(remotePath)
   const remoteTmp = `/tmp/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
+  let downloadResult: TransferResult | null = null
 
   try {
     const isDir = await remoteIsDir(client, remotePath)
@@ -753,7 +765,7 @@ export async function downloadFolder(
     const remoteSize = parseInt(sizeResult.stdout.trim()) || 0
     log("transfer", `Compressed on remote: ${remotePath} -> ${remoteTmp} (${remoteSize} bytes)`)
 
-    const downloadResult = await downloadFile(client, remoteTmp, tmpFile, {
+    downloadResult = await downloadFile(client, remoteTmp, tmpFile, {
       onProgress: options?.onProgress
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (downloading archive)` })
         : undefined,
@@ -769,8 +781,6 @@ export async function downloadFolder(
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
-    await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
-
     const duration = Date.now() - startTime
     log("transfer", `Folder download complete: ${remotePath} -> ${localPath} (${duration}ms)`)
     return {
@@ -780,22 +790,28 @@ export async function downloadFolder(
       duration,
     }
   } catch (err: any) {
+    log("transfer", `Folder download failed: ${err.message}`)
     return {
       success: false,
       path: localPath,
-      size: 0,
+      size: downloadResult?.size ?? 0,
       duration: Date.now() - startTime,
       error: err.message,
     }
   } finally {
+    // 清理本地临时文件
     try {
       const { unlinkSync } = await import("fs")
       if (existsSync(tmpFile)) unlinkSync(tmpFile)
     } catch {
+      // 忽略删除错误
     }
+    
+    // 清理远程临时文件
     try {
-      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 })
+      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
     } catch {
+      // 忽略远程删除错误
     }
   }
 }
