@@ -88,7 +88,7 @@
 
 关键变化：
 
-> AI 应该提交“执行意图”给调度器，而不是默认直接运行命令。
+> AI 应该提交“执行意图”给调度器，而不是默认直接裸跑命令。
 
 旧路径：
 
@@ -96,18 +96,36 @@
 { "tool": "ssh_exec", "command": "npm test" }
 ```
 
-新默认路径：
+新默认路径不是要求 AI 一定换工具名，而是让最常用的 `ssh_exec` 底层默认进入 scheduler。也就是说：
+
+```json
+{
+  "tool": "ssh_exec",
+  "command": "npm test",
+  "cwd": "/repo",
+  "reason": "验证刚才修改是否通过测试",
+  "intent": "test",
+  "cost": "large",
+  "if_busy": "queue",
+  "scheduler": "auto"
+}
+```
+
+同时保留一个显式调度工具 `ssh_schedule`，它和 `ssh_exec` 的 scheduler 模式走同一套底层逻辑：
 
 ```json
 {
   "tool": "ssh_schedule",
   "command": "npm test",
   "cwd": "/repo",
+  "reason": "验证刚才修改是否通过测试",
   "intent": "test",
-  "blocking": true,
+  "cost": "large",
   "if_busy": "queue"
 }
 ```
+
+`ssh_exec` 的 `scheduler="bypass"` 是显式逃生通道，但 bypass 任务仍应登记到 daemon 的任务看板中，避免其他 AI 看漏正在运行的命令。
 
 调度器返回：
 
@@ -499,7 +517,7 @@ type ScheduleDecision =
 
 #### `ssh_schedule`
 
-提交命令给共享 VM 调度器。它应该成为 AI 执行命令的默认工具。
+提交命令给共享 VM 调度器。它是显式调度工具，底层逻辑也会被 `ssh_exec` 的默认 scheduler 模式复用。
 
 参数：
 
@@ -510,7 +528,7 @@ type ScheduleDecision =
   intent?: TaskIntent
   cost?: TaskCost
   blocking?: boolean
-  priority?: number
+  urgency?: "low" | "normal" | "high" | "urgent"
   timeout?: number
   if_busy?: "run_anyway" | "wait" | "queue" | "fail"
   lock_scope?: "none" | "host" | "workdir" | "custom"
@@ -519,6 +537,7 @@ type ScheduleDecision =
   profile_file?: string
   profile_json?: string
   reason?: string
+  force?: boolean
 }
 ```
 
@@ -527,6 +546,8 @@ type ScheduleDecision =
 - `medium`、`large`、`exclusive` 任务：`if_busy = "queue"`
 - `tiny` inspect/search 任务：`if_busy = "run_anyway"`
 - build/test/install/deploy/migration/server：`blocking = true`
+- `urgency = "normal"`
+- V1 不建议开放裸数字 `priority`。用 `urgency` + `reason` 表达紧急程度，避免 AI 通过随意填高优先级插队。
 
 #### `ssh_wait_task`
 
@@ -607,13 +628,19 @@ type ScheduleDecision =
 
 #### `ssh_exec`
 
-`ssh_exec` 默认也应走 scheduler。
+`ssh_exec` 从第一版调度器接入开始就默认走 scheduler。原因是 AI 最自然、最频繁调用的就是 `ssh_exec`；如果只新增 `ssh_schedule`，AI 仍可能继续直接执行，协作效果会打折。
 
 新增参数：
 
 ```ts
 {
   scheduler?: "auto" | "bypass"
+  reason?: string
+  intent?: TaskIntent
+  cost?: TaskCost
+  urgency?: "low" | "normal" | "high" | "urgent"
+  if_busy?: "run_anyway" | "wait" | "queue" | "fail"
+  force?: boolean
 }
 ```
 
@@ -623,11 +650,36 @@ type ScheduleDecision =
 scheduler = "auto"
 ```
 
-这一点很重要，因为 AI 会继续自然地调用 `ssh_exec`。如果它仍是绕过路径，抢占问题会继续存在。
+行为：
+
+- `scheduler="auto"`：进入 scheduler，根据当前 VM 状态决定立即执行、排队、建议等待、拒绝或要求确认。
+- `scheduler="bypass"`：绕过准入和队列，直接执行；但仍要登记成 running task，让 `ssh_queue_status` 和 `ssh_get_host_load` 能看到。
+- AI 没填 `intent/cost`：调度器只做高置信度自动分类。分类不了时默认 `medium + queue`。
+- AI 填了但明显不合理：例如 `npm test` 填 `tiny`，调度器可以提升成本，并在响应中返回 `classification.source = "agent_overridden_by_policy"`。
 
 #### `ssh_exec_background`
 
 也应调度感知。默认创建 `blocking=true`、`if_busy="queue"` 的 scheduled task。
+
+#### `ssh_cd`
+
+当前 `ssh_cd` 容易制造认知误差：AI 会以为自己改变了“当前会话目录”，但 SSH exec 通常是每条命令独立执行，且多个 AI 共享同一 VM 时不应该有一个会被互相污染的全局 cwd。
+
+V1 建议把 `ssh_cd` 改造成“虚拟工作目录设置”：
+
+- daemon/MCP 为每个 `agentId + hostId` 维护一个 `virtualCwd`。
+- `ssh_cd(path)` 只更新该 agent 在该 host 下的 `virtualCwd`，不改变远端全局 shell 状态。
+- 后续 `ssh_exec` / `ssh_schedule` 如果没有显式传 `cwd`，就使用这个 `virtualCwd`。
+- 实际执行时由工具内部拼接 `cd <virtualCwd> && <command>`，或传给 `ExecRunner` 统一处理。
+- 每个任务记录都必须保存最终使用的 `cwd`，方便其他 AI 理解任务发生在哪。
+
+同时，工具描述中应提示 AI：优先在每次执行命令时显式传 `cwd`；`ssh_cd` 只是设置本 agent 的默认工作目录，不会影响其他 AI。
+
+第一版最低要求：
+
+1. `ssh_cd` 返回清晰文案：`已设置当前 AI 会话在该 host 上的默认 cwd`。
+2. `ssh_exec` / `ssh_schedule` 在响应中返回 `effectiveCwd`。
+3. 不再暗示 `ssh_cd` 改变了远端全局 shell。
 
 #### `ssh_list_tasks`
 
@@ -747,6 +799,7 @@ class SchedulerService {
 AI 调用 ssh_schedule
   -> MCP 发送 schedule IPC
   -> daemon 解析 profile/host/session
+  -> daemon 解析 effectiveCwd：显式 cwd 优先，否则使用 agent 的 virtualCwd
   -> PolicyEngine 分类命令
   -> LockManager 检查锁
   -> QueueManager 检查槽位
@@ -865,6 +918,7 @@ AI 更容易响应清晰上下文：
 5. 修复 session hash，保留 hop 顺序。
 6. 统一 profile 文件格式，或同时支持 flat 和 `auth` 形式。
 7. 给任务记录添加稳定 host identity。
+8. 调整 `ssh_cd` 语义：先提示 AI 它不是远端全局 cd；实现时按 agent + host 缓存 virtual cwd。
 
 涉及文件：
 
@@ -881,6 +935,7 @@ AI 更容易响应清晰上下文：
 - 普通 exec 完成后持久化最终状态。
 - 多跳 hash 保留顺序。
 - flat profile 能正常加载，或给出清晰校验错误。
+- `ssh_cd` 不影响其他 agent；未显式传 `cwd` 的命令使用当前 agent 的 virtual cwd。
 
 ### Phase 1：daemon 内调度器骨架
 
@@ -944,9 +999,10 @@ AI 更容易响应清晰上下文：
 
 调整：
 
-- `ssh_exec` 默认 scheduler auto。
+- `ssh_exec` 默认 scheduler auto，并复用 `ssh_schedule` 底层逻辑。
 - `ssh_exec_background` 默认 scheduler queue。
 - `ssh_get_host_load` 包含 scheduler state。
+- `ssh_cd` 设置 agent + host 的 virtual cwd；`ssh_exec` / `ssh_schedule` 返回 `effectiveCwd`。
 
 测试：
 
@@ -954,6 +1010,7 @@ AI 更容易响应清晰上下文：
 - MCP schedule 返回 `queued`。
 - MCP wait 返回最终输出。
 - 现有 `ssh_exec` 仍可用，但默认走 scheduler。
+- 两个 agent 分别 `ssh_cd` 到不同目录后，默认命令互不影响。
 
 ### Phase 3：锁和策略
 
@@ -1146,6 +1203,7 @@ Agent C：
 - `ssh_exec_status` -> scheduler task status
 - `ssh_exec_cancel` -> daemon cancel
 - `ssh_list_tasks` -> scheduler tasks
+- `ssh_cd` -> 设置当前 agent 在当前 host 的 virtual cwd
 
 保留 `scheduler="bypass"` 作为紧急兼容模式。
 
@@ -1164,10 +1222,11 @@ Agent C：
 ### 17.3 上线顺序
 
 1. 在 daemon IPC 后面添加 scheduler internals。
-2. 添加新的 MCP 工具。
-3. 把 `ssh_exec` 默认改成 scheduler auto。
-4. 更新文档。
-5. 弱化 MCP 直接使用 task manager 的路径。
+2. 添加 `ssh_schedule`、`ssh_wait_task`、`ssh_queue_status` 等 MCP 工具。
+3. 同时把 `ssh_exec` 默认改成 scheduler auto，保留 `scheduler="bypass"`。
+4. 把 `ssh_cd` 改成 virtual cwd，并更新工具描述避免误导 AI。
+5. 更新文档。
+6. 弱化 MCP 直接使用 task manager 的路径。
 
 ## 18. 测试计划
 
@@ -1271,6 +1330,6 @@ MCP：
 7. 后续 large/blocking task 自动入队。
 8. tiny read/search 任务允许并发。
 9. 返回 blocker 和 recommended next step。
+10. `ssh_cd` 维护 agent + host 级 virtual cwd；命令响应返回 `effectiveCwd`。
 
 这个 MVP 应该足以阻止大多数 AI 意外抢占，并让它们在排队期间自然去做其他不冲突的事情。
-

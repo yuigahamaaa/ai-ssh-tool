@@ -300,4 +300,41 @@ describe("ProfileManager", () => {
       assert.notEqual(chain[0].id, chain[1].id)
     })
   })
+
+  describe("normalizeProfile", () => {
+    it("normalizes flat profile to auth format", () => {
+      const flat = {
+        name: "flat-test",
+        chain: [
+          { host: "10.0.0.1", port: 22, username: "root", password: "pass123" },
+        ],
+      }
+      const normalized = ProfileManager.normalizeProfile(flat)
+      assert.ok(normalized.chain[0].auth)
+      assert.equal(normalized.chain[0].auth.username, "root")
+      assert.equal(normalized.chain[0].auth.password, "pass123")
+      assert.equal(normalized.chain[0].host, "10.0.0.1")
+      assert.equal(normalized.chain[0].port, 22)
+    })
+
+    it("keeps auth profile unchanged", () => {
+      const auth = {
+        name: "auth-test",
+        chain: [
+          { name: "target", host: "10.0.0.2", port: 22, auth: { username: "deploy", privateKey: "KEY" } },
+        ],
+      }
+      const normalized = ProfileManager.normalizeProfile(auth)
+      assert.equal(normalized.chain[0].auth.username, "deploy")
+      assert.equal(normalized.chain[0].auth.privateKey, "KEY")
+      assert.equal((normalized.chain[0] as any).username, undefined)
+    })
+
+    it("throws on invalid profile missing chain", () => {
+      assert.throws(
+        () => ProfileManager.normalizeProfile({ name: "bad" }),
+        { message: /missing chain/ },
+      )
+    })
+  })
 })

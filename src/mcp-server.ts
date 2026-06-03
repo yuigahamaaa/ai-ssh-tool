@@ -29,6 +29,9 @@ import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
 import { getGlobalTaskManager } from "./exec-task-manager.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
+import { DaemonClient } from "./daemon-client.js"
+import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
+import { randomUUID } from "crypto"
 
 interface HostConfig {
   host: string
@@ -84,6 +87,8 @@ interface ClientCacheEntry {
   client: any
   forwardManager: PortForwardManager
 }
+
+const MCP_AGENT_ID = `mcp-${randomUUID().slice(0, 8)}`
 
 async function main() {
   checkDeps()
@@ -202,6 +207,135 @@ async function main() {
     return { client, forwardManager }
   }
 
+  const daemonClient = new DaemonClient()
+
+  async function scheduleCommand(params: {
+    command: string
+    cwd?: string
+    scheduler?: "auto" | "bypass"
+    reason?: string
+    intent?: TaskIntent
+    cost?: TaskCost
+    urgency?: TaskUrgency
+    if_busy?: "run_anyway" | "wait" | "queue" | "fail"
+    force?: boolean
+    timeout?: number
+    profile_name?: string
+    profile_json?: string
+    profile_file?: string
+  }): Promise<ScheduleDecision> {
+    const profile = await getProfileForScheduler(params.profile_name, params.profile_json, params.profile_file)
+    await daemonClient.ensureDaemon()
+
+    const configJson = profileToLegacyConfigJson(profile)
+    const connectResp = await daemonClient.connectHostJson(configJson)
+    if (!connectResp.ok) {
+      throw new Error(`Connection failed: ${(connectResp as any).error}`)
+    }
+    const { sessionId } = connectResp.data as any
+
+    const hostIdentity: HostIdentity = {
+      id: sessionId.slice(0, 16),
+      profileKey: sessionId.slice(0, 16),
+      targetHost: profile.chain[profile.chain.length - 1].host,
+      targetUser: profile.chain[profile.chain.length - 1].auth.username,
+      displayName: profile.name,
+    }
+    const agentIdentity: AgentIdentity = {
+      id: MCP_AGENT_ID,
+      name: "mcp-server",
+      clientType: "mcp",
+    }
+
+    const scheduleReq: ScheduleRequest = {
+      agent: agentIdentity,
+      host: hostIdentity,
+      sessionId,
+      command: params.command,
+      cwd: params.cwd,
+      reason: params.reason,
+      intent: params.intent,
+      cost: params.cost,
+      urgency: params.urgency,
+      ifBusy: params.if_busy,
+      scheduler: params.scheduler ?? "auto",
+      timeoutMs: params.timeout,
+      force: params.force,
+    }
+
+    const resp = await daemonClient.schedule(scheduleReq as unknown as Record<string, unknown>)
+    if (!resp.ok) {
+      throw new Error(`Schedule failed: ${(resp as any).error}`)
+    }
+    return resp.data as ScheduleDecision
+  }
+
+  function profileToLegacyConfigJson(profile: SSHProfile): string {
+    const chain = profile.chain
+    const target = chain[chain.length - 1]
+    const gateways = chain.slice(0, -1)
+    return JSON.stringify({
+      gateways: gateways.map(g => ({
+        host: g.host,
+        port: g.port,
+        username: g.auth.username,
+        password: g.auth.password,
+        privateKey: g.auth.privateKey,
+      })),
+      target: {
+        host: target.host,
+        port: target.port,
+        username: target.auth.username,
+        password: target.auth.password,
+        privateKey: target.auth.privateKey,
+      },
+    })
+  }
+
+  async function getProfileForScheduler(
+    profileName?: string,
+    profileJson?: string,
+    profileFile?: string,
+  ): Promise<SSHProfile> {
+    let profile: SSHProfile | undefined
+    if (profileName) {
+      profile = profileManager.getByName(profileName) ?? profileManager.getByAlias(profileName)
+      if (!profile) {
+        const fileName = profileName.endsWith(".json") ? profileName : `${profileName}.json`
+        profile = profileManager.loadFromFile(fileName)
+      }
+      if (!profile) throw new Error(`Profile not found: ${profileName}`)
+      profileManager.markUsed(profile.id)
+    } else if (profileFile) {
+      profile = profileManager.loadFromFile(profileFile)
+      if (!profile) throw new Error(`Profile file not found: ${profileFile}`)
+    } else if (profileJson) {
+      profile = JSON.parse(profileJson) as SSHProfile
+    } else if (initialConfig) {
+      profile = {
+        id: "default",
+        name: "default",
+        chain: [
+          ...(initialConfig.gateways || []).map((g: HostConfig) => ({
+            name: g.host,
+            host: g.host,
+            port: g.port ?? 22,
+            auth: { username: g.username, password: g.password, privateKey: g.privateKey },
+          })),
+          {
+            name: initialConfig.target.host,
+            host: initialConfig.target.host,
+            port: initialConfig.target.port ?? 22,
+            auth: { username: initialConfig.target.username, password: initialConfig.target.password, privateKey: initialConfig.target.privateKey },
+          },
+        ],
+      } as SSHProfile
+    } else {
+      throw new Error("Must provide profile_name, profile_file, profile_json, or initial config")
+    }
+    return profile
+  }
+
   const server = new McpServer({
     name: "ssh-tool",
     version: "2.0.0",
@@ -210,22 +344,42 @@ async function main() {
   // --- Remote execution ---
   server.tool(
     "ssh_exec",
-    "Execute a shell command on the remote server. Returns stdout, stderr, and exit code.",
+    "Execute a shell command on the remote server via the shared scheduler. Returns stdout, stderr, and exit code. Default scheduler=auto means the command goes through the daemon scheduler for conflict detection and queue management. Use scheduler=bypass for urgent lightweight checks.",
     {
       command: z.string().describe("Shell command to execute"),
       cwd: z.string().optional().describe("Working directory"),
       timeout: z.number().optional().describe("Timeout in ms (default: 30000)"),
+      scheduler: z.enum(["auto", "bypass"]).optional().describe("Scheduler mode: auto (default, through scheduler) or bypass (skip queue, still registered)"),
+      reason: z.string().optional().describe("Why you are running this command (for other AI agents to see)"),
+      intent: z.string().optional().describe("Command intent: inspect, search, test, build, install, server, deploy, migration, cleanup, custom"),
+      cost: z.string().optional().describe("Estimated cost: tiny, small, medium, large, exclusive"),
+      urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency level"),
+      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("What to do if host is busy"),
+      force: z.boolean().optional().describe("Force execution of risky commands"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile (alternative to profile_name)"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile (alternative to profile_name/profile_json)"),
     },
-    async ({ command, cwd, timeout, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, command, { timeout: timeout ?? 30000, cwd })
+    async (params) => {
+      const decision = await scheduleCommand({
+        command: params.command,
+        cwd: params.cwd,
+        scheduler: params.scheduler,
+        reason: params.reason,
+        intent: params.intent as TaskIntent | undefined,
+        cost: params.cost as TaskCost | undefined,
+        urgency: params.urgency as TaskUrgency | undefined,
+        if_busy: params.if_busy,
+        force: params.force,
+        timeout: params.timeout,
+        profile_name: params.profile_name,
+        profile_json: params.profile_json,
+        profile_file: params.profile_file,
+      })
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ exitCode: result.code, stdout: result.stdout, stderr: result.stderr }),
+          text: JSON.stringify(decision, null, 2),
         }],
       }
     },
@@ -736,21 +890,126 @@ async function main() {
 
   server.tool(
     "ssh_cd",
-    "Change the working directory for subsequent commands. Creates the directory if it doesn't exist.",
+    "Set the virtual working directory for this AI session on the target host. Does NOT affect other AI agents. Subsequent ssh_exec / ssh_schedule calls without explicit cwd will use this directory automatically.",
     {
-      path: z.string().describe("Directory path to change to"),
+      path: z.string().describe("Directory path to set as virtual cwd"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     async ({ path, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const mkdirResult = await remoteExec(client, `mkdir -p ${JSON.stringify(path)} && cd ${JSON.stringify(path)} && pwd`, { timeout: 10000 })
-      if (mkdirResult.code !== 0) {
-        return { content: [{ type: "text" as const, text: `Failed to change directory: ${mkdirResult.stderr}` }] }
+      const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
+      await daemonClient.ensureDaemon()
+      const configJson = profileToLegacyConfigJson(profile)
+      const connectResp = await daemonClient.connectHostJson(configJson)
+      if (!connectResp.ok) {
+        return { content: [{ type: "text" as const, text: `Connection failed: ${(connectResp as any).error}` }] }
       }
-      const cwd = mkdirResult.stdout.trim()
-      return { content: [{ type: "text" as const, text: `Changed directory to: ${cwd}` }] }
+      const { sessionId } = connectResp.data as any
+      const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
+      const hostIdentity: HostIdentity = {
+        id: sessionId.slice(0, 16),
+        profileKey: sessionId.slice(0, 16),
+        targetHost: profile.chain[profile.chain.length - 1].host,
+        targetUser: profile.chain[profile.chain.length - 1].auth.username,
+        displayName: profile.name,
+      }
+      const resp = await daemonClient.setCwd(agentIdentity, hostIdentity, path)
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Failed: ${(resp as any).error}` }] }
+      }
+      const data = resp.data as any
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, cwd: data.cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" }) }] }
+    },
+  )
+
+  // --- Scheduler tools ---
+  server.tool(
+    "ssh_schedule",
+    "Submit a command to the shared VM scheduler. Use for tests, builds, installs, servers, deploys, migrations, or any command that may consume CPU, modify files, occupy ports, or run for more than a few seconds.",
+    {
+      command: z.string().describe("Command to execute"),
+      cwd: z.string().optional().describe("Working directory"),
+      reason: z.string().optional().describe("Why you are running this command"),
+      intent: z.string().optional().describe("Command intent"),
+      cost: z.string().optional().describe("Estimated cost"),
+      urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency"),
+      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("What to do if host is busy"),
+      force: z.boolean().optional().describe("Force risky commands"),
+      timeout: z.number().optional().describe("Timeout in ms"),
+      profile_name: z.string().optional().describe("Profile name"),
+      profile_json: z.string().optional().describe("Profile JSON"),
+      profile_file: z.string().optional().describe("Profile file path"),
+    },
+    async (params) => {
+      const decision = await scheduleCommand({
+        command: params.command,
+        cwd: params.cwd,
+        scheduler: "auto",
+        reason: params.reason,
+        intent: params.intent as TaskIntent | undefined,
+        cost: params.cost as TaskCost | undefined,
+        urgency: params.urgency as TaskUrgency | undefined,
+        if_busy: params.if_busy,
+        force: params.force,
+        timeout: params.timeout,
+        profile_name: params.profile_name,
+        profile_json: params.profile_json,
+        profile_file: params.profile_file,
+      })
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(decision, null, 2) }],
+      }
+    },
+  )
+
+  server.tool(
+    "ssh_queue_status",
+    "Show running tasks, queued tasks, and recent completions on the shared VM.",
+    {
+      host_id: z.string().optional().describe("Filter by host ID"),
+      limit: z.number().optional().describe("Max results (default 20)"),
+    },
+    async ({ host_id, limit }) => {
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.queueStatus({ agent: { id: MCP_AGENT_ID, clientType: "mcp" }, hostId: host_id, limit })
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
+    },
+  )
+
+  server.tool(
+    "ssh_wait_task",
+    "Wait for a scheduled task to complete, or until timeout.",
+    {
+      task_id: z.string().describe("Task ID to wait for"),
+      timeout: z.number().optional().describe("Timeout in ms (default 30000)"),
+    },
+    async ({ task_id, timeout }) => {
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.waitTask(task_id, timeout)
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
+    },
+  )
+
+  server.tool(
+    "ssh_dequeue_task",
+    "Remove a queued task from the scheduler before it starts.",
+    {
+      task_id: z.string().describe("Task ID to dequeue"),
+    },
+    async ({ task_id }) => {
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.dequeueTask(task_id, { id: MCP_AGENT_ID, clientType: "mcp" })
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
     },
   )
 

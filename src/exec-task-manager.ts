@@ -33,6 +33,9 @@ export interface ExecTask {
   hostname: string
   createdAt: number
   updatedAt: number
+  profileKey?: string
+  sessionId?: string
+  cwd?: string
 }
 
 export interface RunningTaskEntry {
@@ -71,7 +74,7 @@ export class ExecTaskManager {
   private PERSIST_INTERVAL = 1000
   private CLEANUP_INTERVAL = 5 * 60 * 1000
   private CLEANUP_THRESHOLD = 20
-  private TASK_RETENTION_MS = 30 * 60 * 1000
+  private TASK_RETENTION_MS = 24 * 60 * 60 * 1000
 
   constructor() {
     this.loadTasksFromDisk()
@@ -194,12 +197,14 @@ export class ExecTaskManager {
       env?: Record<string, string>
       timeout?: number
       detached?: boolean
+      profileKey?: string
+      sessionId?: string
     }
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
     const taskType = options?.type ?? "exec"
     const isBackground = taskType === "background" || options?.timeout === undefined
-    const persistImmediate = taskType === "background"
+    const persistImmediate = true
     const useDetached = options?.detached || isBackground
 
     let fullCommand = command
@@ -229,6 +234,9 @@ export class ExecTaskManager {
       hostname,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      profileKey: options?.profileKey,
+      sessionId: options?.sessionId,
+      cwd: options?.cwd,
     }
 
     const entry: RunningTaskEntry = {
@@ -239,9 +247,7 @@ export class ExecTaskManager {
     }
 
     this.tasks.set(id, entry)
-    if (persistImmediate) {
-      this.saveTask(entry, true)
-    }
+    this.saveTask(entry, true)
 
     const promise = new Promise<ExecResult>((resolve, reject) => {
       // 对于后台任务，先保持简单，我们先不用复杂的 nohup 包装，避免转义问题
@@ -381,16 +387,9 @@ export class ExecTaskManager {
       entry.task.stderr += `\n${errorMsg}`
     }
 
-    if (entry.persistImmediate) {
-      this.saveTask(entry, true)
-    }
+    this.saveTask(entry, true)
 
     log("exec-task", `Task ${id} finished: ${status}, code=${exitCode}, signal=${signal}`)
-
-    setTimeout(() => {
-      this.tasks.delete(id)
-      this.deleteTaskFile(id)
-    }, this.TASK_RETENTION_MS)
   }
 
   cancel(id: string, client: Client, signal: "TERM" | "HUP" = "TERM"): boolean {

@@ -35,6 +35,7 @@ import { createRequest } from "../ipc-protocol.js"
 import { upload, download } from "../file-transfer.js"
 import { BackgroundExecManager } from "../background-exec.js"
 import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
+import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
 
@@ -52,14 +53,23 @@ interface SshExecConfig {
   timeout?: number
 }
 
-function parseArgs(): { 
-  configPath?: string; 
-  configJson?: string; 
-  profileName?: string; 
+function parseArgs(): {
+  configPath?: string;
+  configJson?: string;
+  profileName?: string;
   profileJson?: string;
-  command?: string; 
-  shell: boolean; 
-  debug: boolean 
+  command?: string;
+  shell: boolean;
+  debug: boolean;
+  scheduler: "auto" | "bypass";
+  reason?: string;
+  intent?: TaskIntent;
+  cost?: TaskCost;
+  urgency?: TaskUrgency;
+  ifBusy?: "run_anyway" | "wait" | "queue" | "fail";
+  force: boolean;
+  cwd?: string;
+  timeout?: number;
 } {
   const args = process.argv.slice(2)
   let configPath: string | undefined
@@ -69,6 +79,15 @@ function parseArgs(): {
   let command: string | undefined
   let shell = false
   let debug = false
+  let scheduler: "auto" | "bypass" = "auto"
+  let reason: string | undefined
+  let intent: TaskIntent | undefined
+  let cost: TaskCost | undefined
+  let urgency: TaskUrgency | undefined
+  let ifBusy: "run_anyway" | "wait" | "queue" | "fail" | undefined
+  let force = false
+  let cwd: string | undefined
+  let timeout: number | undefined
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && i + 1 < args.length) {
@@ -85,6 +104,24 @@ function parseArgs(): {
       shell = true
     } else if (args[i] === "--debug") {
       debug = true
+    } else if (args[i] === "--scheduler" && i + 1 < args.length) {
+      scheduler = args[++i] as "auto" | "bypass"
+    } else if (args[i] === "--reason" && i + 1 < args.length) {
+      reason = args[++i]
+    } else if (args[i] === "--intent" && i + 1 < args.length) {
+      intent = args[++i] as TaskIntent
+    } else if (args[i] === "--cost" && i + 1 < args.length) {
+      cost = args[++i] as TaskCost
+    } else if (args[i] === "--urgency" && i + 1 < args.length) {
+      urgency = args[++i] as TaskUrgency
+    } else if (args[i] === "--if-busy" && i + 1 < args.length) {
+      ifBusy = args[++i] as "run_anyway" | "wait" | "queue" | "fail"
+    } else if (args[i] === "--force") {
+      force = true
+    } else if (args[i] === "--cwd" && i + 1 < args.length) {
+      cwd = args[++i]
+    } else if (args[i] === "--timeout" && i + 1 < args.length) {
+      timeout = parseInt(args[++i])
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.log(`用法:
   ssh-exec [--debug] --config <json文件> --command <命令>       执行命令（单次连接）
@@ -136,7 +173,7 @@ Profile 格式:
     }
   }
 
-  return { configPath, configJson, profileName, profileJson, command, shell, debug }
+  return { configPath, configJson, profileName, profileJson, command, shell, debug, scheduler, reason, intent, cost, urgency, ifBusy, force, cwd, timeout }
 }
 
 /**
@@ -331,6 +368,88 @@ async function interactiveShell(config: SshExecConfig): Promise<void> {
     process.stdin.pause()
     process.stdin.removeAllListeners("data")
     await gw.disconnectAll()
+  }
+}
+
+async function execScheduledCommand(
+  config: SshExecConfig,
+  command: string,
+  opts: {
+    scheduler: "auto" | "bypass"
+    reason?: string
+    intent?: TaskIntent
+    cost?: TaskCost
+    urgency?: TaskUrgency
+    ifBusy?: "run_anyway" | "wait" | "queue" | "fail"
+    force: boolean
+    cwd?: string
+    timeout?: number
+    profileName?: string
+  }
+): Promise<void> {
+  const client = createClient()
+  try {
+    await client.ensureDaemon({ debug: false })
+
+    const configJson = JSON.stringify(config)
+    const connectResp = await client.connectHostJson(configJson)
+    if (!connectResp.ok) {
+      console.error(`Connection failed: ${(connectResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    const { sessionId } = connectResp.data as any
+    const agentIdentity: AgentIdentity = {
+      id: `cli-${process.pid}-${Date.now()}`,
+      clientType: "cli",
+    }
+    const hostIdentity: HostIdentity = {
+      id: sessionId.slice(0, 16),
+      profileKey: sessionId.slice(0, 16),
+      targetHost: config.target.host,
+      targetUser: config.target.username,
+      displayName: opts.profileName ?? config.target.host,
+    }
+
+    const scheduleReq: ScheduleRequest = {
+      agent: agentIdentity,
+      host: hostIdentity,
+      sessionId,
+      command,
+      cwd: opts.cwd,
+      reason: opts.reason,
+      intent: opts.intent,
+      cost: opts.cost,
+      urgency: opts.urgency,
+      ifBusy: opts.ifBusy,
+      scheduler: opts.scheduler,
+      timeoutMs: opts.timeout,
+      force: opts.force,
+    }
+
+    const schedResp = await client.schedule(scheduleReq as unknown as Record<string, unknown>)
+    if (!schedResp.ok) {
+      console.error(`Schedule failed: ${(schedResp as any).error}`)
+      process.exitCode = 1
+      return
+    }
+
+    const decision = schedResp.data as any
+    if (decision.action === "run_now" && decision.result) {
+      if (decision.result.stdout) process.stdout.write(decision.result.stdout)
+      if (decision.result.stderr) process.stderr.write(decision.result.stderr)
+      process.exitCode = decision.result.code ?? 0
+    } else {
+      console.log(JSON.stringify(decision, null, 2))
+      process.exitCode = 0
+    }
+  } catch (err: any) {
+    logError("exec-scheduled", "scheduled exec failed", err)
+    printErrorAndLogPath(err.message)
+    process.exitCode = 1
+  } finally {
+    client.disconnect()
   }
 }
 
@@ -704,7 +823,7 @@ async function main() {
   }
 
   // Original behavior: direct connection (no daemon)
-  const { configPath, configJson, profileName, profileJson, command, shell } = parseArgs()
+  const { configPath, configJson, profileName, profileJson, command, shell, scheduler, reason, intent, cost, urgency, ifBusy, force, cwd, timeout } = parseArgs()
 
   if (!configPath && !configJson && !profileName && !profileJson) {
     console.error("错误: 必须指定 --config <json 文件路径> 或 --config-json '<json 字符串>' 或 --profile-name <profile 名称> 或 --profile-json '<json 字符串>'")
@@ -730,7 +849,7 @@ async function main() {
   if (shell) {
     await interactiveShell(config)
   } else if (command) {
-    await execCommand(config, command)
+    await execScheduledCommand(config, command, { scheduler, reason, intent, cost, urgency, ifBusy, force, cwd, timeout, profileName })
   } else {
     console.error("错误: 必须指定 --command <命令> 或 --shell")
     process.exit(1)

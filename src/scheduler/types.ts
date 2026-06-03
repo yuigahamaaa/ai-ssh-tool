@@ -1,0 +1,154 @@
+export type TaskIntent =
+  | "inspect"
+  | "search"
+  | "test"
+  | "build"
+  | "install"
+  | "server"
+  | "deploy"
+  | "migration"
+  | "cleanup"
+  | "custom"
+
+export type TaskCost = "tiny" | "small" | "medium" | "large" | "exclusive"
+
+export type TaskUrgency = "low" | "normal" | "high" | "urgent"
+
+export type ScheduledTaskStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timeout"
+  | "stale"
+
+export interface AgentIdentity {
+  id: string
+  name?: string
+  clientType: "mcp" | "cli"
+}
+
+export interface HostIdentity {
+  id: string
+  profileKey: string
+  targetHost: string
+  targetUser: string
+  displayName: string
+}
+
+export interface CommandClassification {
+  intent: TaskIntent
+  cost: TaskCost
+  blocking: boolean
+  mutates: boolean
+  risky: boolean
+  source: "agent" | "auto" | "default" | "agent_overridden_by_policy"
+  reason: string
+}
+
+export interface ScheduleRequest {
+  agent: AgentIdentity
+  host: HostIdentity
+  sessionId: string
+  command: string
+  cwd?: string
+  reason?: string
+  intent?: TaskIntent
+  cost?: TaskCost
+  urgency?: TaskUrgency
+  ifBusy?: "run_anyway" | "wait" | "queue" | "fail"
+  scheduler?: "auto" | "bypass"
+  timeoutMs?: number
+  force?: boolean
+}
+
+export interface ScheduledTask {
+  id: string
+  agentId: string
+  agentName?: string
+  hostId: string
+  profileKey: string
+  sessionId: string
+  command: string
+  effectiveCwd?: string
+  reason?: string
+  classification: CommandClassification
+  scheduler: "auto" | "bypass"
+  status: ScheduledTaskStatus
+  queuePosition?: number
+  queuedAt?: number
+  startedAt?: number
+  finishedAt?: number
+  updatedAt: number
+  pid?: number | null
+  exitCode?: number | null
+  signal?: string | null
+  stdoutTail: string
+  stderrTail: string
+  stdoutBytes: number
+  stderrBytes: number
+  decisionReason?: string
+}
+
+export type ScheduledTaskSummary = Pick<
+  ScheduledTask,
+  "id" | "agentId" | "agentName" | "hostId" | "command" | "status" | "classification" | "scheduler" | "startedAt" | "stdoutTail"
+>
+
+export interface ScheduleDecision {
+  action: "run_now" | "queued" | "wait_recommended" | "rejected" | "needs_confirmation"
+  taskId?: string
+  queuePosition?: number
+  effectiveCwd?: string
+  classification?: CommandClassification
+  blockers?: ScheduledTaskSummary[]
+  reason: string
+  recommendedNextStep?: string
+  result?: {
+    stdout: string
+    stderr: string
+    code: number
+    signal?: string
+  }
+}
+
+export interface QueueStatus {
+  hostId?: string
+  running: ScheduledTaskSummary[]
+  queued: ScheduledTaskSummary[]
+  recent: ScheduledTaskSummary[]
+  virtualCwd?: string
+  limits: {
+    maxQueueSize: number
+    maxTotalRunning: number
+    maxLargeRunning: number
+  }
+}
+
+export interface VirtualCwdState {
+  key: string
+  agentId: string
+  hostId: string
+  cwd: string
+  updatedAt: number
+}
+
+export interface TaskRunner {
+  start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+}
+
+export function toSummary(task: ScheduledTask): ScheduledTaskSummary {
+  return {
+    id: task.id,
+    agentId: task.agentId,
+    agentName: task.agentName,
+    hostId: task.hostId,
+    command: task.command,
+    status: task.status,
+    classification: task.classification,
+    scheduler: task.scheduler,
+    startedAt: task.startedAt,
+    stdoutTail: task.stdoutTail,
+  }
+}

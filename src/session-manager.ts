@@ -42,7 +42,7 @@ export class SSHSessionManager extends EventEmitter {
         port: hop.port,
         username: hop.auth?.username,
       }
-    }).sort((a, b) => a.host.localeCompare(b.host))
+    })
     return createHash("md5").update(JSON.stringify(normalized)).digest("hex").slice(0, 16)
   }
 
@@ -53,7 +53,7 @@ export class SSHSessionManager extends EventEmitter {
         port: hop.port,
         username: hop.auth?.username ?? "",
       }
-    }).sort((a, b) => a.host.localeCompare(b.host))
+    })
   }
 
   /** Get existing session by config hash (for session reuse) */

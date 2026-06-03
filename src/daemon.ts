@@ -29,6 +29,8 @@ import {
   type IPCResponse,
   normalizeConfig,
 } from "./ipc-protocol.js"
+import { SchedulerService } from "./scheduler/scheduler-service.js"
+import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
 
 interface DaemonSession {
   sessionId: string
@@ -51,13 +53,28 @@ export class SSHDaemon {
   private startedAt = Date.now()
   private bgManager = new BackgroundExecManager()
   private forwardManagers = new Map<string, PortForwardManager>()
+  private scheduler: SchedulerService
 
-  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number }) {
+  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
     this.idleTimeoutMs = opts?.idleTimeoutMs ?? 10 * 60 * 1000 // 10 min default
     this.gateway = new SSHGateway({
       connectionTimeout: 15000,
       maxSessions: 50,
+    })
+    this.scheduler = opts?.scheduler ?? new SchedulerService({
+      runner: {
+        start: async (task) => {
+          const conn = this.gateway.sessions.getConnection(task.sessionId)
+          if (!conn) throw new Error(`Session ${task.sessionId} not found for scheduled task`)
+          const client = conn.getFinalClient()
+          const cmd = task.effectiveCwd
+            ? `cd ${JSON.stringify(task.effectiveCwd)} && ${task.command}`
+            : task.command
+          const result = await remoteExec(client, cmd, { timeout: 120_000 })
+          return { code: result.code, stdout: result.stdout, stderr: result.stderr, signal: result.signal }
+        },
+      },
     })
   }
 
@@ -207,6 +224,26 @@ export class SSHDaemon {
 
       case "portForward":
         resp = await this.handlePortForward(req)
+        break
+
+      case "schedule":
+        resp = this.handleSchedule(req as any)
+        break
+
+      case "queueStatus":
+        resp = this.handleQueueStatus(req as any)
+        break
+
+      case "waitTask":
+        resp = await this.handleWaitTask(req as any)
+        break
+
+      case "dequeueTask":
+        resp = this.handleDequeueTask(req as any)
+        break
+
+      case "setCwd":
+        resp = this.handleSetCwd(req as any)
         break
 
       default:
@@ -380,6 +417,51 @@ export class SSHDaemon {
       } catch {
         // ignore cleanup errors
       }
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleSchedule(req: { id: string; params: ScheduleRequest }): IPCResponse {
+    try {
+      const decision = this.scheduler.schedule(req.params)
+      return { id: req.id, ok: true, data: decision }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleQueueStatus(req: { id: string; params: { agent?: AgentIdentity; hostId?: string; limit?: number } }): IPCResponse {
+    try {
+      const status = this.scheduler.queueStatus(req.params.hostId, req.params.limit)
+      return { id: req.id, ok: true, data: status }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private async handleWaitTask(req: { id: string; params: { taskId: string; timeoutMs?: number } }): Promise<IPCResponse> {
+    try {
+      const task = await this.scheduler.waitTask(req.params.taskId, req.params.timeoutMs)
+      return { id: req.id, ok: true, data: task }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleDequeueTask(req: { id: string; params: { taskId: string; agent?: AgentIdentity } }): IPCResponse {
+    try {
+      const success = this.scheduler.dequeueTask(req.params.taskId)
+      return { id: req.id, ok: true, data: { dequeued: success } }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleSetCwd(req: { id: string; params: { agent: AgentIdentity; host: HostIdentity; cwd: string } }): IPCResponse {
+    try {
+      const cwd = this.scheduler.setCwd(req.params.agent.id, req.params.host.id, req.params.cwd)
+      return { id: req.id, ok: true, data: { success: true, cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" } }
+    } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
     }
   }

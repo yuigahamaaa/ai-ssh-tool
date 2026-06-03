@@ -8,6 +8,7 @@ import { resolve } from "path"
 import { log, logError, printErrorAndLogPath } from "../logger.js"
 import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
+import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 
 function createClient(): DaemonClient {
   return new DaemonClient()
@@ -91,6 +92,15 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
   let profileName: string | undefined
   let profileJson: string | undefined
   let command: string | undefined
+  let scheduler: "auto" | "bypass" = "auto"
+  let reason: string | undefined
+  let intent: TaskIntent | undefined
+  let cost: TaskCost | undefined
+  let urgency: TaskUrgency | undefined
+  let ifBusy: "run_anyway" | "wait" | "queue" | "fail" | undefined
+  let force = false
+  let cwd: string | undefined
+  let timeout: number | undefined
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && i + 1 < args.length) {
@@ -103,6 +113,24 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
       profileJson = args[++i]
     } else if (args[i] === "--command" && i + 1 < args.length) {
       command = args[++i]
+    } else if (args[i] === "--scheduler" && i + 1 < args.length) {
+      scheduler = args[++i] as "auto" | "bypass"
+    } else if (args[i] === "--reason" && i + 1 < args.length) {
+      reason = args[++i]
+    } else if (args[i] === "--intent" && i + 1 < args.length) {
+      intent = args[++i] as TaskIntent
+    } else if (args[i] === "--cost" && i + 1 < args.length) {
+      cost = args[++i] as TaskCost
+    } else if (args[i] === "--urgency" && i + 1 < args.length) {
+      urgency = args[++i] as TaskUrgency
+    } else if (args[i] === "--if-busy" && i + 1 < args.length) {
+      ifBusy = args[++i] as "run_anyway" | "wait" | "queue" | "fail"
+    } else if (args[i] === "--force") {
+      force = true
+    } else if (args[i] === "--cwd" && i + 1 < args.length) {
+      cwd = args[++i]
+    } else if (args[i] === "--timeout" && i + 1 < args.length) {
+      timeout = parseInt(args[++i])
     }
   }
 
@@ -171,20 +199,54 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
       console.error(`[ssh-exec] connected, session ${sessionId.slice(0, 8)}`)
     }
 
-    log("daemon-cli", `Executing: ${command}`)
-    const execResp = await client.exec(sessionId, command)
-    if (!execResp.ok) {
-      log("daemon-cli", `Exec failed: ${(execResp as any).error}`)
-      printErrorAndLogPath((execResp as any).error)
+    const hostIdentity: HostIdentity = {
+      id: sessionId.slice(0, 16),
+      profileKey: sessionId.slice(0, 16),
+      targetHost: (connectResp.data as any)?.host ?? "unknown",
+      targetUser: "unknown",
+      displayName: profileName ?? configPath ?? "inline",
+    }
+    const agentIdentity: AgentIdentity = {
+      id: `cli-${process.pid}-${Date.now()}`,
+      clientType: "cli",
+    }
+
+    const scheduleReq: ScheduleRequest = {
+      agent: agentIdentity,
+      host: hostIdentity,
+      sessionId,
+      command: command!,
+      cwd,
+      reason,
+      intent,
+      cost,
+      urgency,
+      ifBusy,
+      scheduler,
+      timeoutMs: timeout,
+      force,
+    }
+
+    log("daemon-cli", `Scheduling: ${command} (scheduler=${scheduler})`)
+    const schedResp = await client.schedule(scheduleReq as unknown as Record<string, unknown>)
+    if (!schedResp.ok) {
+      log("daemon-cli", `Schedule failed: ${(schedResp as any).error}`)
+      printErrorAndLogPath((schedResp as any).error)
       process.exitCode = 1
       return
     }
 
-    const result = execResp.data as any
-    log("daemon-cli", `Exit code: ${result.code}, stdout: ${result.stdout?.length}B, stderr: ${result.stderr?.length}B`)
-    if (result.stdout) process.stdout.write(result.stdout)
-    if (result.stderr) process.stderr.write(result.stderr)
-    process.exitCode = result.code ?? 0
+    const decision = schedResp.data as any
+    log("daemon-cli", `Decision: ${decision.action}`)
+
+    if (decision.action === "run_now" && decision.result) {
+      if (decision.result.stdout) process.stdout.write(decision.result.stdout)
+      if (decision.result.stderr) process.stderr.write(decision.result.stderr)
+      process.exitCode = decision.result.code ?? 0
+    } else {
+      console.log(JSON.stringify(decision, null, 2))
+      process.exitCode = 0
+    }
   } catch (err: any) {
     logError("daemon-cli", "daemon exec failed", err)
     printErrorAndLogPath(err.message)

@@ -138,12 +138,8 @@ export class ProfileManager {
    * 4. 用户主目录的 .ssh-tool/profiles/
    */
   loadFromFile(profileFile: string): SSHProfile | undefined {
-    if (existsSync(profileFile)) {
-      const raw = readFileSync(profileFile, "utf-8")
-      return JSON.parse(raw) as SSHProfile
-    }
-
     const searchPaths = [
+      profileFile,
       join(process.cwd(), "profiles", profileFile),
       join(process.cwd(), "..", "profiles", profileFile),
       join(process.env.HOME ?? ".", ".ssh-tool", "profiles", profileFile),
@@ -152,11 +148,31 @@ export class ProfileManager {
     for (const searchPath of searchPaths) {
       if (existsSync(searchPath)) {
         const raw = readFileSync(searchPath, "utf-8")
-        return JSON.parse(raw) as SSHProfile
+        return ProfileManager.normalizeProfile(JSON.parse(raw))
       }
     }
 
     return undefined
+  }
+
+  static normalizeProfile(data: Record<string, unknown>): SSHProfile {
+    if (!data || !Array.isArray(data.chain)) {
+      throw new Error("Invalid profile: missing chain array")
+    }
+    return {
+      ...data,
+      chain: (data.chain as Record<string, unknown>[]).map((hop: Record<string, unknown>) => {
+        if (hop.auth) return hop as unknown as Omit<SSHHostConfig, "id">
+        const { host, port, name, username, password, privateKey, passphrase, ...rest } = hop as Record<string, unknown>
+        return {
+          ...rest,
+          name: name ?? host,
+          host,
+          port: port ?? 22,
+          auth: { username, password, privateKey, passphrase },
+        } as unknown as Omit<SSHHostConfig, "id">
+      }),
+    } as unknown as SSHProfile
   }
 
   /** List all profiles */

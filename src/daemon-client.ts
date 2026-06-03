@@ -149,6 +149,31 @@ export class DaemonClient {
     }
   }
 
+  /** Schedule a command through the daemon scheduler */
+  async schedule(req: Record<string, unknown>): Promise<IPCResponse> {
+    return this.send(createRequest("schedule", req), 120000)
+  }
+
+  /** Get queue status */
+  async queueStatus(params: { agent?: { id: string; name?: string; clientType: string }; hostId?: string; limit?: number }): Promise<IPCResponse> {
+    return this.send(createRequest("queueStatus", params))
+  }
+
+  /** Wait for a task to complete */
+  async waitTask(taskId: string, timeoutMs?: number): Promise<IPCResponse> {
+    return this.send(createRequest("waitTask", { taskId, timeoutMs }), timeoutMs ?? 120000)
+  }
+
+  /** Remove a task from the queue */
+  async dequeueTask(taskId: string, agent?: { id: string; name?: string; clientType: string }): Promise<IPCResponse> {
+    return this.send(createRequest("dequeueTask", { taskId, agent }))
+  }
+
+  /** Set virtual cwd for an agent on a host */
+  async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string): Promise<IPCResponse> {
+    return this.send(createRequest("setCwd", { agent, host, cwd }))
+  }
+
   /** Spawn daemon as a detached background process */
   private async startDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
     const daemonScript = this.findDaemonScript()

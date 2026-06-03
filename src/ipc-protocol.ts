@@ -22,6 +22,8 @@ export function getPidPath(): string {
   return join(homedir(), ".ssh-exec-daemon.pid")
 }
 
+import type { ScheduleRequest } from "./scheduler/types.js"
+
 // --- Request types ---
 
 export type IPCRequest =
@@ -32,6 +34,11 @@ export type IPCRequest =
   | { id: string; action: "transfer"; params: { sessionId: string; action: string; localPath: string; remotePath: string } }
   | { id: string; action: "bgExec"; params: { sessionId: string; subcommand: string; command?: string; taskId?: string } }
   | { id: string; action: "portForward"; params: { sessionId: string; subcommand: string; type?: string; bindAddr?: string; bindPort?: number; dstAddr?: string; dstPort?: number; forwardId?: string } }
+  | { id: string; action: "schedule"; params: ScheduleRequest }
+  | { id: string; action: "queueStatus"; params: { agent?: { id: string; name?: string; clientType: string }; hostId?: string; limit?: number } }
+  | { id: string; action: "waitTask"; params: { taskId: string; timeoutMs?: number } }
+  | { id: string; action: "dequeueTask"; params: { taskId: string; agent?: { id: string; name?: string; clientType: string } } }
+  | { id: string; action: "setCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }; cwd: string } }
   | { id: string; action: "list" }
   | { id: string; action: "ping" }
   | { id: string; action: "shutdown" }
@@ -82,7 +89,7 @@ export function createRequest(
   params?: Record<string, unknown>,
 ): IPCRequest {
   const id = randomUUID()
-  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec" || action === "portForward") {
+  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec" || action === "portForward" || action === "schedule" || action === "queueStatus" || action === "waitTask" || action === "dequeueTask" || action === "setCwd") {
     return { id, action, params: params as any }
   }
   return { id, action } as IPCRequest
