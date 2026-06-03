@@ -4,360 +4,366 @@
 
 ---
 
-## 🔐 安全最佳实践（必读！）
+## 🚀 快速入门（AI 初学者指南）
 
-### ✅ 推荐方式：使用 SSH 私钥（最安全）
+### 我是谁？
 
-**强烈推荐使用 SSH 密钥认证，而不是密码！**
+我是一个专门帮你管理远程服务器的工具！你可以用我来：
+- ✅ 在远程服务器上执行命令
+- ✅ 上传和下载文件/文件夹
+- ✅ 管理多个服务器配置（Profile）
+- ✅ 在后台运行长时间任务
+- ✅ 建立端口转发访问内部服务
 
+### 我的工作方式
+
+我通过 **MCP 协议** 与你通信。你只需要调用我的工具函数，我就会帮你完成操作！
+
+---
+
+## 📖 核心概念讲解
+
+### 1. Profile（配置文件）
+
+Profile 是一个服务器的连接配置，包含：
+- 服务器地址 (host)
+- 用户名 (username)
+- 认证方式（密码或私钥）
+- 可选的跳板机配置
+
+**为什么需要 Profile？**
+- 方便管理多个服务器
+- 不需要每次都输入完整配置
+- 支持动态注册和切换
+
+### 2. 两种使用方式
+
+**方式 A：使用已保存的 Profile**
 ```json
 {
-  "target": {
-    "host": "192.168.1.100",
-    "username": "root",
-    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...你的私钥内容...\n-----END OPENSSH PRIVATE KEY-----"
+  "profile_name": "my-server"
+}
+```
+
+**方式 B：动态传入配置**
+```json
+{
+  "profile_json": "{\"id\":\"default\",\"name\":\"default\",\"chain\":[{\"host\":\"192.168.1.100\",\"port\":22,\"username\":\"root\",\"privateKey\":\"-----BEGIN OPENSSH PRIVATE KEY-----...\"}]}"
+}
+```
+
+### 3. 路径格式
+
+- **本地路径**：你的电脑上的文件路径，如 `/Users/you/project`
+- **远程路径**：服务器上的文件路径，如 `/var/www/html`
+
+---
+
+## 🛠️ MCP 工具列表（AI 常用工具速查表）
+
+### 📋 基础工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_exec` | 在远程执行命令 | `command`, `cwd`, `profile_name` |
+| `ssh_read_file` | 读取远程文件 | `path`, `offset`, `limit` |
+| `ssh_write_file` | 写入远程文件 | `path`, `content` |
+| `ssh_list_dir` | 列出目录内容 | `path`, `show_hidden` |
+| `ssh_exists` | 检查路径是否存在 | `path` |
+| `ssh_stat` | 获取文件/目录信息 | `path` |
+| `ssh_grep` | 在文件中搜索 | `pattern`, `path` |
+| `ssh_find` | 查找文件 | `path`, `name`, `type` |
+
+### 📤 文件传输工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_upload` | 上传本地文件/文件夹到远程 | `local_path`, `remote_path` |
+| `ssh_download` | 下载远程文件/文件夹到本地 | `remote_path`, `local_path` |
+
+### 🔄 后台任务工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_exec_background` | 在后台执行命令 | `command`, `cwd` |
+| `ssh_exec_status` | 查看后台任务状态 | `task_id` |
+| `ssh_exec_cancel` | 取消后台任务 | `task_id` |
+| `ssh_list_tasks` | 列出所有任务 | `hostname` |
+
+### 🔐 Profile 管理工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_list_profiles` | 列出所有配置文件 | 无 |
+| `ssh_add_profile` | **动态添加配置** | `name`, `alias`, `chain` |
+| `ssh_get_profile` | 获取配置详情 | `profile_id/name/alias` |
+| `ssh_remove_profile` | 删除配置 | `profile_id/name` |
+
+### 🌐 网络工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_local_forward` | 本地端口转发 | `local_port`, `remote_host`, `remote_port` |
+| `ssh_remote_forward` | 远程端口转发 | `remote_port`, `local_host`, `local_port` |
+| `ssh_get_host_load` | 获取服务器负载 | 无 |
+
+### 📡 会话管理工具
+
+| 工具名 | 功能 | 常用参数 |
+|--------|------|----------|
+| `ssh_list_sessions` | 列出所有会话 | 无 |
+| `ssh_disconnect` | 断开指定会话 | `session_id` |
+| `ssh_cd` | 切换工作目录 | `path` |
+
+---
+
+## 🎯 实际使用示例（AI 学习案例）
+
+### 案例 1：首次连接服务器
+
+**步骤 1：添加一个新的 Profile**
+```json
+{
+  "name": "ssh_add_profile",
+  "parameters": {
+    "name": "生产服务器",
+    "alias": "prod",
+    "chain": "[{\"host\":\"192.168.1.100\",\"port\":22,\"username\":\"root\",\"privateKey\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\\n-----END OPENSSH PRIVATE KEY-----\"}]"
   }
 }
 ```
 
-或者更好的方式：**直接读取本地私钥文件**（更安全，不用把私钥写在 JSON 里）
+**步骤 2：执行命令检查服务器**
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "uname -a && uptime",
+    "profile_name": "prod"
+  }
+}
+```
 
-### ⚠️ 密码使用注意事项
+### 案例 2：上传网站代码到服务器
 
-如果你必须使用密码：
-1. **不要把配置文件提交到 Git！**
-2. **配置文件权限已设置为 600**（仅你可读写）
-3. ProfileManager 使用的 XOR 混淆**不是加密**，仅防止随手查看
-4. 生产环境建议使用 SSH Agent 或系统钥匙串
+```json
+{
+  "name": "ssh_upload",
+  "parameters": {
+    "local_path": "/Users/me/my-website",
+    "remote_path": "/var/www/html",
+    "overwrite": "overwrite",
+    "profile_name": "prod"
+  }
+}
+```
 
-### 🛡️ ProfileManager 的安全措施
+### 案例 3：后台运行长时间任务
 
-| 措施 | 说明 |
-|------|------|
-| 文件权限 | `profiles.json` 权限为 600（仅所有者可读） |
-| 目录权限 | `~/.opencode/ssh/` 权限为 700（仅所有者可访问） |
-| 密码混淆 | XOR 混淆（非加密，仅防随手看） |
+**步骤 1：启动后台任务**
+```json
+{
+  "name": "ssh_exec_background",
+  "parameters": {
+    "command": "npm run build && npm start",
+    "cwd": "/var/www/html",
+    "profile_name": "prod"
+  }
+}
+```
 
----
+**步骤 2：查看任务状态**
+```json
+{
+  "name": "ssh_exec_status",
+  "parameters": {
+    "task_id": "abc123"
+  }
+}
+```
 
-## 核心能力
+### 案例 4：访问内部数据库（端口转发）
 
-| 能力 | 说明 |
-|------|------|
-| N-hop 跳板机 | JSON 声明式配置，支持任意级跳转 |
-| Daemon 连接复用 | 后台进程保持连接，命令秒执行 |
-| MCP Server | 标准 MCP 协议，AI agent 原生集成 |
-| 文件传输 | 单文件流式传输，支持大文件 |
-| 文件夹传输 | 压缩 → 传输 → 解压，全自动化 |
-| 后台执行 | detach 模式，支持状态查询和日志读取 |
-| SSH Config 解析 | 自动读取 `~/.ssh/config` |
+```json
+{
+  "name": "ssh_local_forward",
+  "parameters": {
+    "local_port": 5432,
+    "remote_host": "127.0.0.1",
+    "remote_port": 5432,
+    "profile_name": "prod"
+  }
+}
+```
 
----
+现在你可以通过 `localhost:5432` 访问远程数据库了！
 
-## 安装
+### 案例 5：下载日志文件
 
-```bash
-npm install
-npm run build
+```json
+{
+  "name": "ssh_download",
+  "parameters": {
+    "remote_path": "/var/log/nginx/access.log",
+    "local_path": "/Users/me/Downloads/access.log",
+    "profile_name": "prod"
+  }
+}
 ```
 
 ---
 
-## 配置
+## 🔑 认证方式详解
 
-### 🎯 方式一：使用 SSH 私钥（推荐，最安全）
+### 方式 1：SSH 私钥（推荐，最安全）
 
 ```json
 {
-  "target": {
+  "chain": [{
     "host": "192.168.1.100",
+    "port": 22,
     "username": "root",
     "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAACFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAgEAx...\n-----END OPENSSH PRIVATE KEY-----"
-  }
+  }]
 }
 ```
 
-### 🔑 方式二：使用密码（⚠️ 仅用于测试环境）
+### 方式 2：密码（仅测试环境）
 
 ```json
 {
-  "target": {
+  "chain": [{
     "host": "192.168.1.100",
+    "port": 22,
     "username": "root",
-    "password": "你的密码"
-  }
+    "password": "your-password"
+  }]
 }
 ```
 
-**⚠️ 重要警告：**
-- 不要把包含密码的配置文件提交到 Git！
-- 在 `.gitignore` 中添加你的配置文件！
-- 生产环境必须使用 SSH 密钥！
-
-### 🚪 通过跳板机连接
+### 方式 3：通过跳板机（N-hop）
 
 ```json
 {
-  "gateways": [
+  "chain": [
     {
       "host": "bastion.company.com",
       "port": 22,
       "username": "ops",
-      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...跳板机私钥...\n-----END OPENSSH PRIVATE KEY-----"
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...跳板机密钥...\n-----END OPENSSH PRIVATE KEY-----"
+    },
+    {
+      "host": "10.0.0.50",
+      "port": 22,
+      "username": "deploy",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...目标机密钥...\n-----END OPENSSH PRIVATE KEY-----"
     }
-  ],
-  "target": {
-    "host": "10.0.0.50",
-    "username": "deploy",
-    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...目标机私钥...\n-----END OPENSSH PRIVATE KEY-----"
-  }
+  ]
 }
 ```
 
-### 📋 全部配置字段
+---
 
-| 字段 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| `target.host` | 是 | - | 服务器地址（IP 或域名） |
-| `target.username` | 是 | - | 登录用户名 |
-| `target.password` | 否 | - | 密码（和 privateKey 二选一） |
-| `target.privateKey` | 否 | - | 私钥内容（推荐） |
-| `target.port` | 否 | 22 | SSH 端口 |
-| `gateways` | 否 | [] | 跳板机列表（按连接顺序） |
-| `gateways[].host` | 是 | - | 跳板机地址 |
-| `gateways[].username` | 是 | - | 跳板机用户名 |
-| `gateways[].password` | 否 | - | 跳板机密码 |
-| `gateways[].privateKey` | 否 | - | 跳板机私钥 |
-| `timeout` | 否 | 30000 | 连接超时（毫秒） |
+## ⚠️ 安全注意事项
+
+1. **不要把私钥提交到 Git！**
+2. **不要在对话中发送密码或私钥！**
+3. 使用 `profile_name` 比直接传入 `profile_json` 更安全
+4. Profile 文件权限已设置为 600（仅你可读写）
+5. 生产环境必须使用 SSH 私钥，禁止使用密码！
 
 ---
 
-## 使用方式
+## 📊 返回值说明
 
-### 1. CLI 直接执行
-
-```bash
-# 执行命令
-node dist/cli/ssh-exec.js --config server.json --command "uname -a"
-
-# 直接传 JSON
-node dist/cli/ssh-exec.js --config-json '{"target":{"host":"10.0.0.1","username":"root"}}' --command "uptime"
-```
-
-### 2. Daemon 持久化模式（推荐）
-
-```bash
-# 首次自动启动 daemon，后续复用连接
-node dist/cli/ssh-exec.js daemon exec --config server.json --command "df -h"
-node dist/cli/ssh-exec.js daemon exec --config server.json --command "free -h"
-
-# 查看会话
-node dist/cli/ssh-exec.js daemon sessions
-
-# 停止 daemon
-node dist/cli/ssh-exec.js daemon stop
-```
-
-### 3. MCP Server（AI Agent 推荐）
-
-```bash
-# 启动 MCP 服务器（stdio 模式）
-node dist/mcp-server.js --config server.json
-
-# 通过 CLI 启动
-node dist/cli/ssh-exec.js mcp --config server.json
-```
-
-MCP 暴露 21 个工具：
-- `remote_exec` — 执行远程命令
-- `remote_read_file` / `remote_write_file` — 读写文件
-- `remote_list_dir` / `remote_exists` / `remote_stat` — 目录/文件操作
-- `remote_grep` / `remote_find` — 搜索
-- `upload` / `download` — 自动判断文件 / 文件夹，单一接口（文件走 SFTP，文件夹走 tar+gzip）
-- `exec_background` / `exec_status` / `exec_cancel` / `list_tasks` — 后台执行（跨进程可见）
-- `get_host_load` — 获取远程主机负载（CPU、内存、进程数、运行中任务）
-
-### 4. 文件传输
-
-`upload` / `download` 自动判断路径是文件还是文件夹，不再分两个子命令。
-
-```bash
-# 上传文件 / 文件夹（自动判断）
-node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action upload --local ./app.tar.gz --remote /tmp/app.tar.gz
-node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action upload --local ./my-project --remote /opt/my-project
-
-# 下载文件 / 文件夹（自动判断）
-node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action download --remote /var/log/syslog --local ./syslog.txt
-node dist/cli/ssh-exec.js daemon transfer --config server.json \
-  --action download --remote /opt/my-project --local ./downloaded
-```
-
-### 5. 后台执行（detach）
-
-```bash
-# 启动后台命令
-node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
-  --sub start --command "nohup python train.py > train.log 2>&1 &"
-
-# 查询状态
-node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
-  --sub status --task-id <taskId>
-
-# 读取输出
-node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
-  --sub output --task-id <taskId>
-
-# 取消任务
-node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
-  --sub cancel --task-id <taskId>
-
-# 列出所有任务
-node dist/cli/ssh-exec.js daemon bg-exec --config server.json --sub list
-```
-
----
-
-## 命令速查
-
-| 命令 | 说明 |
-|------|------|
-| `--config <文件>` | 配置文件路径 |
-| `--config-json '<JSON>'` | 直接传 JSON 配置 |
-| `--command "<命令>"` | 要执行的命令 |
-| `--shell` | 交互式 shell |
-| `--debug` | 调试日志 |
-| `daemon start` | 启动 daemon |
-| `daemon stop` | 停止 daemon |
-| `daemon exec` | 通过 daemon 执行命令 |
-| `daemon sessions` | 查看活跃会话 |
-| `daemon disconnect <id>` | 断开指定连接 |
-| `daemon ping` | 检查 daemon 状态 |
-| `daemon transfer` | 文件/文件夹传输 |
-| `daemon bg-exec` | 后台执行管理 |
-| `mcp` | 启动 MCP 服务器 |
-
----
-
-## MCP 集成配置
-
-### Claude Desktop / Cursor 配置示例
-
+### 成功响应
 ```json
 {
-  "mcpServers": {
-    "ssh-remote": {
-      "command": "node",
-      "args": ["/path/to/ssh-tool/dist/mcp-server.js", "--config", "/path/to/server.json"]
+  "content": [
+    {
+      "type": "text",
+      "text": "命令执行结果或状态信息"
     }
-  }
+  ]
+}
+```
+
+### 错误响应
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Error: 错误描述"
+    }
+  ]
 }
 ```
 
 ---
 
-## 调试
+## 🎈 小贴士
 
-```bash
-# 开启调试日志
-node dist/cli/ssh-exec.js --debug --config server.json --command "ls"
-# 生成: logs/debug-192.168.1.100-ls-20260531-021557.log
-```
-
-| 日志关键字 | 问题 | 处理 |
-|-----------|------|------|
-| `All configured authentication methods failed` | 认证失败 | 检查用户名/密码 |
-| `getaddrinfo ENOTFOUND` | DNS 失败 | 检查 IP 地址 |
-| `Timed out while waiting for handshake` | 连接超时 | 检查网络 |
-| `ENOENT .ssh-exec-daemon.sock` | Daemon 未启动 | `daemon start` |
+1. **使用短别名**：为常用服务器设置 `alias`，可以快速访问
+2. **先检查再操作**：用 `ssh_exists` 检查路径是否存在
+3. **后台任务管理**：长时间运行的任务用 `ssh_exec_background`
+4. **服务器负载**：执行任务前可以用 `ssh_get_host_load` 检查负载
+5. **清理会话**：不用的会话记得用 `ssh_disconnect` 断开
 
 ---
 
-## 移植
+## 📝 完整工具参数参考
 
-```bash
-# 复制整个目录后
-npm install && npm run build
-```
+### ssh_exec
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| command | string | 是 | 要执行的命令 |
+| cwd | string | 否 | 工作目录 |
+| timeout | number | 否 | 超时时间（毫秒） |
+| profile_name | string | 否 | Profile 名称 |
+| profile_json | string | 否 | Profile JSON 字符串 |
 
----
+### ssh_upload / ssh_download
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| local_path | string | 是（upload） | 本地路径 |
+| remote_path | string | 是（download） | 远程路径 |
+| compression_level | number | 否 | 压缩级别 1-9 |
+| overwrite | string | 否 | ask/skip/overwrite/rename/backup |
+| skip_symlinks | boolean | 否 | 是否跳过符号链接 |
+| profile_name | string | 否 | Profile 名称 |
+| profile_json | string | 否 | Profile JSON 字符串 |
 
-## 测试
-
-### 快速开始 - 日常开发使用
-```bash
-# 日常开发首选 - 快速单元测试（推荐）
-npm run test:fast
-
-# 需要时运行慢速测试
-npm run test:slow
-
-# 集成测试
-npm run test:integration
-
-# 性能测试
-npm run test:performance
-
-# 完整测试
-npm run test:all
-```
-
-### 测试分组说明 (2025-06-01 更新)
-| 命令 | 说明 | 适用场景 | 包含文件 |
-|------|------|----------|----------|
-| `npm run test:fast` | 快速单元测试 | 日常开发、CI、PR检查 | 18个核心测试 |
-| `npm run test:slow` | 慢速 IPC/daemon 测试 | 发布前验证 | `daemon-lifecycle.test.ts` |
-| `npm run test:integration` | 集成测试 | 冒烟测试、完整工作流 | `integration.test.ts` |
-| `npm run test:performance` | 性能测试 | 性能回归检查 | `performance.test.ts` |
-
-### 重要提示
-- **日常开发请使用 `npm run test:fast`**，避免被慢速测试阻塞
-- 完整测试审查报告详见：[TEST_REVIEW_20250601.md](./TEST_REVIEW_20250601.md)
-- 测试设计文档：[TEST_DESIGN.md](./TEST_DESIGN.md)
-
-### 所有测试文件清单
-| 测试文件 | 覆盖模块 | 用例数 | 类型 |
-|----------|----------|--------|------|
-| `daemon.test.ts` | IPC Protocol、Config Hash | 14 | 快速 |
-| `daemon-lifecycle.test.ts` | Daemon IPC 生命周期 | 8 | 慢速 |
-| `session-manager.test.ts` | SSHSessionManager | 20 | 快速 |
-| `profile-manager.test.ts` | ProfileManager CRUD | 18 | 快速 |
-| `remote-shell.test.ts` | remoteExec、execOnChain | 10 | 快速 |
-| `remote-fs.test.ts` | SFTP 文件操作 | 17 | 快速 |
-| `remote-tools.test.ts` | RemoteTools 工具集 | 22 | 快速 |
-| `connection.test.ts` | SSHConnection | 13 | 快速 |
-| `gateway.test.ts` | SSHGateway 门面 | 17 | 快速 |
-| `logger.test.ts` | 日志模块 | - | 快速 |
-| `multi-hop-auth.test.ts` | 多跳认证 | 10+ | 快速 |
-| `file-transfer.test.ts` | 文件传输 | 10+ | 快速 |
-| `background-exec.test.ts` | 后台执行 | 8+ | 快速 |
-| `port-forwarding.test.ts` | 端口转发 | 6+ | 快速 |
-| `error-handling.test.ts` | 错误处理 | 12+ | 快速 |
-| `mcp-server.test.ts` | MCP 工具集成 | 20+ | 快速 |
-| `session-reuse.test.ts` | Session 复用 | 10+ | 快速 |
-| `daemon-ipc.test.ts` | Daemon IPC 协议 | 20+ | 快速 |
-| `agent-auth.test.ts` | Agent 认证 | 10+ | 快速 |
-| `integration.test.ts` | 完整工作流集成 | 20+ | 集成 |
-| `performance.test.ts` | 性能基准测试 | 10+ | 性能 |
-| **总计** | | **~250+** | |
+### ssh_add_profile
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| name | string | 是 | Profile 显示名称 |
+| alias | string | 否 | 短别名 |
+| chain | string | 是 | 连接链的 JSON 字符串 |
+| tags | array | 否 | 标签数组 |
 
 ---
 
-## 与其他方案对比
+## 💡 AI 使用建议
 
-| 能力 | 本工具 | 原生 ssh | node-ssh | VS Code Remote |
-|------|--------|----------|----------|----------------|
-| N-hop 跳板机 | JSON 声明 | ProxyJump | jumpHost | 自动 |
-| 连接复用 | Daemon 自动 | 手动 | 不支持 | 自动 |
-| AI 工具集成 | 21 个 MCP 工具 | 无 | 无 | Copilot |
-| 文件夹传输 | 压缩自动传输 | 需 scp | 无 | 内置 |
-| 后台执行 | detach 模式 | screen/tmux | 无 | 无 |
-| 运行时依赖 | Node.js | 系统自带 | Node.js | VS Code |
+**最佳实践流程：**
+
+1. **列出现有 Profile** → `ssh_list_profiles`
+2. **如果没有合适的** → `ssh_add_profile` 添加新配置
+3. **检查服务器状态** → `ssh_get_host_load`
+4. **执行操作** → `ssh_exec` / `ssh_upload` / `ssh_download`
+5. **查看结果** → 根据工具返回判断是否成功
+6. **清理资源** → `ssh_disconnect`（如果不再需要）
+
+**常见场景：**
+- ✅ 部署代码到服务器
+- ✅ 查看服务器日志
+- ✅ 运行定时任务
+- ✅ 访问内部服务
+- ✅ 备份文件
 
 ---
 
-## 许可
+**祝你使用愉快！🚀**
 
-MIT
+如果有任何问题，随时问我！我会帮助你理解和使用这个工具。

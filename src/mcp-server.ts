@@ -583,6 +583,88 @@ async function main() {
     },
   )
 
+  server.tool(
+    "ssh_add_profile",
+    "Add a new SSH profile. This allows dynamic registration of SSH connections. The profile will be saved to disk.",
+    {
+      name: z.string().describe("Profile name (display name)"),
+      alias: z.string().optional().describe("Short alias for quick reference"),
+      chain: z.string().describe("JSON string of SSH connection chain. Example: [{\"host\":\"gateway.example.com\",\"port\":22,\"username\":\"user\",\"privateKey\":\"...\"},{\"host\":\"target.example.com\",\"port\":22,\"username\":\"deploy\",\"privateKey\":\"...\"}]"),
+      tags: z.array(z.string()).optional().describe("Array of tags for organization"),
+    },
+    async ({ name, alias, chain, tags }) => {
+      try {
+        const chainArray = JSON.parse(chain) as Omit<SSHHostConfig, "id">[]
+        const profile = profileManager.add({
+          name,
+          alias,
+          chain: chainArray,
+          tags,
+        })
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, profileId: profile.id, message: `Profile '${name}' added successfully` }) }] }
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (err as Error).message }) }] }
+      }
+    },
+  )
+
+  server.tool(
+    "ssh_remove_profile",
+    "Remove an existing SSH profile by ID or name.",
+    {
+      profile_id: z.string().optional().describe("Profile ID to remove"),
+      profile_name: z.string().optional().describe("Profile name to remove (alternative to profile_id)"),
+    },
+    async ({ profile_id, profile_name }) => {
+      if (!profile_id && !profile_name) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Must provide profile_id or profile_name" }) }] }
+      }
+
+      let removed = false
+      if (profile_id) {
+        removed = profileManager.delete(profile_id)
+      } else if (profile_name) {
+        const profile = profileManager.getByName(profile_name)
+        if (profile) {
+          removed = profileManager.delete(profile.id)
+        }
+      }
+
+      if (removed) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: "Profile removed successfully" }) }] }
+      } else {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
+      }
+    },
+  )
+
+  server.tool(
+    "ssh_get_profile",
+    "Get a specific SSH profile by ID, name, or alias.",
+    {
+      profile_id: z.string().optional().describe("Profile ID"),
+      profile_name: z.string().optional().describe("Profile name"),
+      profile_alias: z.string().optional().describe("Profile alias"),
+    },
+    async ({ profile_id, profile_name, profile_alias }) => {
+      let profile: SSHProfile | undefined
+
+      if (profile_id) {
+        profile = profileManager.get(profile_id)
+      } else if (profile_name) {
+        profile = profileManager.getByName(profile_name)
+      } else if (profile_alias) {
+        profile = profileManager.getByAlias(profile_alias)
+      }
+
+      if (profile) {
+        return { content: [{ type: "text" as const, text: JSON.stringify(profile) }] }
+      } else {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
+      }
+    },
+  )
+
   // --- Session management ---
   server.tool(
     "ssh_list_sessions",
