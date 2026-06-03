@@ -3,10 +3,13 @@ dist/
 logs/
 *.log
 .DS_Store
+debug.log
+test-*.log
 
 # 🔐 SSH 配置文件（可能包含密码/私钥，不要提交！）
 *.json
 !configs/
+!profiles/*.json
 !tsconfig*.json
 !package*.json
 .opencode/

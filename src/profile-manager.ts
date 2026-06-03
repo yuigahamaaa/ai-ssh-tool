@@ -129,6 +129,36 @@ export class ProfileManager {
     return this.profiles.find((p) => p.alias === alias)
   }
 
+  /**
+   * 从文件路径加载配置，支持多路径搜索
+   * 搜索顺序：
+   * 1. 绝对路径直接查找
+   * 2. 当前目录下的 profiles/ 文件夹
+   * 3. 项目根目录（ssh-tool 上一级）的 profiles/ 文件夹
+   * 4. 用户主目录的 .ssh-tool/profiles/
+   */
+  loadFromFile(profileFile: string): SSHProfile | undefined {
+    if (existsSync(profileFile)) {
+      const raw = readFileSync(profileFile, "utf-8")
+      return JSON.parse(raw) as SSHProfile
+    }
+
+    const searchPaths = [
+      join(process.cwd(), "profiles", profileFile),
+      join(process.cwd(), "..", "profiles", profileFile),
+      join(process.env.HOME ?? ".", ".ssh-tool", "profiles", profileFile),
+    ]
+
+    for (const searchPath of searchPaths) {
+      if (existsSync(searchPath)) {
+        const raw = readFileSync(searchPath, "utf-8")
+        return JSON.parse(raw) as SSHProfile
+      }
+    }
+
+    return undefined
+  }
+
   /** List all profiles */
   list(): SSHProfile[] {
     return [...this.profiles]

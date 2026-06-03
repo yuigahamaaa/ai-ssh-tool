@@ -1,5 +1,5 @@
 {
-  "name": "ai-ssh-tool",
+  "name": "ssh-tool",
   "version": "2.0.0",
   "description": "SSH multi-hop tool for AI agents - MCP support, daemon, file transfer, background exec",
   "type": "module",

@@ -118,16 +118,18 @@ async function main() {
         profile = profileManager.getByAlias(profileName)
       }
       if (!profile) {
+        // 尝试从 profiles/ 目录加载配置文件
+        const fileName = profileName.endsWith(".json") ? profileName : `${profileName}.json`
+        profile = profileManager.loadFromFile(fileName)
+      }
+      if (!profile) {
         throw new Error(`Profile not found: ${profileName}`)
       }
       profileManager.markUsed(profile.id!)
     } else if (profileFile) {
-      // 从文件读取配置
-      try {
-        const raw = readFileSync(resolve(profileFile), "utf-8")
-        profile = JSON.parse(raw) as SSHProfile
-      } catch (err) {
-        throw new Error(`Failed to read profile file: ${profileFile} - ${(err as Error).message}`)
+      profile = profileManager.loadFromFile(profileFile)
+      if (!profile) {
+        throw new Error(`Profile file not found: ${profileFile}. Searched in: current dir profiles/, project root profiles/, ~/.ssh-tool/profiles/`)
       }
     } else if (profileJson) {
       profile = JSON.parse(profileJson) as SSHProfile
