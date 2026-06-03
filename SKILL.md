@@ -36,19 +36,44 @@ Profile 是一个服务器的连接配置，包含：
 - 不需要每次都输入完整配置
 - 支持动态注册和切换
 
-### 2. 两种使用方式
+### 2. 三种使用方式
 
-**方式 A：使用已保存的 Profile**
+**方式 A：使用已保存的 Profile（推荐，最简单）**
 ```json
 {
   "profile_name": "my-server"
 }
 ```
 
-**方式 B：动态传入配置**
+**方式 B：传入配置文件路径（推荐，避免 JSON 转义）**
 ```json
 {
-  "profile_json": "{\"id\":\"default\",\"name\":\"default\",\"chain\":[{\"host\":\"192.168.1.100\",\"port\":22,\"username\":\"root\",\"privateKey\":\"-----BEGIN OPENSSH PRIVATE KEY-----...\"}]}"
+  "profile_file": "/path/to/your/server-config.json"
+}
+```
+
+**方式 C：动态传入 JSON 配置**
+```json
+{
+  "profile_json": "{\"chain\":[{\"host\":\"192.168.1.100\",\"username\":\"root\",\"privateKey\":\"-----BEGIN...\"}]}"
+}
+```
+
+**配置文件示例（profile_file）**：
+```json
+{
+  "id": "my-server",
+  "name": "生产服务器",
+  "alias": "prod",
+  "chain": [
+    {
+      "host": "192.168.1.100",
+      "port": 22,
+      "username": "root",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAACFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAgEAx...\n-----END OPENSSH PRIVATE KEY-----"
+    }
+  ],
+  "tags": ["生产", "重要"]
 }
 ```
 
@@ -65,7 +90,7 @@ Profile 是一个服务器的连接配置，包含：
 
 | 工具名 | 功能 | 常用参数 |
 |--------|------|----------|
-| `ssh_exec` | 在远程执行命令 | `command`, `cwd`, `profile_name` |
+| `ssh_exec` | 在远程执行命令 | `command`, `cwd`, `profile_name/file/json` |
 | `ssh_read_file` | 读取远程文件 | `path`, `offset`, `limit` |
 | `ssh_write_file` | 写入远程文件 | `path`, `content` |
 | `ssh_list_dir` | 列出目录内容 | `path`, `show_hidden` |
@@ -119,9 +144,40 @@ Profile 是一个服务器的连接配置，包含：
 
 ## 🎯 实际使用示例（AI 学习案例）
 
-### 案例 1：首次连接服务器
+### 案例 1：使用 profile_file 连接服务器（推荐！）
 
-**步骤 1：添加一个新的 Profile**
+**步骤 1：创建配置文件**
+```json
+{
+  "id": "prod-server",
+  "name": "生产服务器",
+  "alias": "prod",
+  "chain": [
+    {
+      "host": "192.168.1.100",
+      "port": 22,
+      "username": "root",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+    }
+  ]
+}
+```
+保存为：`/Users/me/.ssh/prod-server.json`
+
+**步骤 2：执行命令（使用 profile_file）**
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "uname -a && uptime",
+    "profile_file": "/Users/me/.ssh/prod-server.json"
+  }
+}
+```
+
+### 案例 2：使用已保存的 Profile（最简单）
+
+**先添加 Profile**
 ```json
 {
   "name": "ssh_add_profile",
@@ -133,7 +189,7 @@ Profile 是一个服务器的连接配置，包含：
 }
 ```
 
-**步骤 2：执行命令检查服务器**
+**然后使用 profile_name 访问**
 ```json
 {
   "name": "ssh_exec",
@@ -144,7 +200,7 @@ Profile 是一个服务器的连接配置，包含：
 }
 ```
 
-### 案例 2：上传网站代码到服务器
+### 案例 3：上传网站代码到服务器
 
 ```json
 {
@@ -153,12 +209,12 @@ Profile 是一个服务器的连接配置，包含：
     "local_path": "/Users/me/my-website",
     "remote_path": "/var/www/html",
     "overwrite": "overwrite",
-    "profile_name": "prod"
+    "profile_file": "/Users/me/.ssh/prod-server.json"
   }
 }
 ```
 
-### 案例 3：后台运行长时间任务
+### 案例 4：后台运行长时间任务
 
 **步骤 1：启动后台任务**
 ```json
@@ -182,7 +238,7 @@ Profile 是一个服务器的连接配置，包含：
 }
 ```
 
-### 案例 4：访问内部数据库（端口转发）
+### 案例 5：访问内部数据库（端口转发）
 
 ```json
 {
@@ -197,19 +253,6 @@ Profile 是一个服务器的连接配置，包含：
 ```
 
 现在你可以通过 `localhost:5432` 访问远程数据库了！
-
-### 案例 5：下载日志文件
-
-```json
-{
-  "name": "ssh_download",
-  "parameters": {
-    "remote_path": "/var/log/nginx/access.log",
-    "local_path": "/Users/me/Downloads/access.log",
-    "profile_name": "prod"
-  }
-}
-```
 
 ---
 
@@ -268,9 +311,10 @@ Profile 是一个服务器的连接配置，包含：
 
 1. **不要把私钥提交到 Git！**
 2. **不要在对话中发送密码或私钥！**
-3. 使用 `profile_name` 比直接传入 `profile_json` 更安全
-4. Profile 文件权限已设置为 600（仅你可读写）
-5. 生产环境必须使用 SSH 私钥，禁止使用密码！
+3. **使用 `profile_file` 比 `profile_json` 更安全**（不需要在对话中传输私钥）
+4. 使用 `profile_name` 比直接传入 `profile_json` 更安全
+5. Profile 文件权限已设置为 600（仅你可读写）
+6. 生产环境必须使用 SSH 私钥，禁止使用密码！
 
 ---
 
@@ -304,11 +348,12 @@ Profile 是一个服务器的连接配置，包含：
 
 ## 🎈 小贴士
 
-1. **使用短别名**：为常用服务器设置 `alias`，可以快速访问
-2. **先检查再操作**：用 `ssh_exists` 检查路径是否存在
-3. **后台任务管理**：长时间运行的任务用 `ssh_exec_background`
-4. **服务器负载**：执行任务前可以用 `ssh_get_host_load` 检查负载
-5. **清理会话**：不用的会话记得用 `ssh_disconnect` 断开
+1. **使用 `profile_file`**：避免 JSON 转义，推荐使用配置文件路径
+2. **使用短别名**：为常用服务器设置 `alias`，可以快速访问
+3. **先检查再操作**：用 `ssh_exists` 检查路径是否存在
+4. **后台任务管理**：长时间运行的任务用 `ssh_exec_background`
+5. **服务器负载**：执行任务前可以用 `ssh_get_host_load` 检查负载
+6. **清理会话**：不用的会话记得用 `ssh_disconnect` 断开
 
 ---
 
@@ -320,8 +365,9 @@ Profile 是一个服务器的连接配置，包含：
 | command | string | 是 | 要执行的命令 |
 | cwd | string | 否 | 工作目录 |
 | timeout | number | 否 | 超时时间（毫秒） |
-| profile_name | string | 否 | Profile 名称 |
+| profile_name | string | 否 | Profile 名称或别名 |
 | profile_json | string | 否 | Profile JSON 字符串 |
+| **profile_file** | string | 否 | **Profile 配置文件路径（推荐）** |
 
 ### ssh_upload / ssh_download
 | 参数 | 类型 | 必填 | 说明 |
@@ -331,8 +377,9 @@ Profile 是一个服务器的连接配置，包含：
 | compression_level | number | 否 | 压缩级别 1-9 |
 | overwrite | string | 否 | ask/skip/overwrite/rename/backup |
 | skip_symlinks | boolean | 否 | 是否跳过符号链接 |
-| profile_name | string | 否 | Profile 名称 |
+| profile_name | string | 否 | Profile 名称或别名 |
 | profile_json | string | 否 | Profile JSON 字符串 |
+| **profile_file** | string | 否 | **Profile 配置文件路径（推荐）** |
 
 ### ssh_add_profile
 | 参数 | 类型 | 必填 | 说明 |
@@ -349,18 +396,75 @@ Profile 是一个服务器的连接配置，包含：
 **最佳实践流程：**
 
 1. **列出现有 Profile** → `ssh_list_profiles`
-2. **如果没有合适的** → `ssh_add_profile` 添加新配置
+2. **如果没有合适的** → `ssh_add_profile` 添加新配置，或使用 `profile_file` 传入配置文件
 3. **检查服务器状态** → `ssh_get_host_load`
 4. **执行操作** → `ssh_exec` / `ssh_upload` / `ssh_download`
 5. **查看结果** → 根据工具返回判断是否成功
 6. **清理资源** → `ssh_disconnect`（如果不再需要）
 
+**推荐使用方式：**
+
+1. ✅ **首选 `profile_file`**：把配置文件保存到本地，用路径引用
+   ```json
+   { "profile_file": "/Users/me/.ssh/my-server.json" }
+   ```
+
+2. ✅ **次选 `profile_name`**：先注册 Profile，然后用名称引用
+   ```json
+   { "profile_name": "prod" }
+   ```
+
+3. ⚠️ **最后才用 `profile_json`**：仅在临时配置时使用
+   ```json
+   { "profile_json": "{...}" }
+   ```
+
 **常见场景：**
-- ✅ 部署代码到服务器
-- ✅ 查看服务器日志
-- ✅ 运行定时任务
-- ✅ 访问内部服务
-- ✅ 备份文件
+- ✅ 部署代码到服务器（使用 `profile_file`）
+- ✅ 查看服务器日志（使用 `profile_name`）
+- ✅ 运行定时任务（使用 `ssh_exec_background`）
+- ✅ 访问内部服务（使用端口转发）
+- ✅ 备份文件（使用 `ssh_download`）
+
+---
+
+## 📂 Profile 配置文件示例
+
+**简单配置（单服务器）**
+```json
+{
+  "name": "测试服务器",
+  "alias": "test",
+  "chain": [
+    {
+      "host": "192.168.1.100",
+      "username": "root",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+    }
+  ]
+}
+```
+
+**跳板机配置（多服务器）**
+```json
+{
+  "name": "生产环境",
+  "alias": "prod",
+  "chain": [
+    {
+      "host": "bastion.example.com",
+      "username": "admin",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+    },
+    {
+      "host": "10.0.0.50",
+      "username": "deploy",
+      "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+    }
+  ],
+  "tags": ["生产", "重要"]
+}
+```
 
 ---
 
