@@ -12,10 +12,11 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "fs"
 import { dirname, join } from "path"
 import { randomUUID } from "crypto"
+import { homedir } from "os"
 import type { SSHHostConfig, SSHProfile } from "./types.js"
 
 const DEFAULT_PROFILES_DIR = join(
-  process.env.HOME ?? process.env.USERPROFILE ?? ".",
+  homedir(),
   ".opencode",
   "ssh",
 )
@@ -142,7 +143,7 @@ export class ProfileManager {
       profileFile,
       join(process.cwd(), "profiles", profileFile),
       join(process.cwd(), "..", "profiles", profileFile),
-      join(process.env.HOME ?? ".", ".ssh-tool", "profiles", profileFile),
+      join(homedir(), ".ssh-tool", "profiles", profileFile),
     ]
 
     for (const searchPath of searchPaths) {

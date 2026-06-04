@@ -183,7 +183,6 @@ export interface AgentRecord {
   startedAt: number
   lastSeenAt: number
   defaultProfile?: string
-}>
 }
 
 export function toSummary(task: ScheduledTask): ScheduledTaskSummary {

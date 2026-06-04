@@ -12,7 +12,7 @@ import type { Client, ClientChannel } from "ssh2"
 import { randomUUID } from "crypto"
 import { join } from "path"
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, renameSync } from "fs"
-import { tmpdir } from "os"
+import { homedir } from "os"
 import { log } from "./logger.js"
 
 export type TaskType = "exec" | "background"
@@ -46,8 +46,7 @@ export interface RunningTaskEntry {
 }
 
 function getTaskStorageDir(): string {
-  const userDir = process.env.HOME || tmpdir()
-  const storageDir = join(userDir, ".ssh-tool", "exec-tasks")
+  const storageDir = join(homedir(), ".ssh-tool", "exec-tasks")
   if (!existsSync(storageDir)) {
     mkdirSync(storageDir, { recursive: true, mode: 0o700 })
   }

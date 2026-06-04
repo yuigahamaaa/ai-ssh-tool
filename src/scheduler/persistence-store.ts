@@ -1,11 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, renameSync } from "fs"
 import { join } from "path"
-import { tmpdir } from "os"
+import { homedir } from "os"
 import type { ScheduledTask, ScheduledTaskStatus, VirtualCwdState } from "./types.js"
 
 function getBaseDir(): string {
-  const userDir = process.env.HOME || tmpdir()
-  return join(userDir, ".ssh-tool", "scheduler")
+  return join(homedir(), ".ssh-tool", "scheduler")
 }
 
 function getTasksDir(): string {
