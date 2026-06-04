@@ -3,8 +3,22 @@ import { join } from "path"
 import { homedir } from "os"
 import type { ScheduledTask, ScheduledTaskStatus, VirtualCwdState } from "./types.js"
 
+/**
+ * Get user data directory with cross-platform support.
+ * Windows: uses USERPROFILE or HOMEPATH, falls back to homedir()
+ * Unix/macOS: uses homedir()
+ */
+function getUserDataDir(): string {
+  // Windows support: try USERPROFILE first, then HOMEPATH
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 function getBaseDir(): string {
-  return join(homedir(), ".ssh-tool", "scheduler")
+  return join(getUserDataDir(), ".ssh-tool", "scheduler")
 }
 
 function getTasksDir(): string {

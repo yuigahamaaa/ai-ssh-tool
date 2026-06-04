@@ -6,12 +6,23 @@ import { homedir } from "os"
 export const OUTPUT_TAIL_LIMIT = 64 * 1024
 const MAX_OUTPUT_FILE_SIZE = 10 * 1024 * 1024
 
+/**
+ * Get user data directory with cross-platform support.
+ */
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 export class OutputStore {
   private baseDir: string
-  private inMemory = new Map&lt;string, { stdoutTail: string; stderrTail: string; stdoutBytes: number; stderrBytes: number }&gt;()
+  private inMemory = new Map<string, { stdoutTail: string; stderrTail: string; stdoutBytes: number; stderrBytes: number }>()
 
   constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? join(homedir(), ".ssh-tool", "scheduler", "outputs")
+    this.baseDir = baseDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "outputs")
     if (!existsSync(this.baseDir)) {
       mkdirSync(this.baseDir, { recursive: true, mode: 0o700 })
     }

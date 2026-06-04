@@ -15,8 +15,19 @@ import { randomUUID } from "crypto"
 import { homedir } from "os"
 import type { SSHHostConfig, SSHProfile } from "./types.js"
 
+/**
+ * Get user data directory with cross-platform support.
+ */
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 const DEFAULT_PROFILES_DIR = join(
-  homedir(),
+  getUserDataDir(),
   ".opencode",
   "ssh",
 )

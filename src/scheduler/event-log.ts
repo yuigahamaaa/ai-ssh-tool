@@ -6,13 +6,24 @@ import type { SchedulerEvent, EventType } from "./types.js"
 
 const MAX_EVENTS_PER_FILE = 1000
 
+/**
+ * Get user data directory with cross-platform support.
+ */
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 export class EventLog {
   private baseDir: string
   private currentFile: string
   private eventCount = 0
 
   constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? join(homedir(), ".ssh-tool", "scheduler", "events")
+    this.baseDir = baseDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "events")
     if (!existsSync(this.baseDir)) {
       mkdirSync(this.baseDir, { recursive: true, mode: 0o700 })
     }

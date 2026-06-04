@@ -15,6 +15,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdir
 import { homedir } from "os"
 import { log } from "./logger.js"
 
+/**
+ * Get user data directory with cross-platform support.
+ */
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 export type TaskType = "exec" | "background"
 export type TaskStatus = "running" | "completed" | "failed" | "cancelled" | "timeout"
 
@@ -46,7 +57,7 @@ export interface RunningTaskEntry {
 }
 
 function getTaskStorageDir(): string {
-  const storageDir = join(homedir(), ".ssh-tool", "exec-tasks")
+  const storageDir = join(getUserDataDir(), ".ssh-tool", "exec-tasks")
   if (!existsSync(storageDir)) {
     mkdirSync(storageDir, { recursive: true, mode: 0o700 })
   }

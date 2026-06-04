@@ -9,17 +9,28 @@ import { randomUUID } from "crypto"
 import { join } from "path"
 import { homedir } from "os"
 
+/**
+ * Get user data directory with cross-platform support.
+ */
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
 // --- Transport paths ---
 
 export function getPipePath(): string {
   if (process.platform === "win32") {
     return "\\\\.\\pipe\\ssh-exec-daemon"
   }
-  return join(homedir(), ".ssh-exec-daemon.sock")
+  return join(getUserDataDir(), ".ssh-exec-daemon.sock")
 }
 
 export function getPidPath(): string {
-  return join(homedir(), ".ssh-exec-daemon.pid")
+  return join(getUserDataDir(), ".ssh-exec-daemon.pid")
 }
 
 import type { ScheduleRequest } from "./scheduler/types.js"

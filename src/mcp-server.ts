@@ -267,7 +267,40 @@ async function main() {
     if (!resp.ok) {
       throw new Error(`Schedule failed: ${(resp as any).error}`)
     }
-    return resp.data as ScheduleDecision
+    const decision = resp.data as ScheduleDecision
+
+    // ssh_exec 语义：调用它就是为了执行命令拿结果
+    // 当调度决策是 run_now 时，内部 waitTask 等完成后返回 stdout
+    // 当调度决策是排队/等待/拒绝时，返回调度决策让 AI 处理
+    if (decision.action === "run_now" && decision.taskId) {
+      try {
+        const waitResp = await daemonClient.waitTask(decision.taskId, params.timeout ?? 120000)
+        if (waitResp.ok && waitResp.data) {
+          const taskResult = waitResp.data as { code: number; stdout: string; stderr: string; signal?: string }
+          return {
+            action: "run_now",
+            taskId: decision.taskId,
+            effectiveCwd: decision.effectiveCwd,
+            classification: decision.classification,
+            reason: decision.reason,
+            result: {
+              stdout: taskResult.stdout ?? "",
+              stderr: taskResult.stderr ?? "",
+              code: taskResult.code ?? 0,
+              signal: taskResult.signal,
+            },
+          }
+        }
+      } catch (err) {
+        // waitTask failed, return the original decision with error info
+        return {
+          ...decision,
+          reason: `Task failed during wait: ${err instanceof Error ? err.message : String(err)}`,
+        }
+      }
+    }
+
+    return decision
   }
 
   function profileToLegacyConfigJson(profile: SSHProfile): string {
