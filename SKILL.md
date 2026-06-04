@@ -118,7 +118,7 @@ ssh-tool/
 | `ssh_remote_forward` | 远程端口转发 | `remote_port`, `local_host`, `local_port` |
 | `ssh_stop_forward` | 停止转发 | `forward_id` |
 | `ssh_list_forwards` | 列出转发 | - |
-| `ssh_get_host_load` | 主机负载 | - |
+| `ssh_get_host_load` | 主机负载 + scheduler 状态 | - |
 | `ssh_list_sessions` | 列出会话 | - |
 | `ssh_disconnect` | 断开会话 | `session_id` |
 | `ssh_cd` | 设置虚拟 cwd | `path` |
@@ -299,7 +299,7 @@ ssh-tool/
 { "name": "ssh_exec_background", "parameters": { "command": "npm run build", "profile_name": "prod" } }
 // 查询状态
 { "name": "ssh_exec_status", "parameters": { "task_id": "abc123" } }
-// 查看主机负载
+// 查看主机负载和 scheduler 状态
 { "name": "ssh_get_host_load", "parameters": { "profile_name": "prod" } }
 ```
 

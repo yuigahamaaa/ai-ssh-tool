@@ -33,7 +33,6 @@ import {
 import { DaemonClient } from "../daemon-client.js"
 import { createRequest } from "../ipc-protocol.js"
 import { upload, download } from "../file-transfer.js"
-import { BackgroundExecManager } from "../background-exec.js"
 import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 import { ProfileManager } from "../profile-manager.js"

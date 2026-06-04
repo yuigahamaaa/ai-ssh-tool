@@ -16,7 +16,6 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs"
 import { createHash } from "crypto"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
-import { BackgroundExecManager } from "./background-exec.js"
 import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
 import { enableDebug, log, logError } from "./logger.js"
@@ -61,7 +60,6 @@ export class SSHDaemon {
   private sessionMap = new Map<string, DaemonSession>() // configHash -> session
   private configCache = new Map<string, CachedConfig>() // path -> cached hash
   private startedAt = Date.now()
-  private bgManager = new BackgroundExecManager()
   private forwardManagers = new Map<string, PortForwardManager>()
   private scheduler: SchedulerService
 

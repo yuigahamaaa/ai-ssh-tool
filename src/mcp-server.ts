@@ -27,7 +27,6 @@ import { PortForwardManager } from "./port-forwarding.js"
 import { ProfileManager } from "./profile-manager.js"
 import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
-import { getGlobalTaskManager } from "./exec-task-manager.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
@@ -102,8 +101,6 @@ async function main() {
 
   const profileManager = new ProfileManager()
   profileManager.load()
-
-  const taskManager = getGlobalTaskManager()
 
   // Client cache: profile name -> { client, forwardManager }
   const clientCache = new Map<string, ClientCacheEntry>()
@@ -715,7 +712,7 @@ async function main() {
   // --- Host load monitoring ---
   server.tool(
     "ssh_get_host_load",
-    "Get current load information for a remote machine, including CPU load average, memory usage, process count, and running tasks.",
+    "Get current load information for a remote machine, including CPU load average, memory usage, process count, and scheduler state (running/queued/recent tasks).",
     {
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
@@ -731,12 +728,13 @@ async function main() {
       const uptimeResult = await remoteExec(entry.client, "uptime", { timeout: 10000 })
       const memResult = await remoteExec(entry.client, "free -h", { timeout: 10000 })
       const procResult = await remoteExec(entry.client, "ps aux --no-headers | wc -l", { timeout: 10000 })
+      const queueResp = await daemonClient.queueStatus({ hostId: hostname })
       const loadInfo = {
         hostname: hostname ?? "unknown",
         uptime: uptimeResult.stdout.trim(),
         memory: memResult.stdout.trim(),
         processCount: procResult.stdout.trim(),
-        tasks: taskManager.list(hostname),
+        scheduler: queueResp.ok ? queueResp.data : { error: (queueResp as any).error },
       }
       return { content: [{ type: "text", text: JSON.stringify(loadInfo, null, 2) }] }
     },
