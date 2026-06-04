@@ -220,6 +220,7 @@ async function main() {
     if_busy?: "run_anyway" | "wait" | "queue" | "fail"
     force?: boolean
     timeout?: number
+    background?: boolean
     profile_name?: string
     profile_json?: string
     profile_file?: string
@@ -232,11 +233,11 @@ async function main() {
     if (!connectResp.ok) {
       throw new Error(`Connection failed: ${(connectResp as any).error}`)
     }
-    const { sessionId } = connectResp.data as any
+    const { sessionId, configHash } = connectResp.data as any
 
     const hostIdentity: HostIdentity = {
-      id: sessionId.slice(0, 16),
-      profileKey: sessionId.slice(0, 16),
+      id: configHash ?? sessionId.slice(0, 16),
+      profileKey: configHash ?? sessionId.slice(0, 16),
       targetHost: profile.chain[profile.chain.length - 1].host,
       targetUser: profile.chain[profile.chain.length - 1].auth.username,
       displayName: profile.name,
@@ -261,46 +262,35 @@ async function main() {
       scheduler: params.scheduler ?? "auto",
       timeoutMs: params.timeout,
       force: params.force,
+      background: params.background,
     }
 
     const resp = await daemonClient.schedule(scheduleReq as unknown as Record<string, unknown>)
     if (!resp.ok) {
       throw new Error(`Schedule failed: ${(resp as any).error}`)
     }
-    const decision = resp.data as ScheduleDecision
+    return resp.data as ScheduleDecision
+  }
 
-    // ssh_exec 语义：调用它就是为了执行命令拿结果
-    // 当调度决策是 run_now 时，内部 waitTask 等完成后返回 stdout
-    // 当调度决策是排队/等待/拒绝时，返回调度决策让 AI 处理
-    if (decision.action === "run_now" && decision.taskId) {
-      try {
-        const waitResp = await daemonClient.waitTask(decision.taskId, params.timeout ?? 120000)
-        if (waitResp.ok && waitResp.data) {
-          const taskResult = waitResp.data as { code: number; stdout: string; stderr: string; signal?: string }
-          return {
-            action: "run_now",
-            taskId: decision.taskId,
-            effectiveCwd: decision.effectiveCwd,
-            classification: decision.classification,
-            reason: decision.reason,
-            result: {
-              stdout: taskResult.stdout ?? "",
-              stderr: taskResult.stderr ?? "",
-              code: taskResult.code ?? 0,
-              signal: taskResult.signal,
-            },
-          }
-        }
-      } catch (err) {
-        // waitTask failed, return the original decision with error info
-        return {
-          ...decision,
-          reason: `Task failed during wait: ${err instanceof Error ? err.message : String(err)}`,
-        }
-      }
+  function formatScheduleDecisionForAgent(decision: ScheduleDecision): string {
+    const guidance: string[] = []
+
+    if (decision.action === "queued") {
+      guidance.push("Task was queued. Do not immediately resubmit the same command. Continue unrelated read/search/planning work, then call ssh_queue_status or ssh_wait_task with this taskId.")
+    } else if (decision.waitTimedOut) {
+      guidance.push("The foreground wait timed out but the task is still registered. Use ssh_exec_status with taskId to check status/output instead of rerunning the command.")
+    } else if (decision.action === "wait_recommended") {
+      guidance.push("A conflicting task is running. Prefer waiting for a blocker or doing unrelated work before retrying.")
+    } else if (decision.action === "needs_confirmation") {
+      guidance.push("This command is risky. Explain the risk and retry with force=true only if the user intends it.")
     }
 
-    return decision
+    const result = decision.result
+    if (result?.truncated) {
+      guidance.push(`Returned stdout/stderr are tails only. Read full output from stdoutPath=${result.stdoutPath} and stderrPath=${result.stderrPath}, or call ssh_exec_status with mode=full when this task is still tracked.`)
+    }
+
+    return JSON.stringify({ ...decision, agentGuidance: guidance }, null, 2)
   }
 
   function profileToLegacyConfigJson(profile: SSHProfile): string {
@@ -377,7 +367,7 @@ async function main() {
   // --- Remote execution ---
   server.tool(
     "ssh_exec",
-    "Execute a shell command on the remote server via the shared scheduler. Returns stdout, stderr, and exit code. Default scheduler=auto means the command goes through the daemon scheduler for conflict detection and queue management. Use scheduler=bypass for urgent lightweight checks.",
+    "Execute a shell command on the remote server via the shared scheduler. Default behavior: scripts, tests, builds, installs, and unknown medium+ commands are serial on the same host and may queue. If action=queued, do not rerun; use taskId with ssh_wait_task/ssh_queue_status and do unrelated work. If result.truncated=true, returned output is only a tail; read stdoutPath/stderrPath for full logs. Only use if_busy=run_anyway or scheduler=bypass when you are certain concurrency is safe.",
     {
       command: z.string().describe("Shell command to execute"),
       cwd: z.string().optional().describe("Working directory"),
@@ -387,7 +377,7 @@ async function main() {
       intent: z.string().optional().describe("Command intent: inspect, search, test, build, install, server, deploy, migration, cleanup, custom"),
       cost: z.string().optional().describe("Estimated cost: tiny, small, medium, large, exclusive"),
       urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency level"),
-      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("What to do if host is busy"),
+      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("When host is busy: queue (default for heavy), wait, fail, or run_anyway to bypass serial queue -- only use run_anyway when tasks are truly independent"),
       force: z.boolean().optional().describe("Force execution of risky commands"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile (alternative to profile_name)"),
@@ -412,7 +402,7 @@ async function main() {
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(decision, null, 2),
+          text: formatScheduleDecisionForAgent(decision),
         }],
       }
     },
@@ -626,7 +616,7 @@ async function main() {
   // --- Background execution ---
   server.tool(
     "ssh_exec_background",
-    "Start a command in the background on the remote server. Returns a task handle for status queries.",
+    "Start a command in the background on the remote server. It is registered in the shared scheduler and subject to the same serial/queuing rules as ssh_exec. Use ssh_exec_status with the returned taskId; do not start duplicate background jobs if action=queued.",
     {
       command: z.string().describe("Command to execute in background"),
       cwd: z.string().optional().describe("Working directory"),
@@ -635,43 +625,41 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     async ({ command, cwd, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const { id } = taskManager.start(client, command, { type: "background", cwd })
-      const task = taskManager.getStatus(id)
-      return { content: [{ type: "text" as const, text: JSON.stringify({ taskId: task?.id, status: task?.status, pid: task?.pid, command: task?.command }) }] }
+      const decision = await scheduleCommand({
+        command,
+        cwd,
+        scheduler: "auto",
+        background: true,
+        profile_name,
+        profile_json,
+        profile_file,
+      })
+      return { content: [{ type: "text" as const, text: formatScheduleDecisionForAgent(decision) }] }
     },
   )
 
   server.tool(
     "ssh_exec_status",
-    "Get the status and output of a background task.",
+    "Get exact status and output for a scheduler task. Default mode returns a bounded tail plus stdoutPath/stderrPath metadata; use mode=full only when you truly need the full output inline.",
     {
       task_id: z.string().describe("Task ID from exec_background"),
       mode: z.enum(["tail", "full"]).optional().describe("Output mode: tail (default) or full"),
     },
     async ({ task_id, mode }) => {
       await daemonClient.ensureDaemon()
-      // Get task output
+      const statusResp = await daemonClient.getTaskStatus(task_id)
+      if (!statusResp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(statusResp as any).error}` }] }
+      }
+
       const outputResp = await daemonClient.getTaskOutput(task_id, mode)
       if (!outputResp.ok) {
         return { content: [{ type: "text" as const, text: `Error: ${(outputResp as any).error}` }] }
       }
-      
-      // Get task status from queue status
-      const queueResp = await daemonClient.queueStatus({})
-      let task: any = null
-      if (queueResp.ok) {
-        const allTasks = [
-          ...((queueResp.data as any)?.running || []),
-          ...((queueResp.data as any)?.queued || []),
-          ...((queueResp.data as any)?.recent || [])
-        ]
-        task = allTasks.find((t: any) => t.id === task_id)
-      }
-      
+
       const result = {
-        ...task,
-        ...(outputResp.data as any)
+        ...(statusResp.data as any),
+        output: outputResp.data,
       }
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -691,6 +679,20 @@ async function main() {
       }
       const cancelled = (resp.data as any)?.cancelled
       return { content: [{ type: "text" as const, text: cancelled ? `Task ${task_id} cancelled` : `Task ${task_id} not found or already finished` }] }
+    },
+  )
+
+  server.tool(
+    "ssh_cleanup_outputs",
+    "Clean old scheduler output files. Running and queued task outputs are protected.",
+    {},
+    async () => {
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.cleanupOutputs()
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data) }] }
     },
   )
 
@@ -978,7 +980,7 @@ async function main() {
   // --- Scheduler tools ---
   server.tool(
     "ssh_schedule",
-    "Submit a command to the shared VM scheduler. Use for tests, builds, installs, servers, deploys, migrations, or any command that may consume CPU, modify files, occupy ports, or run for more than a few seconds.",
+    "Submit a command to the shared VM scheduler. Heavy commands (tests, builds, installs, scripts) default to serial and may queue behind running heavy work. If queued, keep the taskId and do other useful work; later call ssh_wait_task or ssh_queue_status. Use if_busy=run_anyway only for truly independent work.",
     {
       command: z.string().describe("Command to execute"),
       cwd: z.string().optional().describe("Working directory"),
@@ -986,7 +988,7 @@ async function main() {
       intent: z.string().optional().describe("Command intent"),
       cost: z.string().optional().describe("Estimated cost"),
       urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency"),
-      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("What to do if host is busy"),
+      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("When host is busy: queue (default for heavy), wait, fail, or run_anyway to bypass serial queue -- only use run_anyway when tasks are truly independent"),
       force: z.boolean().optional().describe("Force risky commands"),
       timeout: z.number().optional().describe("Timeout in ms"),
       profile_name: z.string().optional().describe("Profile name"),
@@ -1010,14 +1012,14 @@ async function main() {
         profile_file: params.profile_file,
       })
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(decision, null, 2) }],
+        content: [{ type: "text" as const, text: formatScheduleDecisionForAgent(decision) }],
       }
     },
   )
 
   server.tool(
     "ssh_queue_status",
-    "Show running tasks, queued tasks, and recent completions on the shared VM.",
+    "Show running tasks, queued tasks, locks, recent completions, and this AI session's virtual cwd on the shared VM. Use this before starting heavy work when unsure whether the VM is busy.",
     {
       host_id: z.string().optional().describe("Filter by host ID"),
       limit: z.number().optional().describe("Max results (default 20)"),

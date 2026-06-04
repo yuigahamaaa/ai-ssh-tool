@@ -3,6 +3,7 @@
 专为 AI Agent 设计的 SSH 工具，支持多级跳板机、MCP 协议、文件传输、后台执行、智能调度器。
 
 > 📄 生产环境部署、架构设计、性能调优等详细说明请查看 [README.md](./README.md)
+> 📄 AI Agent 上手 SOP 请查看 [docs/AI_AGENT_USAGE.zh-CN.md](./docs/AI_AGENT_USAGE.zh-CN.md)
 > 📄 调度器设计文档请查看 [docs/AI_COLLABORATIVE_SCHEDULER_DESIGN.zh-CN.md](./docs/AI_COLLABORATIVE_SCHEDULER_DESIGN.zh-CN.md)
 
 ---
@@ -13,9 +14,9 @@
 ssh-tool/
 ├── src/                    # 核心源码
 │   ├── mcp-server.ts       # MCP 工具入口（AI 调用的接口）
-│   ├── scheduler/          # 调度器模块（新增！）
+│   ├── scheduler/          # 共享调度器（默认执行路径）
 │   ├── profile-manager.ts  # Profile 管理（读取/保存配置）
-│   ├── exec-task-manager.ts# 统一任务管理器
+│   ├── exec-task-manager.ts# legacy 本地任务存储（兼容旧后台执行）
 │   ├── remote-shell.ts     # 远程命令执行
 │   ├── file-transfer.ts    # 文件/文件夹传输
 │   ├── connection.ts       # SSH 连接管理
@@ -124,6 +125,19 @@ ssh-tool/
 
 ---
 
+## 给 AI Agent 的默认操作规则
+
+1. 默认用 `ssh_exec` 执行命令；它已经走共享调度器。
+2. 运行测试、构建、安装、脚本、服务启动、迁移、部署时，不要绕过调度器。这些命令默认串行，忙时会排队。
+3. 只有确认两个任务互不竞争 CPU、端口、工作目录、依赖缓存、数据库或全局状态时，才使用 `if_busy: "run_anyway"`。
+4. `scheduler: "bypass"` 是紧急逃生口，不是常规并发开关。它仍会登记任务，但会跳过排队。
+5. 如果返回 `action: "queued"`，不要重复提交同一个命令。保存 `taskId`，先做不依赖该结果的读文件、搜索、方案整理，再用 `ssh_wait_task` 或 `ssh_queue_status` 查询。
+6. 如果返回 `waitTimedOut: true`，命令没有失败，只是前台等待超时。用 `ssh_exec_status` 查看同一个 `taskId`，不要直接重跑。
+7. 如果返回 `result.truncated: true`，内联 stdout/stderr 只是 tail。完整输出在 `result.stdoutPath` / `result.stderrPath`，需要时读取文件或用 `ssh_exec_status(mode="full")`。
+8. 不要用远端 `cd` 期待跨工具调用保持目录。用 `ssh_cd` 设置当前 AI 会话的虚拟工作目录，或每次显式传 `cwd`。
+
+---
+
 ## 调度器使用指南（新增！）
 
 ### ssh_exec 工作原理
@@ -132,10 +146,11 @@ ssh-tool/
 
 1. **调度决策**：`schedule()` 函数决定任务是立即执行还是排队
 2. **等待完成**：当决策是 `run_now` 时，内部会 `waitTask` 等待任务执行完毕
-3. **返回结果**：最终返回 `{ stdout, stderr, code, signal }` 给调用者
+3. **返回结果**：最终返回调度决策；若已完成，会带 `result`
+4. **输出保护**：内联输出默认只返回尾部，完整 stdout/stderr 落盘并通过路径暴露
 
 ```json
-// 正常执行（99% 场景）
+// 轻量命令通常会立即执行
 {
   "name": "ssh_exec",
   "parameters": { "command": "uptime", "profile_name": "prod" }
@@ -144,7 +159,16 @@ ssh-tool/
 {
   "action": "run_now",
   "taskId": "task-xxx",
-  "result": { "stdout": " 10:00:00 up 1 day", "stderr": "", "code": 0 }
+  "result": {
+    "stdout": " 10:00:00 up 1 day",
+    "stderr": "",
+    "code": 0,
+    "truncated": false,
+    "stdoutBytes": 20,
+    "stderrBytes": 0,
+    "stdoutPath": "~/.ssh-tool/scheduler/outputs/t_xxx.stdout",
+    "stderrPath": "~/.ssh-tool/scheduler/outputs/t_xxx.stderr"
+  }
 }
 ```
 
@@ -159,7 +183,8 @@ ssh-tool/
   "action": "queued",
   "taskId": "task-xxx",
   "queuePosition": 1,
-  "reason": "Queue full or host busy"
+  "reason": "Host has conflicting tasks; command queued.",
+  "recommendedNextStep": "Do unrelated read-only work; call ssh_wait_task or ssh_queue_status later."
 }
 ```
 
@@ -170,8 +195,8 @@ ssh-tool/
 | `scheduler` | `"auto"`（默认） / `"bypass"` | `auto`=走调度器排队；`bypass`=跳过排队直接执行（仍会记录任务状态） |
 | `intent` | `"inspect"` / `"search"` / `"test"` / `"build"` / `"install"` / `"server"` / `"deploy"` / `"migration"` / `"cleanup"` / `"custom"` | 任务意图（用于调度决策） |
 | `cost` | `"tiny"` / `"small"` / `"medium"` / `"large"` / `"exclusive"` | 预估成本（用于调度决策） |
-| `urgency` | `"low"` / `"normal"` / `"high"` / `"urgent"` | 紧急程度（暂未实现，保留） |
-| `if_busy` | `"run_anyway"` / `"wait"` / `"queue"` / `"fail"` | 主机忙时策略（暂未实现，保留） |
+| `urgency` | `"low"` / `"normal"` / `"high"` / `"urgent"` | 紧急程度（用于记录和后续策略扩展） |
+| `if_busy` | `"run_anyway"` / `"wait"` / `"queue"` / `"fail"` | 主机忙时策略：默认 heavy/medium 会 `queue`；`run_anyway` 是显式并发许可 |
 | `force` | `true` / `false` | `true`=强制执行有风险的命令 |
 
 ### 任务分类说明
@@ -180,9 +205,19 @@ ssh-tool/
 |------|------|--------|
 | `tiny` | 简单读命令（ls, cat, uptime 等） | 可与其他任务并发 |
 | `small` | 轻量任务 | 可与其他任务并发 |
-| `medium` | 普通任务（默认分类） | 可与其他任务并发 |
-| `large` | 耗时任务（build, deploy 等） | 仅一个 large 任务可运行 |
+| `medium` | 普通任务（默认分类） | 默认会排队，避免未知命令抢占 |
+| `large` | 耗时任务（test, build, install, script 等） | 默认串行；除非显式 `if_busy="run_anyway"` |
 | `exclusive` | 独占任务（会修改全局状态） | 独占主机，阻塞所有其他任务 |
+
+### 输出读取规则
+
+`ssh_exec` 和 `ssh_exec_status` 默认返回 bounded tail，避免把 AI 上下文塞爆。返回里会包含：
+
+- `stdoutBytes` / `stderrBytes`：真实输出字节数
+- `truncated`：内联输出是否被截断
+- `stdoutPath` / `stderrPath`：完整输出文件路径
+
+当 `truncated=true` 时，优先读取 `stdoutPath` / `stderrPath` 中和错误相关的片段；不要因为没看到完整日志就重跑测试或构建。
 
 ### 虚拟工作目录（ssh_cd）
 
@@ -200,6 +235,8 @@ ssh-tool/
 ```
 
 > 💡 虚拟目录按 `Agent + Host` 隔离，不同 Agent 互不影响。
+
+注意：远端 shell 里的 `cd /repo` 只影响当前这条命令。跨工具调用要保持目录，请用 `ssh_cd` 或显式传 `cwd`。
 
 ---
 
@@ -299,19 +336,34 @@ ssh-tool/
 }
 ```
 
-#### 场景 7.3：用 bypass 跳过排队（紧急操作）
+#### 场景 7.3：显式允许并发（确认互不影响时）
 ```json
 {
   "name": "ssh_exec",
   "parameters": {
-    "command": "tail -f /var/log/nginx/error.log",
+    "command": "pytest tests/unit/test_parser.py",
+    "intent": "test",
+    "cost": "large",
+    "if_busy": "run_anyway",
+    "reason": "Only runs isolated unit tests in a separate worktree; safe to run concurrently.",
+    "profile_name": "prod"
+  }
+}
+```
+
+#### 场景 7.4：用 bypass 跳过排队（少用）
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "uptime",
     "scheduler": "bypass",
     "profile_name": "prod"
   }
 }
 ```
 
-#### 场景 7.4：查看队列状态
+#### 场景 7.5：查看队列状态
 ```json
 {
   "name": "ssh_queue_status",
@@ -322,7 +374,7 @@ ssh-tool/
 }
 ```
 
-#### 场景 7.5：异步提交任务 + 自己 wait
+#### 场景 7.6：异步提交任务 + 自己 wait
 ```json
 // 提交
 {

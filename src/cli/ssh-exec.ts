@@ -399,14 +399,14 @@ async function execScheduledCommand(
       return
     }
 
-    const { sessionId } = connectResp.data as any
+    const { sessionId, configHash } = connectResp.data as any
     const agentIdentity: AgentIdentity = {
       id: `cli-${process.pid}-${Date.now()}`,
       clientType: "cli",
     }
     const hostIdentity: HostIdentity = {
-      id: sessionId.slice(0, 16),
-      profileKey: sessionId.slice(0, 16),
+      id: configHash ?? sessionId.slice(0, 16),
+      profileKey: configHash ?? sessionId.slice(0, 16),
       targetHost: config.target.host,
       targetUser: config.target.username,
       displayName: opts.profileName ?? config.target.host,
@@ -439,6 +439,11 @@ async function execScheduledCommand(
     if (decision.action === "run_now" && decision.result) {
       if (decision.result.stdout) process.stdout.write(decision.result.stdout)
       if (decision.result.stderr) process.stderr.write(decision.result.stderr)
+      if (decision.result.truncated) {
+        console.error(`\n[ssh-exec] output truncated; full output files:`)
+        console.error(`[ssh-exec] stdout: ${decision.result.stdoutPath}`)
+        console.error(`[ssh-exec] stderr: ${decision.result.stderrPath}`)
+      }
       process.exitCode = decision.result.code ?? 0
     } else {
       console.log(JSON.stringify(decision, null, 2))

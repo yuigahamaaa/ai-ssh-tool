@@ -39,6 +39,16 @@ describe("IPC Scheduler Actions", () => {
     assert.equal((req as any).params.taskId, "t1")
   })
 
+  it("createRequest supports task output/status cleanup actions", () => {
+    const outputReq = createRequest("getTaskOutput", { taskId: "t1", mode: "tail" })
+    const statusReq = createRequest("getTaskStatus", { taskId: "t1" })
+    const cleanupReq = createRequest("cleanupOutputs", {})
+
+    assert.equal(outputReq.action, "getTaskOutput")
+    assert.equal((statusReq as any).params.taskId, "t1")
+    assert.equal(cleanupReq.action, "cleanupOutputs")
+  })
+
   it("createRequest supports setCwd action", () => {
     const req = createRequest("setCwd", {
       agent: { id: "a1", clientType: "mcp" },

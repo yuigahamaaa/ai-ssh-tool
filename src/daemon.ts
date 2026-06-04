@@ -48,6 +48,10 @@ interface CachedConfig {
   mtime: number
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
 export class SSHDaemon {
   private gateway: SSHGateway
   private server: Server | null = null
@@ -75,10 +79,26 @@ export class SSHDaemon {
           if (!conn) throw new Error(`Session ${task.sessionId} not found for scheduled task`)
           const client = conn.getFinalClient()
           const cmd = task.effectiveCwd
-            ? `cd ${JSON.stringify(task.effectiveCwd)} && ${task.command}`
+            ? `cd ${shellQuote(task.effectiveCwd)} && ${task.command}`
             : task.command
-          const result = await remoteExec(client, cmd, { timeout: 120_000 })
+          const result = await remoteExec(client, cmd, { timeout: task.timeoutMs ?? 120_000 })
           return { code: result.code, stdout: result.stdout, stderr: result.stderr, signal: result.signal }
+        },
+        cancel: (task) => {
+          const conn = this.gateway.sessions.getConnection(task.sessionId)
+          if (!conn) return false
+          const client = conn.getFinalClient()
+          const handle = backgroundTaskHandles.get(task.id)
+          if (handle) {
+            handle.stop()
+            return true
+          }
+          if (task.pid) {
+            const killCmd = `kill -TERM -${task.pid} 2>/dev/null || kill -TERM ${task.pid} 2>/dev/null; sleep 0.5; kill -9 -${task.pid} 2>/dev/null || kill -9 ${task.pid} 2>/dev/null; true`
+            client.exec(killCmd, () => {})
+            return true
+          }
+          return false
         },
         startBackground: (
           task: any,
@@ -91,9 +111,9 @@ export class SSHDaemon {
           
           let fullCommand = task.command
           if (task.effectiveCwd) {
-            fullCommand = `cd ${JSON.stringify(task.effectiveCwd)} && ${fullCommand}`
+            fullCommand = `cd ${shellQuote(task.effectiveCwd)} && ${fullCommand}`
           }
-          const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
+          const wrappedCommand = `setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool ${shellQuote(fullCommand)}`
           
           let currentPid: number | null = null
           let pidCaptured = false
@@ -110,7 +130,7 @@ export class SSHDaemon {
               stream,
               stop: () => {
                 if (currentPid) {
-                  const killCmd = `kill -TERM ${currentPid} 2>/dev/null; sleep 0.1; kill -9 ${currentPid} 2>/dev/null; true`
+                  const killCmd = `kill -TERM -${currentPid} 2>/dev/null || kill -TERM ${currentPid} 2>/dev/null; sleep 0.5; kill -9 -${currentPid} 2>/dev/null || kill -9 ${currentPid} 2>/dev/null; true`
                   client.exec(killCmd, () => {})
                 }
                 try { stream.close() } catch {}
@@ -124,6 +144,7 @@ export class SSHDaemon {
                 const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
+                  task.pid = currentPid
                   pidCaptured = true
                   const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, '')
                   if (remaining) {
@@ -143,6 +164,7 @@ export class SSHDaemon {
                 let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
+                  task.pid = currentPid
                   pidCaptured = true
                   const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, '')
                   if (remaining) {
@@ -329,7 +351,7 @@ export class SSHDaemon {
         break
 
       case "schedule":
-        resp = this.handleSchedule(req as any)
+        resp = await this.handleSchedule(req as any)
         break
 
       case "queueStatus":
@@ -354,6 +376,14 @@ export class SSHDaemon {
 
       case "getTaskOutput":
         resp = this.handleGetTaskOutput(req as any)
+        break
+
+      case "getTaskStatus":
+        resp = this.handleGetTaskStatus(req as any)
+        break
+
+      case "cleanupOutputs":
+        resp = this.handleCleanupOutputs(req as any)
         break
 
       default:
@@ -388,7 +418,7 @@ export class SSHDaemon {
       const session = this.gateway.sessions.getSession(existing.sessionId)
       const connection = this.gateway.sessions.getConnection(existing.sessionId)
       if (session?.status === "connected" && connection?.isConnected()) {
-        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true } }
+        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true, configHash } }
       }
       this.sessionMap.delete(configHash)
       if (session) {
@@ -422,7 +452,7 @@ export class SSHDaemon {
       })
 
       this.sessionMap.set(configHash, { sessionId: session.id, configHash })
-      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false } }
+      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash } }
     } catch (err: any) {
       // Clean up any error sessions created during the failed connection
       for (const [sid, entry] of this.sessionMap) {
@@ -451,7 +481,7 @@ export class SSHDaemon {
       const session = this.gateway.sessions.getSession(existing.sessionId)
       const connection = this.gateway.sessions.getConnection(existing.sessionId)
       if (session?.status === "connected" && connection?.isConnected()) {
-        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true } }
+        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true, configHash } }
       }
       this.sessionMap.delete(configHash)
       if (session) {
@@ -531,9 +561,61 @@ export class SSHDaemon {
     }
   }
 
-  private handleSchedule(req: { id: string; params: ScheduleRequest }): IPCResponse {
+  private async handleSchedule(req: { id: string; params: ScheduleRequest }): Promise<IPCResponse> {
     try {
       const decision = this.scheduler.schedule(req.params)
+      if (decision.action === "run_now" && decision.taskId && !req.params.background) {
+        try {
+          const task = await this.scheduler.waitTask(decision.taskId, req.params.timeoutMs ?? 120_000)
+          if (task.status === "running" || task.status === "queued") {
+            return {
+              id: req.id,
+              ok: true,
+              data: {
+                ...decision,
+                action: task.status === "queued" ? "queued" : decision.action,
+                taskId: task.id,
+                reason: `${decision.reason} Command is still ${task.status}; use ssh_exec_status with task_id=${task.id}.`,
+                waitTimedOut: true,
+                result: undefined,
+              },
+            }
+          }
+          const output = this.scheduler.getTaskOutput(task.id, "tail")
+          return {
+            id: req.id,
+            ok: true,
+            data: {
+              ...decision,
+              result: {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                code: task.exitCode ?? 0,
+                signal: task.signal ?? undefined,
+                stdoutBytes: output.stdoutBytes,
+                stderrBytes: output.stderrBytes,
+                stdoutPath: output.stdoutPath,
+                stderrPath: output.stderrPath,
+                outputFiles: output.outputFiles,
+                truncated: output.truncated,
+                stdoutTruncated: output.stdoutTruncated,
+                stderrTruncated: output.stderrTruncated,
+                stdoutFileTruncated: output.stdoutFileTruncated,
+                stderrFileTruncated: output.stderrFileTruncated,
+              },
+            },
+          }
+        } catch (waitErr: any) {
+          return {
+            id: req.id,
+            ok: true,
+            data: {
+              ...decision,
+              reason: decision.reason + " (wait failed: " + waitErr.message + ")",
+            },
+          }
+        }
+      }
       return { id: req.id, ok: true, data: decision }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
@@ -542,7 +624,7 @@ export class SSHDaemon {
 
   private handleQueueStatus(req: { id: string; params: { agent?: AgentIdentity; hostId?: string; limit?: number } }): IPCResponse {
     try {
-      const status = this.scheduler.queueStatus(req.params.hostId, req.params.limit)
+      const status = this.scheduler.queueStatus(req.params.hostId, req.params.limit, req.params.agent?.id)
       return { id: req.id, ok: true, data: status }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
@@ -578,8 +660,8 @@ export class SSHDaemon {
 
   private handleCancelTask(req: { id: string; params: { taskId: string } }): IPCResponse {
     try {
-      const result = this.scheduler.cancelTask(req.params.taskId)
-      return { id: req.id, ok: true, data: result }
+      const cancelled = this.scheduler.cancelTask(req.params.taskId)
+      return { id: req.id, ok: true, data: { cancelled } }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
     }
@@ -588,6 +670,25 @@ export class SSHDaemon {
   private handleGetTaskOutput(req: { id: string; params: { taskId: string; mode?: string } }): IPCResponse {
     try {
       const result = this.scheduler.getTaskOutput(req.params.taskId, req.params.mode as any)
+      return { id: req.id, ok: true, data: result }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleGetTaskStatus(req: { id: string; params: { taskId: string } }): IPCResponse {
+    try {
+      const task = this.scheduler.getTask(req.params.taskId)
+      if (!task) return { id: req.id, ok: false, error: `Task ${req.params.taskId} not found` }
+      return { id: req.id, ok: true, data: task }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleCleanupOutputs(req: { id: string; params: Record<string, never> }): IPCResponse {
+    try {
+      const result = this.scheduler.cleanupOutputs()
       return { id: req.id, ok: true, data: result }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
@@ -637,37 +738,46 @@ export class SSHDaemon {
 
   private async handleBgExec(req: IPCRequest & { action: "bgExec" }): Promise<IPCResponse> {
     const { sessionId, subcommand, command, taskId } = req.params
-    const connection = this.gateway.sessions.getConnection(sessionId)
-    if (!connection) {
-      return { id: req.id, ok: false, error: `Session ${sessionId} not found` }
-    }
-    const client = connection.getFinalClient()
     try {
       switch (subcommand) {
         case "start": {
           if (!command) return { id: req.id, ok: false, error: "command is required" }
-          const task = await this.bgManager.start(client, command)
-          return { id: req.id, ok: true, data: task }
+          // Use scheduler's background task mechanism
+          const entry = this.sessionMap.get(sessionId) ?? Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)
+          const hId = entry?.configHash ?? sessionId.slice(0, 16)
+          const decision = this.scheduler.schedule({
+            agent: { id: "daemon-bgexec", clientType: "cli" },
+            host: { id: hId, profileKey: hId, targetHost: "unknown", targetUser: "unknown", displayName: "bgexec" },
+            sessionId,
+            command,
+            background: true,
+            scheduler: "auto",
+          })
+          return { id: req.id, ok: true, data: { taskId: decision.taskId, status: decision.action, command } }
         }
         case "status": {
           if (!taskId) return { id: req.id, ok: false, error: "taskId is required" }
-          const task = this.bgManager.getStatus(taskId)
+          const task = this.scheduler.getTask(taskId)
           if (!task) return { id: req.id, ok: false, error: `Task ${taskId} not found` }
           return { id: req.id, ok: true, data: task }
         }
         case "output": {
           if (!taskId) return { id: req.id, ok: false, error: "taskId is required" }
-          const output = this.bgManager.getOutput(taskId)
-          if (!output) return { id: req.id, ok: false, error: `Task ${taskId} not found` }
+          const output = this.scheduler.getTaskOutput(taskId, "full")
           return { id: req.id, ok: true, data: output }
         }
         case "cancel": {
           if (!taskId) return { id: req.id, ok: false, error: "taskId is required" }
-          const cancelled = this.bgManager.cancel(taskId, { client })
-          return { id: req.id, ok: true, data: { cancelled } }
+          const result = this.scheduler.cancelTask(taskId)
+          return { id: req.id, ok: true, data: result }
         }
         case "list": {
-          const tasks = this.bgManager.list()
+          const statusResp = this.scheduler.queueStatus(Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)?.configHash ?? sessionId.slice(0, 16))
+          const tasks = [
+            ...(statusResp.running || []).filter(t => t.status),
+            ...(statusResp.queued || []).filter(t => t.status),
+            ...(statusResp.recent || []).filter(t => t.status),
+          ]
           return { id: req.id, ok: true, data: tasks }
         }
         default:

@@ -2,6 +2,7 @@ import { describe, it, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
+import { DEFAULT_OUTPUT_RETURN_LIMIT, OutputStore } from "../scheduler/output-store.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, ScheduledTask, TaskRunner } from "../scheduler/types.js"
 import { mkdtempSync, rmSync } from "fs"
 import { join } from "path"
@@ -28,6 +29,7 @@ function makeRequest(overrides: Partial<ScheduleRequest> & { agent?: AgentIdenti
 
 class FakeRunner implements TaskRunner {
   started: string[] = []
+  cancelResult = true
   private pending = new Map<string, (result: { code: number; stdout: string; stderr: string }) => void>()
 
   async start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -43,6 +45,10 @@ class FakeRunner implements TaskRunner {
     onClose: (code: number, signal?: string) => void
   ): void {
     // no-op for tests
+  }
+
+  cancel(_task: ScheduledTask): boolean {
+    return this.cancelResult
   }
 
   finish(taskId: string, result: { code: number; stdout: string; stderr: string } = { code: 0, stdout: "", stderr: "" }) {
@@ -64,7 +70,7 @@ describe("SchedulerService", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "sched-test-"))
     persistence = new PersistenceStore(tmpDir)
     runner = new FakeRunner()
-    scheduler = new SchedulerService({ persistence, runner, maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 })
+    scheduler = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "outputs")), maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 })
   })
 
   it("large blocks large", () => {
@@ -126,7 +132,7 @@ describe("SchedulerService", () => {
     const sTmpDir = mkdtempSync(join(tmpdir(), "sched-maxq-"))
     const sPersistence = new PersistenceStore(sTmpDir)
     const sRunner = new FakeRunner()
-    const s = new SchedulerService({ persistence: sPersistence, runner: sRunner, maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 })
+    const s = new SchedulerService({ persistence: sPersistence, runner: sRunner, outputStore: new OutputStore(join(sTmpDir, "outputs")), maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 })
 
     s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
@@ -244,6 +250,41 @@ describe("SchedulerService", () => {
     const output = scheduler.getTaskOutput(d.taskId!)
     assert.equal(output.stdout, "hello world\n")
     assert.equal(output.stderr, "")
+    assert.equal(output.truncated, false)
+    assert.ok(output.stdoutPath.endsWith(`${d.taskId}.stdout`))
+  })
+
+  it("foreground-style output includes truncation metadata", async () => {
+    const outputStore = new OutputStore(join(tmpDir, "outputs"))
+    const s = new SchedulerService({ persistence, runner, outputStore, outputCleanupThrottleMs: 0 })
+    const d = s.schedule(makeRequest({ command: "echo lots" }))
+    runner.finish(d.taskId!, { code: 0, stdout: "x".repeat(40 * 1024), stderr: "" })
+    await new Promise(r => setTimeout(r, 10))
+
+    const output = s.getTaskOutput(d.taskId!)
+    assert.equal(output.stdout.length, DEFAULT_OUTPUT_RETURN_LIMIT)
+    assert.equal(output.stdoutBytes, 40 * 1024)
+    assert.equal(output.truncated, true)
+    assert.ok(output.stdoutPath.endsWith(`${d.taskId}.stdout`))
+  })
+
+  it("cancelTask does not mark running task cancelled when runner cannot cancel", () => {
+    const d = scheduler.schedule(makeRequest({ command: "sleep 999", cost: "large" }))
+    runner.cancelResult = false
+
+    const cancelled = scheduler.cancelTask(d.taskId!)
+
+    assert.equal(cancelled, false)
+    assert.equal(scheduler.getTask(d.taskId!)?.status, "running")
+  })
+
+  it("queueStatus returns virtual cwd for the requesting agent", () => {
+    scheduler.setCwd("agent-a", "host-1", "/repo-a")
+    scheduler.setCwd("agent-b", "host-1", "/repo-b")
+
+    const status = scheduler.queueStatus("host-1", 20, "agent-b")
+
+    assert.equal(status.virtualCwd, "/repo-b")
   })
 
   it("getRecentEvents returns events", () => {
@@ -283,10 +324,72 @@ describe("SchedulerService", () => {
     assert.equal(b.action, "queued")
   })
 
-  it("different workdirs allow concurrent mutations", () => {
+  it("different workdirs still block by default for large", () => {
     scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", cwd: "/repo-a" }))
-    
+
     const b = scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", agent: makeAgent("b"), cwd: "/repo-b" }))
+    assert.equal(b.action, "queued")
+  })
+
+  it("ifBusy=run_anyway allows concurrent large in different workdirs", () => {
+    scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", cwd: "/repo-a" }))
+
+    const b = scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", agent: makeAgent("b"), cwd: "/repo-b", ifBusy: "run_anyway" }))
     assert.equal(b.action, "run_now")
+  })
+
+  it('wrapped cd && python script.py serializes with other large', () => {
+    scheduler.schedule(makeRequest({ command: 'cd /repo && python script.py' }))
+    const b = scheduler.schedule(makeRequest({ command: 'bash setup.sh', agent: makeAgent('b') }))
+    assert.equal(b.action, 'queued')
+  })
+
+  it('bash -lc quoted python script.py serializes by default', () => {
+    scheduler.schedule(makeRequest({ command: 'bash -lc "python script.py"' }))
+    const b = scheduler.schedule(makeRequest({ command: 'cd /repo && bash -lc "python other.py"', agent: makeAgent('b') }))
+    assert.equal(b.action, 'queued')
+  })
+
+  it('sudo python script.py serializes by default', () => {
+    scheduler.schedule(makeRequest({ command: 'sudo python script.py' }))
+    const b = scheduler.schedule(makeRequest({ command: 'uv run python other.py', agent: makeAgent('b') }))
+    assert.equal(b.action, 'queued')
+  })
+
+  it('wrapped env FOO=1 python script.py => large', () => {
+    const d = scheduler.schedule(makeRequest({ command: 'env FOO=1 python script.py' }))
+    assert.equal(d.action, 'run_now')
+    assert.equal(d.classification?.cost, 'large')
+    assert.equal(d.classification?.mutates, true)
+  })
+
+  it('wrapped timeout 60 bash setup.sh => large', () => {
+    const d = scheduler.schedule(makeRequest({ command: 'timeout 60 bash setup.sh' }))
+    assert.equal(d.action, 'run_now')
+    assert.equal(d.classification?.cost, 'large')
+  })
+
+  it('wrapped cd /repo && npm test => large, serializes', () => {
+    const d = scheduler.schedule(makeRequest({ command: 'cd /repo && npm test' }))
+    assert.equal(d.classification?.cost, 'large')
+    assert.equal(d.classification?.intent, 'test')
+
+    const b = scheduler.schedule(makeRequest({ command: 'npm install', agent: makeAgent('b') }))
+    assert.equal(b.action, 'queued')
+  })
+
+  it('exclusive blocks large even with run_anyway', () => {
+    scheduler.schedule(makeRequest({ command: 'kubectl apply -f deploy.yaml', intent: 'deploy', cost: 'exclusive', force: true }))
+    const b = scheduler.schedule(makeRequest({ command: 'npm test', cost: 'large', agent: makeAgent('b'), ifBusy: 'run_anyway' }))
+    assert.equal(b.action, 'queued')
+  })
+
+  it('large tasks default serial across different agents', () => {
+    const a = scheduler.schedule(makeRequest({ command: 'python a.py' }))
+    const b = scheduler.schedule(makeRequest({ command: 'python b.py', agent: makeAgent('b') }))
+    const c = scheduler.schedule(makeRequest({ command: 'python c.py', agent: makeAgent('c') }))
+    assert.equal(a.action, 'run_now')
+    assert.equal(b.action, 'queued')
+    assert.equal(c.action, 'queued')
   })
 })

@@ -25,7 +25,10 @@ function createTestServer(): Promise<{
   cleanup: () => Promise<void>
 }> {
   return new Promise((resolve, reject) => {
+    const clients = new Set<any>()
     const server = new Server({ hostKeys: [hostKey.private] }, (client: any) => {
+      clients.add(client)
+      client.on("close", () => clients.delete(client))
       client.on("authentication", (ctx: any) => {
         if (ctx.method === "password" && ctx.password === "testpass") ctx.accept()
         else ctx.reject()
@@ -105,7 +108,13 @@ function createTestServer(): Promise<{
         server,
         port: addr.port,
         hostConfig: { name: "test", host: "127.0.0.1", port: addr.port, auth: { username: "testuser", password: "testpass" } },
-        cleanup: () => new Promise<void>((res) => { memFs.clear(); server.close(() => setTimeout(res, 50)) }),
+        cleanup: () => new Promise<void>((res) => {
+          memFs.clear()
+          for (const client of clients) {
+            try { client.end() } catch {}
+          }
+          server.close(() => res())
+        }),
       })
     })
     server.on("error", reject)

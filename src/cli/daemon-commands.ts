@@ -191,7 +191,7 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
       return
     }
 
-    const { sessionId, reused } = connectResp.data as any
+    const { sessionId, reused, configHash } = connectResp.data as any
     log("daemon-cli", `Session: ${sessionId.slice(0, 8)}, reused=${reused}`)
     if (reused) {
       console.error(`[ssh-exec] reusing session ${sessionId.slice(0, 8)}`)
@@ -200,8 +200,8 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
     }
 
     const hostIdentity: HostIdentity = {
-      id: sessionId.slice(0, 16),
-      profileKey: sessionId.slice(0, 16),
+      id: configHash ?? sessionId.slice(0, 16),
+      profileKey: configHash ?? sessionId.slice(0, 16),
       targetHost: (connectResp.data as any)?.host ?? "unknown",
       targetUser: "unknown",
       displayName: profileName ?? configPath ?? "inline",
@@ -242,6 +242,11 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
     if (decision.action === "run_now" && decision.result) {
       if (decision.result.stdout) process.stdout.write(decision.result.stdout)
       if (decision.result.stderr) process.stderr.write(decision.result.stderr)
+      if (decision.result.truncated) {
+        console.error(`\n[ssh-exec] output truncated; full output files:`)
+        console.error(`[ssh-exec] stdout: ${decision.result.stdoutPath}`)
+        console.error(`[ssh-exec] stderr: ${decision.result.stderrPath}`)
+      }
       process.exitCode = decision.result.code ?? 0
     } else {
       console.log(JSON.stringify(decision, null, 2))

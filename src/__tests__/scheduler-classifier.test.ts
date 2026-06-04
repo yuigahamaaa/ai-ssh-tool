@@ -169,6 +169,130 @@ describe("Command Classifier", () => {
     })
   })
 
+  describe("wrapped script classification", () => {
+    it("cd && python script.py => custom/large", () => {
+      const c = classifyCommand("cd /repo && python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+      assert.equal(c.blocking, true)
+    })
+
+    it("cd && ./scripts/deploy.sh => custom/large", () => {
+      const c = classifyCommand("cd /repo && ./scripts/deploy.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("env FOO=1 python script.py => custom/large", () => {
+      const c = classifyCommand("env FOO=1 python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("env A=1 B=2 python3 main.py => custom/large", () => {
+      const c = classifyCommand("env A=1 B=2 python3 main.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("timeout 60 bash setup.sh => custom/large", () => {
+      const c = classifyCommand("timeout 60 bash setup.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("bash -lc quoted python script.py => custom/large", () => {
+      const c = classifyCommand('bash -lc "python script.py"')
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("bash -lc single-quoted python script.py => custom/large", () => {
+      const c = classifyCommand("bash -lc 'python script.py'")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("cd && bash -lc quoted python script.py => custom/large", () => {
+      const c = classifyCommand('cd /repo && bash -lc "python script.py"')
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("sudo python script.py => custom/large", () => {
+      const c = classifyCommand("sudo python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("sh -c ./deploy.sh => custom/large", () => {
+      const c = classifyCommand("sh -xe ./deploy.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("cd semicolon python script.py => custom/large", () => {
+      const c = classifyCommand("cd /repo; python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("npx vitest => test/large", () => {
+      const c = classifyCommand("npx vitest")
+      assert.equal(c.intent, "test")
+      assert.equal(c.cost, "large")
+    })
+
+    it("pnpm exec vitest => test/large", () => {
+      const c = classifyCommand("pnpm exec vitest")
+      assert.equal(c.intent, "test")
+      assert.equal(c.cost, "large")
+    })
+
+    it("nohup python script.py => custom/large", () => {
+      const c = classifyCommand("nohup python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("sudo timeout 120 bash build.sh => custom/large", () => {
+      const c = classifyCommand("sudo timeout 120 bash build.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("cd /repo && npm test => test/large", () => {
+      const c = classifyCommand("cd /repo && npm test")
+      assert.equal(c.intent, "test")
+      assert.equal(c.cost, "large")
+      assert.equal(c.blocking, true)
+    })
+
+    it("cd /repo && npm install => install/large/mutates", () => {
+      const c = classifyCommand("cd /repo && npm install")
+      assert.equal(c.intent, "install")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("uv run python script.py => custom/large", () => {
+      const c = classifyCommand("uv run python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("poetry run python script.py => custom/large", () => {
+      const c = classifyCommand("poetry run python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+  })
+
   describe("default classification", () => {
     it("classifies unknown command (not script) as custom/medium/default", () => {
       const c = classifyCommand("some-unknown-command")

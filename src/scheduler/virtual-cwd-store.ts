@@ -1,13 +1,11 @@
 import type { VirtualCwdState } from "./types.js"
 import type { PersistenceStore } from "./persistence-store.js"
 
-const PERSIST_DEBOUNCE_MS = 1000
 
 export class VirtualCwdStore {
   private map = new Map<string, VirtualCwdState>()
   private persistence: PersistenceStore
   private dirty = false
-  private persistTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(persistence: PersistenceStore) {
     this.persistence = persistence
@@ -22,12 +20,8 @@ export class VirtualCwdStore {
   }
 
   private schedulePersist(): void {
-    if (this.persistTimer) return
     this.dirty = true
-    this.persistTimer = setTimeout(() => {
-      this.persist()
-      this.persistTimer = null
-    }, PERSIST_DEBOUNCE_MS)
+    this.persist()
   }
 
   private persist(): void {

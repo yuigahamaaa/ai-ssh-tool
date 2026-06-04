@@ -5,41 +5,69 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Optional extended suite to run"
+        required: true
+        default: "ci"
+        type: choice
+        options:
+          - ci
+          - transfer
+          - ssh
+          - integration
+          - performance
+          - all
 
 jobs:
-  unit-tests:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:test
+
+  ci-tests:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
       - run: npm ci
-      - run: npm test
+      - run: npm run test:ci
 
-  integration-tests:
+  extended-tests:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.suite != 'ci'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
+          cache: npm
       - run: npm ci
-      - run: npm run test:integration
-
-  performance-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: npm ci
-      - run: npm run test:performance
+      - name: Run selected suite
+        run: |
+          case "${{ github.event.inputs.suite }}" in
+            transfer) npm run test:transfer ;;
+            ssh) npm run test:ssh ;;
+            integration) npm run test:integration ;;
+            performance) npm run test:performance ;;
+            all) npm run test:all ;;
+            *) npm run test:ci ;;
+          esac

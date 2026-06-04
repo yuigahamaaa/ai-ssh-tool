@@ -92,6 +92,7 @@ export class SSHConnection extends EventEmitter {
         client.destroy()
         reject(new Error(`Connection to ${host.host}:${host.port} timed out`))
       }, timeout)
+      timer.unref?.()
 
       client.on("ready", () => {
         clearTimeout(timer)
@@ -100,6 +101,7 @@ export class SSHConnection extends EventEmitter {
 
       client.on("error", (err) => {
         clearTimeout(timer)
+        client.destroy()
         reject(new Error(`Failed to connect to ${host.host}:${host.port}: ${err.message}`))
       })
 
@@ -121,6 +123,7 @@ export class SSHConnection extends EventEmitter {
         client.destroy()
         reject(new Error(`Tunnel to ${host.host}:${host.port} via hop ${throughHopIndex} timed out`))
       }, timeout)
+      timer.unref?.()
 
       // Create a TCP forward through the previous hop
       throughClient.forwardOut(
@@ -143,6 +146,7 @@ export class SSHConnection extends EventEmitter {
 
           client.on("error", (clientErr) => {
             clearTimeout(timer)
+            client.destroy()
             reject(new Error(`Failed to connect to ${host.host}:${host.port} through tunnel: ${clientErr.message}`))
           })
 
@@ -264,7 +268,8 @@ export class SSHConnection extends EventEmitter {
         this.shell!.once("close", () => resolve())
         this.shell!.close()
         // Fallback: don't wait forever
-        setTimeout(resolve, 2000)
+        const timer = setTimeout(resolve, 2000)
+        timer.unref?.()
       })
       this.shell = null
     }

@@ -179,6 +179,16 @@ export class DaemonClient {
     return this.send(createRequest("getTaskOutput", { taskId, mode }))
   }
 
+  /** Get task status by id */
+  async getTaskStatus(taskId: string): Promise<IPCResponse> {
+    return this.send(createRequest("getTaskStatus", { taskId }))
+  }
+
+  /** Manually cleanup old scheduler output files */
+  async cleanupOutputs(): Promise<IPCResponse> {
+    return this.send(createRequest("cleanupOutputs", {}))
+  }
+
   /** Set virtual cwd for an agent on a host */
   async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string): Promise<IPCResponse> {
     return this.send(createRequest("setCwd", { agent, host, cwd }))

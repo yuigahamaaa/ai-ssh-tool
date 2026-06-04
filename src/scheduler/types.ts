@@ -61,6 +61,7 @@ export interface ScheduleRequest {
   scheduler?: "auto" | "bypass"
   timeoutMs?: number
   force?: boolean
+  background?: boolean
 }
 
 export interface ScheduledTask {
@@ -89,12 +90,34 @@ export interface ScheduledTask {
   stdoutBytes: number
   stderrBytes: number
   decisionReason?: string
+  timeoutMs?: number
+  background?: boolean
 }
 
 export type ScheduledTaskSummary = Pick<
   ScheduledTask,
   "id" | "agentId" | "agentName" | "hostId" | "command" | "status" | "classification" | "scheduler" | "startedAt" | "stdoutTail"
 >
+
+export interface TaskOutputFiles {
+  stdout: string
+  stderr: string
+}
+
+export interface TaskOutputResult {
+  stdout: string
+  stderr: string
+  stdoutBytes: number
+  stderrBytes: number
+  stdoutPath: string
+  stderrPath: string
+  outputFiles: TaskOutputFiles
+  truncated: boolean
+  stdoutTruncated: boolean
+  stderrTruncated: boolean
+  stdoutFileTruncated: boolean
+  stderrFileTruncated: boolean
+}
 
 export interface ScheduleDecision {
   action: "run_now" | "queued" | "wait_recommended" | "rejected" | "needs_confirmation"
@@ -105,11 +128,22 @@ export interface ScheduleDecision {
   blockers?: ScheduledTaskSummary[]
   reason: string
   recommendedNextStep?: string
+  waitTimedOut?: boolean
   result?: {
     stdout: string
     stderr: string
     code: number
     signal?: string
+    stdoutBytes?: number
+    stderrBytes?: number
+    stdoutPath?: string
+    stderrPath?: string
+    outputFiles?: TaskOutputFiles
+    truncated?: boolean
+    stdoutTruncated?: boolean
+    stderrTruncated?: boolean
+    stdoutFileTruncated?: boolean
+    stderrFileTruncated?: boolean
   }
 }
 
@@ -136,6 +170,7 @@ export interface VirtualCwdState {
 
 export interface TaskRunner {
   start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+  cancel?(task: ScheduledTask): boolean
   startBackground(
     task: ScheduledTask,
     onOutput: (stdout: string, stderr: string) => void,
@@ -144,10 +179,11 @@ export interface TaskRunner {
 }
 
 export interface SchedulerServiceInterface {
-  schedule(req: ScheduleRequest): Promise<ScheduleDecision>
+  schedule(req: ScheduleRequest): ScheduleDecision
   getStatus(): QueueStatus
-  getRecentEvents(limit?: number, hostId?: string): import("./types.js").SchedulerEvent[]
-  getTaskOutput(taskId: string, mode?: "tail" | "full"): { stdout: string; stderr: string }
+  getRecentEvents(limit?: number, hostId?: string): SchedulerEvent[]
+  getTaskOutput(taskId: string, mode?: "tail" | "full"): TaskOutputResult
+  getTask(taskId: string): ScheduledTask | undefined
   waitTask(taskId: string, timeoutMs?: number): Promise<ScheduledTask>
   dequeueTask(taskId: string): boolean
   cancelTask(taskId: string): boolean

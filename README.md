@@ -444,8 +444,9 @@ src/
 ├── ipc-protocol.ts      # IPC message framing
 ├── mcp-server.ts        # MCP protocol server
 ├── file-transfer.ts     # File/folder transfer (streaming)
-├── background-exec.ts   # Detached command execution (wrapper)
-├── exec-task-manager.ts # UNIFIED TASK MANAGER (all exec + background)
+├── scheduler/           # Shared scheduler (default exec path)
+├── background-exec.ts   # Legacy detached execution wrapper
+├── exec-task-manager.ts # Legacy local task store for compatibility
 ├── remote-fs.ts         # SFTP file operations
 ├── remote-shell.ts      # Remote command execution
 ├── remote-tools.ts      # Tool definitions for AI
@@ -910,8 +911,9 @@ src/
 ├── ipc-protocol.ts      # IPC 消息协议
 ├── mcp-server.ts        # MCP 协议服务器
 ├── file-transfer.ts     # 文件/文件夹传输（流式）
-├── background-exec.ts   # 后台命令执行（包装器）
-├── exec-task-manager.ts # 统一任务管理器（所有 exec + background）
+├── scheduler/           # 共享调度器（默认执行路径）
+├── background-exec.ts   # legacy 后台执行包装器
+├── exec-task-manager.ts # legacy 本地任务存储（兼容旧后台执行）
 ├── remote-fs.ts         # SFTP 文件操作
 ├── remote-shell.ts      # 远程命令执行
 ├── remote-tools.ts      # AI 工具定义

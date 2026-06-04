@@ -5,7 +5,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
 import { OutputStore } from "../scheduler/output-store.js"
-import { rmSync, mkdirSync, existsSync, readFileSync } from "fs"
+import { rmSync, mkdirSync, existsSync, readFileSync, symlinkSync, utimesSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 
@@ -86,5 +86,52 @@ describe("OutputStore", () => {
     const store = new OutputStore(testDir)
     const full = store.getFullStdout("nonexistent")
     assert.equal(full, "")
+  })
+
+  it("returns truncated tail metadata with full output paths", () => {
+    const store = new OutputStore(testDir)
+    store.create("task-1")
+    store.appendStdout("task-1", "x".repeat(40 * 1024))
+
+    const output = store.getOutput("task-1", "tail", 30 * 1024)
+    assert.equal(output.stdout.length, 30 * 1024)
+    assert.equal(output.stdoutBytes, 40 * 1024)
+    assert.equal(output.truncated, true)
+    assert.equal(output.stdoutTruncated, true)
+    assert.equal(output.stdoutPath, join(testDir, "task-1.stdout"))
+  })
+
+  it("tracks file truncation separately from logical byte count", () => {
+    const store = new OutputStore(testDir, { maxOutputFileSize: 10 })
+    store.create("task-1")
+    store.appendStdout("task-1", "abcdefghijklmnop")
+
+    const output = store.getOutput("task-1", "full")
+    assert.equal(output.stdout, "abcdefghij")
+    assert.equal(output.stdoutBytes, 16)
+    assert.equal(output.stdoutFileTruncated, true)
+    assert.equal(output.truncated, true)
+  })
+
+  it("cleanup deletes old output but protects requested task ids and symlinks", () => {
+    const store = new OutputStore(testDir)
+    store.create("old-task")
+    store.appendStdout("old-task", "old")
+    store.create("protected-task")
+    store.appendStdout("protected-task", "keep")
+
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000)
+    utimesSync(join(testDir, "old-task.stdout"), oldDate, oldDate)
+    utimesSync(join(testDir, "old-task.stderr"), oldDate, oldDate)
+    utimesSync(join(testDir, "protected-task.stdout"), oldDate, oldDate)
+    utimesSync(join(testDir, "protected-task.stderr"), oldDate, oldDate)
+    symlinkSync(join(testDir, "protected-task.stdout"), join(testDir, "link-task.stdout"))
+
+    const result = store.cleanup({ retentionMs: 1, keepRecentTasks: 0 }, ["protected-task"])
+
+    assert.equal(result.deletedFiles, 2)
+    assert.ok(!existsSync(join(testDir, "old-task.stdout")))
+    assert.ok(existsSync(join(testDir, "protected-task.stdout")))
+    assert.ok(existsSync(join(testDir, "link-task.stdout")))
   })
 })

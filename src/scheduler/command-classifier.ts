@@ -54,27 +54,10 @@ const intentToDefaultCost: Record<string, TaskCost> = {
 export function classifyCommand(command: string, opts?: ClassifierOptions): CommandClassification {
   const trimmed = command.trim()
 
-  for (const rule of rules) {
-    if (rule.pattern.test(trimmed)) {
-      let finalCost = opts?.cost ?? rule.cost
-      let source: CommandClassification["source"] = opts?.intent || opts?.cost ? "agent" : "auto"
-
-      const minCost = rule.cost
-      if (costRank(finalCost) < costRank(minCost)) {
-        finalCost = minCost
-        source = "agent_overridden_by_policy"
-      }
-
-      return {
-        intent: opts?.intent ?? rule.intent,
-        cost: finalCost,
-        blocking: rule.blocking,
-        mutates: rule.mutates,
-        risky: rule.risky,
-        source,
-        reason: source === "agent_overridden_by_policy"
-          ? `Agent requested cost=${opts?.cost} but policy requires at least ${minCost} for this command.`
-          : `Classified as ${rule.intent}/${rule.cost} by ${source}.`,
+  for (const candidate of commandCandidates(trimmed)) {
+    for (const rule of rules) {
+      if (rule.pattern.test(candidate)) {
+        return buildResult(rule, opts)
       }
     }
   }
@@ -87,8 +70,130 @@ export function classifyCommand(command: string, opts?: ClassifierOptions): Comm
     risky: false,
     source: opts?.intent || opts?.cost ? "agent" : "default",
     reason: opts?.intent || opts?.cost
-      ? `Agent-provided classification for unrecognized command.`
-      : `Command not recognized; defaulting to medium/custom.`,
+      ? "Agent-provided classification for unrecognized command."
+      : "Command not recognized; defaulting to medium/custom.",
+  }
+}
+
+function commandCandidates(command: string): string[] {
+  const result: string[] = []
+  const seen = new Set<string>()
+  const queue = [command]
+
+  while (queue.length > 0 && result.length < 64) {
+    const current = normalizeCandidate(queue.shift() ?? "")
+    if (!current || seen.has(current)) continue
+
+    seen.add(current)
+    result.push(current)
+
+    for (const part of splitTopLevelCommands(current)) {
+      const normalized = normalizeCandidate(part)
+      if (normalized && !seen.has(normalized)) queue.push(normalized)
+    }
+
+    const unwrapped = unwrapOnce(current)
+    if (unwrapped && !seen.has(unwrapped)) queue.push(unwrapped)
+  }
+
+  return result
+}
+
+function normalizeCandidate(command: string): string {
+  return stripOuterQuotes(command.trim())
+}
+
+function unwrapOnce(command: string): string | undefined {
+  const patterns: RegExp[] = [
+    /^cd\s+(?:"[^"]+"|'[^']+'|\S+)\s*(?:&&|;)\s*(.+)$/s,
+    /^sudo\s+(?:-\S+\s+)*(?:--\s+)?(.+)$/s,
+    /^env\s+(?:-\S+\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)+(.+)$/s,
+    /^timeout\s+(?:-\S+\s+)*(?:\d+[smhd]?|[0-9.]+)\s+(.+)$/s,
+    /^time\s+(?:-\S+\s+)*(.+)$/s,
+    /^nice\s+(?:-\S+\s+)*(.+)$/s,
+    /^nohup\s+(.+)$/s,
+    /^stdbuf\s+(?:-\S+\s+)+(.+)$/s,
+    /^(?:bash|sh|zsh|dash)\s+-[A-Za-z]*c\s+(.+)$/s,
+    /^(?:bash|sh|zsh|dash)\s+-[A-Za-z]*e\s+(.+)$/s,
+    /^npx\s+(?:--yes\s+|-y\s+)?(.+)$/s,
+    /^(?:npm|pnpm|yarn)\s+exec\s+(.+)$/s,
+    /^(?:uv|poetry)\s+run\s+(.+)$/s,
+  ]
+
+  for (const pattern of patterns) {
+    const match = command.match(pattern)
+    if (match?.[1]) return normalizeCandidate(match[1])
+  }
+
+  return undefined
+}
+
+function stripOuterQuotes(value: string): string {
+  if (value.length < 2) return value
+  const first = value[0]
+  const last = value[value.length - 1]
+  if ((first === `"` && last === `"`) || (first === `'` && last === `'`)) {
+    return value.slice(1, -1).trim()
+  }
+  return value
+}
+
+function splitTopLevelCommands(command: string): string[] {
+  const parts: string[] = []
+  let start = 0
+  let quote: `"` | `'` | null = null
+  let escaped = false
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === "\\") {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === `"` || ch === `'`) {
+      quote = ch
+      continue
+    }
+    if (ch === ";" || (ch === "&" && command[i + 1] === "&")) {
+      parts.push(command.slice(start, i))
+      start = i + (ch === "&" ? 2 : 1)
+      if (ch === "&") i++
+    }
+  }
+
+  if (start > 0) parts.push(command.slice(start))
+  return parts
+}
+
+function buildResult(rule: Rule, opts?: ClassifierOptions): CommandClassification {
+  let finalCost = opts?.cost ?? rule.cost
+  let source: CommandClassification["source"] = opts?.intent || opts?.cost ? "agent" : "auto"
+
+  const minCost = rule.cost
+  if (costRank(finalCost) < costRank(minCost)) {
+    finalCost = minCost
+    source = "agent_overridden_by_policy"
+  }
+
+  return {
+    intent: opts?.intent ?? rule.intent,
+    cost: finalCost,
+    blocking: rule.blocking,
+    mutates: rule.mutates,
+    risky: rule.risky,
+    source,
+    reason: source === "agent_overridden_by_policy"
+      ? "Agent requested cost=" + opts?.cost + " but policy requires at least " + minCost + " for this command."
+      : "Classified as " + rule.intent + "/" + rule.cost + " by " + source + ".",
   }
 }
 
