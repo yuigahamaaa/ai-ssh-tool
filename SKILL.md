@@ -81,7 +81,7 @@ ssh-tool/
 | `ssh_queue_status` | 查看队列状态 | `host_id`, `limit` |
 | `ssh_wait_task` | 等待任务完成 | `task_id`, `timeout_ms` |
 | `ssh_dequeue_task` | 从队列移除任务 | `task_id` |
-| `ssh_cd` | 设置虚拟工作目录 | `path` |
+| `ssh_cd` | 设置当前 AI 会话的虚拟 cwd（不是远端 shell 持久 cd） | `path` |
 | `ssh_register_agent` | 注册 Agent（可选） | - |
 | `ssh_heartbeat` | Agent 心跳（可选） | - |
 
@@ -121,7 +121,7 @@ ssh-tool/
 | `ssh_get_host_load` | 主机负载 | - |
 | `ssh_list_sessions` | 列出会话 | - |
 | `ssh_disconnect` | 断开会话 | `session_id` |
-| `ssh_cd` | 切换目录 | `path` |
+| `ssh_cd` | 设置虚拟 cwd | `path` |
 
 ---
 
@@ -221,20 +221,22 @@ ssh-tool/
 
 ### 虚拟工作目录（ssh_cd）
 
+`ssh_cd` 不会在远端共享 shell 中留下一个持久 `cd` 状态。它只是把 cwd 按 `当前 AI agent + host` 存起来；后续 `ssh_exec` / `ssh_schedule` 没有显式传 `cwd` 时，工具内部会自动在这个目录下执行命令。
+
 ```json
 // 设置当前 Agent 在目标主机的工作目录
 {
   "name": "ssh_cd",
   "parameters": { "path": "/var/www/html", "profile_name": "prod" }
 }
-// 后续执行命令会在该目录下进行
+// 后续同一个 AI + 同一个 host 的命令会默认在该目录下执行
 {
   "name": "ssh_exec",
   "parameters": { "command": "ls -la", "profile_name": "prod" }
 }
 ```
 
-> 💡 虚拟目录按 `Agent + Host` 隔离，不同 Agent 互不影响。
+> 💡 虚拟目录按 `Agent + Host` 隔离，不同 Agent 互不影响，也不会改变共享 SSH 会话的真实 shell 状态。
 
 注意：远端 shell 里的 `cd /repo` 只影响当前这条命令。跨工具调用要保持目录，请用 `ssh_cd` 或显式传 `cwd`。
 

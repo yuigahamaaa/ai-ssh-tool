@@ -944,9 +944,9 @@ async function main() {
 
   server.tool(
     "ssh_cd",
-    "Set the virtual working directory for this AI session on the target host. Does NOT affect other AI agents. Subsequent ssh_exec / ssh_schedule calls without explicit cwd will use this directory automatically.",
+    "Set a virtual working directory for this AI session on the target host. This is NOT a persistent remote shell cd: it only stores cwd for agentId+hostId and is applied to later ssh_exec/ssh_schedule calls that omit cwd. It does not affect other AI agents or shared SSH sessions.",
     {
-      path: z.string().describe("Directory path to set as virtual cwd"),
+      path: z.string().describe("Directory path to store as this AI session's virtual cwd"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
@@ -973,7 +973,7 @@ async function main() {
         return { content: [{ type: "text" as const, text: `Failed: ${(resp as any).error}` }] }
       }
       const data = resp.data as any
-      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, cwd: data.cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" }) }] }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, cwd: data.cwd, message: "已设置当前 AI 会话在该 host 上的虚拟 cwd；这不是远端 shell 的持久 cd，不会影响其他 AI 或共享 SSH 会话。" }) }] }
     },
   )
 

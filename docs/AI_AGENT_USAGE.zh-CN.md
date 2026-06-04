@@ -145,6 +145,8 @@
 
 ## 虚拟工作目录
 
+`ssh_cd` 不是远端 shell 的持久 `cd`。它只是在调度器里按 `AI agent + host` 保存一个虚拟 cwd；后续未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会自动使用这个目录。
+
 设置当前 AI 会话在某个 host 上的默认目录：
 
 ```json
@@ -157,7 +159,7 @@
 }
 ```
 
-之后未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会使用这个目录。这个 cwd 按 `AI agent + host` 隔离，不影响其他 AI。
+这个 cwd 按 `AI agent + host` 隔离，不影响其他 AI，也不会改变共享 SSH 会话的真实 shell 状态。
 
 ## 常见错误
 
