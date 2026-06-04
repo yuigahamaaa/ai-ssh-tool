@@ -135,7 +135,55 @@ export interface VirtualCwdState {
 }
 
 export interface TaskRunner {
-  start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+  start(task: ScheduledTask): Promise&lt;{ code: number; stdout: string; stderr: string; signal?: string }&gt;
+}
+
+export type LockScope = "host" | "workdir" | "custom"
+
+export interface SchedulerLock {
+  id: string
+  scope: LockScope
+  key: string
+  hostId: string
+  ownerAgentId: string
+  ownerTaskId?: string
+  reason?: string
+  createdAt: number
+  expiresAt: number
+  renewedAt: number
+}
+
+export type EventType =
+  | "task_created"
+  | "task_queued"
+  | "task_started"
+  | "task_completed"
+  | "task_failed"
+  | "task_cancelled"
+  | "task_timed_out"
+  | "lock_acquired"
+  | "lock_released"
+  | "task_dequeued"
+  | "cwd_changed"
+
+export interface SchedulerEvent {
+  id: string
+  type: EventType
+  timestamp: number
+  taskId?: string
+  hostId?: string
+  agentId?: string
+  data?: Record&lt;string, unknown&gt;
+}
+
+export interface AgentRecord {
+  id: string
+  name?: string
+  clientType: "mcp" | "cli"
+  startedAt: number
+  lastSeenAt: number
+  defaultProfile?: string
+}>
 }
 
 export function toSummary(task: ScheduledTask): ScheduledTaskSummary {

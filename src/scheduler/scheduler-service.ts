@@ -1,3 +1,4 @@
+
 import { randomUUID } from "crypto"
 import type {
   ScheduleRequest,
@@ -10,12 +11,18 @@ import type {
   AgentIdentity,
   HostIdentity,
   TaskRunner,
+  SchedulerLock,
+  LockScope,
+  SchedulerEvent,
+  AgentRecord,
 } from "./types.js"
 import { toSummary } from "./types.js"
 import { classifyCommand } from "./command-classifier.js"
 import { PersistenceStore } from "./persistence-store.js"
 import { VirtualCwdStore } from "./virtual-cwd-store.js"
 import { OutputStore } from "./output-store.js"
+import { EventLog } from "./event-log.js"
+import { LockManager } from "./lock-manager.js"
 
 export interface SchedulerServiceOptions {
   persistence?: PersistenceStore
@@ -29,24 +36,29 @@ export class SchedulerService {
   private persistence: PersistenceStore
   private virtualCwdStore: VirtualCwdStore
   private outputStore: OutputStore
+  private eventLog: EventLog
+  private lockManager: LockManager
   private runner: TaskRunner
 
   private maxQueueSize: number
   private maxTotalRunning: number
   private maxLargeRunning: number
 
-  private tasks = new Map<string, ScheduledTask>()
-  private waitResolvers = new Map<string, { resolve: (task: ScheduledTask) => void; timer: ReturnType<typeof setTimeout> }[]>()
+  private tasks = new Map&lt;string, ScheduledTask&gt;()
+  private waitResolvers = new Map&lt;string, { resolve: (task: ScheduledTask) =&gt; void; timer: ReturnType&lt;typeof setTimeout&gt; }[]&gt;()
+  private agents = new Map&lt;string, AgentRecord&gt;()
 
   constructor(opts?: SchedulerServiceOptions) {
     this.persistence = opts?.persistence ?? new PersistenceStore()
-    this.runner = opts?.runner ?? { start: async () => ({ code: 0, stdout: "", stderr: "" }) }
+    this.runner = opts?.runner ?? { start: async () =&gt; ({ code: 0, stdout: "", stderr: "" }) }
     this.maxQueueSize = opts?.maxQueueSize ?? 50
     this.maxTotalRunning = opts?.maxTotalRunning ?? 4
     this.maxLargeRunning = opts?.maxLargeRunning ?? 1
 
     this.virtualCwdStore = new VirtualCwdStore(this.persistence)
     this.outputStore = new OutputStore()
+    this.eventLog = new EventLog()
+    this.lockManager = new LockManager()
 
     this.restore()
   }
@@ -61,7 +73,34 @@ export class SchedulerService {
     }
   }
 
+  registerAgent(agent: AgentIdentity): AgentRecord {
+    const existing = this.agents.get(agent.id)
+    if (existing) {
+      existing.lastSeenAt = Date.now()
+      return existing
+    }
+
+    const record: AgentRecord = {
+      id: agent.id,
+      name: agent.name,
+      clientType: agent.clientType,
+      startedAt: Date.now(),
+      lastSeenAt: Date.now(),
+    }
+    this.agents.set(agent.id, record)
+    return record
+  }
+
+  heartbeat(agentId: string): void {
+    const agent = this.agents.get(agentId)
+    if (agent) {
+      agent.lastSeenAt = Date.now()
+    }
+  }
+
   schedule(req: ScheduleRequest): ScheduleDecision {
+    this.registerAgent(req.agent)
+
     const effectiveCwd = this.virtualCwdStore.resolve(req.agent.id, req.host.id, req.cwd)
     const classification = classifyCommand(req.command, {
       intent: req.intent,
@@ -69,7 +108,7 @@ export class SchedulerService {
       force: req.force,
     })
 
-    if (classification.risky && !req.force) {
+    if (classification.risky &amp;&amp; !req.force) {
       return {
         action: "needs_confirmation",
         effectiveCwd,
@@ -83,6 +122,7 @@ export class SchedulerService {
     this.tasks.set(task.id, task)
     this.persistence.saveTask(task)
     this.outputStore.create(task.id)
+    this.eventLog.log("task_created", { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { command: task.command } })
 
     if (req.scheduler === "bypass") {
       this.startTask(task)
@@ -109,8 +149,8 @@ export class SchedulerService {
 
     const ifBusy = req.ifBusy ?? this.defaultIfBusy(classification)
 
-    const hasExclusiveBlocker = blockers.some(b => b.classification?.cost === "exclusive")
-    const effectiveIfBusy = (ifBusy === "run_anyway" && hasExclusiveBlocker) ? "queue" : ifBusy
+    const hasExclusiveBlocker = blockers.some(b =&gt; b.classification?.cost === "exclusive")
+    const effectiveIfBusy = (ifBusy === "run_anyway" &amp;&amp; hasExclusiveBlocker) ? "queue" : ifBusy
 
     if (effectiveIfBusy === "run_anyway") {
       this.startTask(task)
@@ -173,31 +213,52 @@ export class SchedulerService {
     }
   }
 
-  queueStatus(hostId?: string, limit = 20): QueueStatus {
+  queueStatus(hostId?: string, limit = 20): QueueStatus &amp; { locks?: SchedulerLock[]; events?: SchedulerEvent[] } {
     const all = Array.from(this.tasks.values())
-    const filtered = hostId ? all.filter(t => t.hostId === hostId) : all
+    const filtered = hostId ? all.filter(t =&gt; t.hostId === hostId) : all
 
     return {
       hostId,
-      running: filtered.filter(t => t.status === "running").slice(0, limit).map(toSummary),
-      queued: filtered.filter(t => t.status === "queued").sort((a, b) => (a.queuePosition ?? 0) - (b.queuePosition ?? 0)).slice(0, limit).map(toSummary),
-      recent: filtered.filter(t => ["completed", "failed", "cancelled", "timeout", "stale"].includes(t.status)).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0)).slice(0, limit).map(toSummary),
+      running: filtered.filter(t =&gt; t.status === "running").slice(0, limit).map(toSummary),
+      queued: filtered.filter(t =&gt; t.status === "queued").sort((a, b) =&gt; (a.queuePosition ?? 0) - (b.queuePosition ?? 0)).slice(0, limit).map(toSummary),
+      recent: filtered.filter(t =&gt; ["completed", "failed", "cancelled", "timeout", "stale"].includes(t.status)).sort((a, b) =&gt; (b.finishedAt ?? 0) - (a.finishedAt ?? 0)).slice(0, limit).map(toSummary),
       virtualCwd: hostId ? this.virtualCwdStore.resolve("__peek__", hostId) : undefined,
       limits: {
         maxQueueSize: this.maxQueueSize,
         maxTotalRunning: this.maxTotalRunning,
         maxLargeRunning: this.maxLargeRunning,
       },
+      locks: hostId ? this.lockManager.getLocksForHost(hostId) : undefined,
+      events: hostId ? this.eventLog.getRecent(limit, hostId) : undefined,
     }
   }
 
-  waitTask(taskId: string, timeoutMs = 30000): Promise<ScheduledTask> {
+  getRecentEvents(limit = 100, hostId?: string): SchedulerEvent[] {
+    return this.eventLog.getRecent(limit, hostId)
+  }
+
+  getTaskOutput(taskId: string, mode: "tail" | "full" = "tail"): { stdout: string; stderr: string } {
+    if (mode === "full") {
+      return {
+        stdout: this.outputStore.getFullStdout(taskId),
+        stderr: this.outputStore.getFullStderr(taskId),
+      }
+    } else {
+      const output = this.outputStore.get(taskId)
+      return {
+        stdout: output?.stdoutTail ?? "",
+        stderr: output?.stderrTail ?? "",
+      }
+    }
+  }
+
+  waitTask(taskId: string, timeoutMs = 30000): Promise&lt;ScheduledTask&gt; {
     const task = this.tasks.get(taskId)
     if (!task) return Promise.reject(new Error(`Task ${taskId} not found`))
-    if (task.status !== "queued" && task.status !== "running") return Promise.resolve(task)
+    if (task.status !== "queued" &amp;&amp; task.status !== "running") return Promise.resolve(task)
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    return new Promise((resolve, reject) =&gt; {
+      const timer = setTimeout(() =&gt; {
         this.removeWaitResolver(taskId, resolve)
         const current = this.tasks.get(taskId)
         if (current) {
@@ -208,7 +269,7 @@ export class SchedulerService {
       }, timeoutMs)
 
       const resolvers = this.waitResolvers.get(taskId) ?? []
-      resolvers.push({ resolve: (t) => { clearTimeout(timer); resolve(t) }, timer })
+      resolvers.push({ resolve: (t) =&gt; { clearTimeout(timer); resolve(t) }, timer })
       this.waitResolvers.set(taskId, resolvers)
     })
   }
@@ -221,12 +282,14 @@ export class SchedulerService {
     task.updatedAt = Date.now()
     task.decisionReason = "Removed from queue by dequeue request."
     this.persistence.saveTask(task)
+    this.eventLog.log("task_dequeued", { taskId, hostId: task.hostId, agentId: task.agentId })
     this.recomputeQueuePositions(task.hostId)
     return true
   }
 
   setCwd(agentId: string, hostId: string, cwd: string): string {
     const state = this.virtualCwdStore.set(agentId, hostId, cwd)
+    this.eventLog.log("cwd_changed", { agentId, hostId, data: { cwd } })
     return state.cwd
   }
 
@@ -240,6 +303,29 @@ export class SchedulerService {
 
   getRunner(): TaskRunner {
     return this.runner
+  }
+
+  acquireLock(
+    scope: LockScope,
+    key: string,
+    hostId: string,
+    agentId: string,
+    taskId?: string,
+    reason?: string
+  ): SchedulerLock | null {
+    const lock = this.lockManager.acquire(scope, key, hostId, agentId, taskId, reason)
+    if (lock) {
+      this.eventLog.log("lock_acquired", { hostId, agentId, data: { lockId: lock.id, scope, key } })
+    }
+    return lock
+  }
+
+  releaseLock(lockId: string): boolean {
+    const result = this.lockManager.release(lockId)
+    if (result) {
+      this.eventLog.log("lock_released", { data: { lockId } })
+    }
+    return result
   }
 
   private createTask(req: ScheduleRequest, effectiveCwd: string | undefined, classification: CommandClassification): ScheduledTask {
@@ -265,14 +351,21 @@ export class SchedulerService {
   }
 
   private startTask(task: ScheduledTask): void {
+    if (task.classification.cost === "exclusive") {
+      this.lockManager.acquire("host", task.hostId, task.hostId, task.agentId, task.id, "exclusive task")
+    } else if (task.classification.mutates &amp;&amp; task.effectiveCwd) {
+      this.lockManager.acquire("workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating task in workdir")
+    }
+
     task.status = "running"
     task.startedAt = Date.now()
     task.updatedAt = Date.now()
     this.persistence.saveTask(task)
+    this.eventLog.log("task_started", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
 
     this.runner.start(task)
-      .then(result => this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
-      .catch(err => this.finishTask(task.id, "failed", 1, undefined, "", err.message))
+      .then(result =&gt; this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
+      .catch(err =&gt; this.finishTask(task.id, "failed", 1, undefined, "", err.message))
   }
 
   private finishTask(taskId: string, status: ScheduledTaskStatus, exitCode: number, signal?: string, stdout?: string, stderr?: string): void {
@@ -286,15 +379,27 @@ export class SchedulerService {
     task.updatedAt = Date.now()
 
     if (stdout) {
-      task.stdoutTail = stdout.slice(-65536)
-      task.stdoutBytes = Buffer.byteLength(stdout)
+      this.outputStore.appendStdout(taskId, stdout)
+      const output = this.outputStore.get(taskId)
+      if (output) {
+        task.stdoutTail = output.stdoutTail
+        task.stdoutBytes = output.stdoutBytes
+      }
     }
     if (stderr) {
-      task.stderrTail = stderr.slice(-65536)
-      task.stderrBytes = Buffer.byteLength(stderr)
+      this.outputStore.appendStderr(taskId, stderr)
+      const output = this.outputStore.get(taskId)
+      if (output) {
+        task.stderrTail = output.stderrTail
+        task.stderrBytes = output.stderrBytes
+      }
     }
 
+    this.lockManager.releaseForTask(taskId)
+
     this.persistence.saveTask(task)
+    const eventType = status === "completed" ? "task_completed" : status === "failed" ? "task_failed" : status === "cancelled" ? "task_cancelled" : "task_timed_out"
+    this.eventLog.log(eventType, { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { exitCode } })
 
     const resolvers = this.waitResolvers.get(taskId)
     if (resolvers) {
@@ -312,24 +417,37 @@ export class SchedulerService {
     if (task.scheduler === "bypass") return []
 
     const running = this.runningTasks(task.hostId)
-    const nonBypass = running.filter(t => t.scheduler !== "bypass")
+    const nonBypass = running.filter(t =&gt; t.scheduler !== "bypass")
+
+    if (task.classification.cost === "exclusive" || task.classification.cost === "large") {
+      if (task.effectiveCwd) {
+        const workdirConflicts = this.lockManager.getConflictingLocks("workdir", task.effectiveCwd, task.hostId)
+        if (workdirConflicts.length &gt; 0) {
+          const blockingTaskIds = workdirConflicts.map(l =&gt; l.ownerTaskId).filter(Boolean) as string[]
+          return blockingTaskIds
+            .map(id =&gt; this.tasks.get(id))
+            .filter(Boolean)
+            .map(toSummary)
+        }
+      }
+    }
 
     switch (task.classification.cost) {
       case "tiny":
-        return nonBypass.filter(t => t.classification.cost === "exclusive").map(toSummary)
+        return nonBypass.filter(t =&gt; t.classification.cost === "exclusive").map(toSummary)
       case "small":
       case "medium":
-        return nonBypass.length >= this.maxTotalRunning ? nonBypass.map(toSummary) : []
+        return nonBypass.length &gt;= this.maxTotalRunning ? nonBypass.map(toSummary) : []
       case "large":
-        return nonBypass.filter(t => t.classification.cost === "large" || t.classification.cost === "exclusive").map(toSummary)
+        return nonBypass.filter(t =&gt; t.classification.cost === "large" || t.classification.cost === "exclusive").map(toSummary)
       case "exclusive":
         return nonBypass.map(toSummary)
     }
   }
 
   private enqueue(task: ScheduledTask): boolean {
-    const queuedCount = this.queuedTasks(task.hostId).filter(t => t.id !== task.id).length
-    if (queuedCount >= this.maxQueueSize) {
+    const queuedCount = this.queuedTasks(task.hostId).filter(t =&gt; t.id !== task.id).length
+    if (queuedCount &gt;= this.maxQueueSize) {
       task.status = "cancelled"
       task.updatedAt = Date.now()
       task.decisionReason = "Queue full."
@@ -341,6 +459,7 @@ export class SchedulerService {
     task.queuedAt = Date.now()
     task.updatedAt = Date.now()
     this.persistence.saveTask(task)
+    this.eventLog.log("task_queued", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
     this.recomputeQueuePositions(task.hostId)
     return true
   }
@@ -348,7 +467,7 @@ export class SchedulerService {
   private pumpQueue(hostId: string): void {
     for (const task of this.queuedTasks(hostId)) {
       const blockers = this.findBlockers(task)
-      if (blockers.length > 0) break
+      if (blockers.length &gt; 0) break
       this.startTask(task)
     }
     this.recomputeQueuePositions(hostId)
@@ -356,20 +475,20 @@ export class SchedulerService {
 
   private recomputeQueuePositions(hostId: string): void {
     const queued = this.queuedTasks(hostId)
-    for (let i = 0; i < queued.length; i++) {
+    for (let i = 0; i &lt; queued.length; i++) {
       queued[i].queuePosition = i + 1
       this.persistence.saveTask(queued[i])
     }
   }
 
   private runningTasks(hostId: string): ScheduledTask[] {
-    return Array.from(this.tasks.values()).filter(t => t.hostId === hostId && t.status === "running")
+    return Array.from(this.tasks.values()).filter(t =&gt; t.hostId === hostId &amp;&amp; t.status === "running")
   }
 
   private queuedTasks(hostId: string): ScheduledTask[] {
     return Array.from(this.tasks.values())
-      .filter(t => t.hostId === hostId && t.status === "queued")
-      .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))
+      .filter(t =&gt; t.hostId === hostId &amp;&amp; t.status === "queued")
+      .sort((a, b) =&gt; (a.queuedAt ?? 0) - (b.queuedAt ?? 0))
   }
 
   private defaultIfBusy(classification: CommandClassification): "run_anyway" | "wait" | "queue" | "fail" {
@@ -384,11 +503,11 @@ export class SchedulerService {
     }
   }
 
-  private removeWaitResolver(taskId: string, resolve: (task: ScheduledTask) => void): void {
+  private removeWaitResolver(taskId: string, resolve: (task: ScheduledTask) =&gt; void): void {
     const resolvers = this.waitResolvers.get(taskId)
     if (!resolvers) return
-    const idx = resolvers.findIndex(r => r.resolve === resolve)
-    if (idx >= 0) resolvers.splice(idx, 1)
+    const idx = resolvers.findIndex(r =&gt; r.resolve === resolve)
+    if (idx &gt;= 0) resolvers.splice(idx, 1)
     if (resolvers.length === 0) this.waitResolvers.delete(taskId)
   }
 }

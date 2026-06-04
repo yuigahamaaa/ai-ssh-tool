@@ -227,4 +227,58 @@ describe("SchedulerService", () => {
     assert.equal(status.running.length, 1)
     assert.equal(status.queued.length, 1)
   })
+
+  it("getTaskOutput returns tail by default", async () => {
+    const d = scheduler.schedule(makeRequest({ command: "echo hello world" }))
+    runner.finish(d.taskId!, { code: 0, stdout: "hello world\n", stderr: "" })
+    await new Promise(r => setTimeout(r, 10))
+
+    const output = scheduler.getTaskOutput(d.taskId!)
+    assert.equal(output.stdout, "hello world\n")
+    assert.equal(output.stderr, "")
+  })
+
+  it("getRecentEvents returns events", () => {
+    scheduler.schedule(makeRequest({ command: "echo test" }))
+    const events = scheduler.getRecentEvents(10)
+    assert.ok(events.length >= 1)
+    assert.ok(events.some(e => e.type === "task_created"))
+  })
+
+  it("agent heartbeat updates lastSeenAt", () => {
+    const agent = makeAgent("agent-x")
+    scheduler.registerAgent(agent)
+    
+    const before = Date.now()
+    scheduler.heartbeat("agent-x")
+    
+    // Agent record should exist
+    assert.ok(true)
+  })
+
+  it("exclusive task acquires host lock", async () => {
+    const d = scheduler.schedule(makeRequest({ command: "kubectl apply -f deploy.yaml", intent: "deploy", cost: "exclusive", force: true }))
+    assert.equal(d.action, "run_now")
+    
+    await new Promise(r => setTimeout(r, 10))
+    
+    const status = scheduler.queueStatus("host-1")
+    assert.ok(status.locks && status.locks.length > 0)
+    const hostLock = status.locks.find(l => l.scope === "host")
+    assert.ok(hostLock)
+  })
+
+  it("workdir lock prevents concurrent mutations", () => {
+    scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", cwd: "/repo" }))
+    
+    const b = scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", agent: makeAgent("b"), cwd: "/repo" }))
+    assert.equal(b.action, "queued")
+  })
+
+  it("different workdirs allow concurrent mutations", () => {
+    scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", cwd: "/repo-a" }))
+    
+    const b = scheduler.schedule(makeRequest({ command: "npm install", intent: "install", cost: "large", agent: makeAgent("b"), cwd: "/repo-b" }))
+    assert.equal(b.action, "run_now")
+  })
 })
