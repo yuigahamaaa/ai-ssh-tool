@@ -102,9 +102,76 @@ describe("Command Classifier", () => {
     })
   })
 
+  describe("script execution classification", () => {
+    it("classifies python script as custom/large/mutates", () => {
+      const c = classifyCommand("python script.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+      assert.equal(c.blocking, true)
+    })
+
+    it("classifies python3 script as custom/large", () => {
+      const c = classifyCommand("python3 main.py --arg=value")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("classifies bash script as custom/large", () => {
+      const c = classifyCommand("bash setup.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("classifies sh script as custom/large", () => {
+      const c = classifyCommand("sh deploy.sh prod")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("classifies zsh script as custom/large", () => {
+      const c = classifyCommand("zsh install.zsh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("classifies node script as custom/large", () => {
+      const c = classifyCommand("node index.js")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+      assert.equal(c.mutates, true)
+    })
+
+    it("classifies ./script.sh as custom/large", () => {
+      const c = classifyCommand("./scripts/deploy.sh")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("classifies ./script.py as custom/large", () => {
+      const c = classifyCommand("./main.py")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("classifies ruby script as custom/large", () => {
+      const c = classifyCommand("ruby script.rb")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+
+    it("classifies perl script as custom/large", () => {
+      const c = classifyCommand("perl script.pl")
+      assert.equal(c.intent, "custom")
+      assert.equal(c.cost, "large")
+    })
+  })
+
   describe("default classification", () => {
-    it("classifies unknown command as custom/medium/default", () => {
-      const c = classifyCommand("./scripts/custom.sh")
+    it("classifies unknown command (not script) as custom/medium/default", () => {
+      const c = classifyCommand("some-unknown-command")
       assert.equal(c.intent, "custom")
       assert.equal(c.cost, "medium")
       assert.equal(c.blocking, true)
@@ -125,6 +192,12 @@ describe("Command Classifier", () => {
       assert.equal(c.cost, "large")
       assert.equal(c.source, "agent_overridden_by_policy")
       assert.ok(c.reason.includes("policy"))
+    })
+
+    it("upgrades cost for python scripts when agent underestimates", () => {
+      const c = classifyCommand("python script.py", { intent: "inspect", cost: "tiny" })
+      assert.equal(c.cost, "large")
+      assert.equal(c.source, "agent_overridden_by_policy")
     })
   })
 

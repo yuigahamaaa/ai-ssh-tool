@@ -18,6 +18,13 @@ interface Rule {
 const rules: Rule[] = [
   { pattern: /^(sudo\s+)?(ls|pwd|cat|head|tail|file|stat|uname|whoami|id|date|wc|diff|sed\s+-n)\b/, intent: "inspect", cost: "tiny", blocking: false, mutates: false, risky: false },
   { pattern: /^(sudo\s+)?(rg|grep|find|which|whereis|locate)\b/, intent: "search", cost: "tiny", blocking: false, mutates: false, risky: false },
+  { pattern: /^(python|python3|py|python2)\s+.*\.py(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^(bash|sh|zsh|dash)\s+.*\.(sh|bash|zsh)(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^node\s+.*\.(js|mjs|cjs|ts)(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^\.\/.*\.(sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl)(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^(ruby|rb)\s+.*\.rb(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^(perl|pl)\s+.*\.pl(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
+  { pattern: /^(go|rustc|javac|gradle|maven)\s+(?!test)/, intent: "build", cost: "large", blocking: true, mutates: false, risky: false },
   { pattern: /^(npm|pnpm|yarn)\s+test\b/, intent: "test", cost: "large", blocking: true, mutates: false, risky: false },
   { pattern: /^(pytest|go\s+test|cargo\s+test|make\s+test|jest|vitest)\b/, intent: "test", cost: "large", blocking: true, mutates: false, risky: false },
   { pattern: /^(npm|pnpm|yarn)\s+run\s+(build|compile)\b/, intent: "build", cost: "large", blocking: true, mutates: false, risky: false },
