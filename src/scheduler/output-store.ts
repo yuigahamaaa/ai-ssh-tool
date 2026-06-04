@@ -1,5 +1,5 @@
 
-import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs"
+import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, unlinkSync } from "fs"
 import { join, dirname } from "path"
 import { homedir } from "os"
 
@@ -92,5 +92,7 @@ export class OutputStore {
 
   remove(taskId: string): void {
     this.inMemory.delete(taskId)
+    try { unlinkSync(this.getStdoutPath(taskId)) } catch {}
+    try { unlinkSync(this.getStderrPath(taskId)) } catch {}
   }
 }
