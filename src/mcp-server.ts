@@ -30,6 +30,14 @@ import { checkDeps } from "./check-deps.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
+import {
+  guidanceForTaskStatus,
+  guidanceForWaitResult,
+  jsonText,
+  mcpEnvelope,
+  mcpErrorEnvelope,
+  scheduleDecisionEnvelope,
+} from "./mcp-response.js"
 import { randomUUID } from "crypto"
 
 interface HostConfig {
@@ -270,24 +278,7 @@ async function main() {
   }
 
   function formatScheduleDecisionForAgent(decision: ScheduleDecision): string {
-    const guidance: string[] = []
-
-    if (decision.action === "queued") {
-      guidance.push("Task was queued. Do not immediately resubmit the same command. Continue unrelated read/search/planning work, then call ssh_queue_status or ssh_wait_task with this taskId.")
-    } else if (decision.waitTimedOut) {
-      guidance.push("The foreground wait timed out but the task is still registered. Use ssh_exec_status with taskId to check status/output instead of rerunning the command.")
-    } else if (decision.action === "wait_recommended") {
-      guidance.push("A conflicting task is running. Prefer waiting for a blocker or doing unrelated work before retrying.")
-    } else if (decision.action === "needs_confirmation") {
-      guidance.push("This command is risky. Explain the risk and retry with force=true only if the user intends it.")
-    }
-
-    const result = decision.result
-    if (result?.truncated) {
-      guidance.push(`Returned stdout/stderr are tails only. Read full output from stdoutPath=${result.stdoutPath} and stderrPath=${result.stderrPath}, or call ssh_exec_status with mode=full when this task is still tracked.`)
-    }
-
-    return JSON.stringify({ ...decision, agentGuidance: guidance }, null, 2)
+    return jsonText(scheduleDecisionEnvelope(decision))
   }
 
   function profileToLegacyConfigJson(profile: SSHProfile): string {
@@ -646,19 +637,24 @@ async function main() {
       await daemonClient.ensureDaemon()
       const statusResp = await daemonClient.getTaskStatus(task_id)
       if (!statusResp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(statusResp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("task_status", (statusResp as any).error)) }] }
       }
 
       const outputResp = await daemonClient.getTaskOutput(task_id, mode)
       if (!outputResp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(outputResp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("task_status", (outputResp as any).error)) }] }
       }
 
       const result = {
-        ...(statusResp.data as any),
-        output: outputResp.data,
+        task: statusResp.data as any,
+        output: outputResp.data as any,
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("task_status", result, guidanceForTaskStatus(result.task, result.output))),
+        }],
+      }
     },
   )
 
@@ -672,10 +668,21 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.cancelTask(task_id)
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cancel_result", (resp as any).error)) }] }
       }
       const cancelled = (resp.data as any)?.cancelled
-      return { content: [{ type: "text" as const, text: cancelled ? `Task ${task_id} cancelled` : `Task ${task_id} not found or already finished` }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope(
+            "cancel_result",
+            { taskId: task_id, cancelled },
+            cancelled
+              ? ["Task was cancelled. Check ssh_queue_status before starting replacement heavy work."]
+              : ["Task was not cancelled. It may be missing, already finished, or the running process could not be cancelled; call ssh_exec_status for the same taskId when unsure."],
+          )),
+        }],
+      }
     },
   )
 
@@ -687,9 +694,9 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.cleanupOutputs()
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cleanup_result", (resp as any).error)) }] }
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data) }] }
+      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("cleanup_result", resp.data)) }] }
     },
   )
 
@@ -703,9 +710,9 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.queueStatus({ hostId: hostname })
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("queue_status", (resp as any).error)) }] }
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data) }] }
+      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("queue_status", resp.data)) }] }
     },
   )
 
@@ -736,7 +743,7 @@ async function main() {
         processCount: procResult.stdout.trim(),
         scheduler: queueResp.ok ? queueResp.data : { error: (queueResp as any).error },
       }
-      return { content: [{ type: "text", text: JSON.stringify(loadInfo, null, 2) }] }
+      return { content: [{ type: "text", text: jsonText(mcpEnvelope("host_load", loadInfo)) }] }
     },
   )
 
@@ -955,7 +962,7 @@ async function main() {
       const configJson = profileToLegacyConfigJson(profile)
       const connectResp = await daemonClient.connectHostJson(configJson)
       if (!connectResp.ok) {
-        return { content: [{ type: "text" as const, text: `Connection failed: ${(connectResp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
       }
       const { sessionId } = connectResp.data as any
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
@@ -968,10 +975,19 @@ async function main() {
       }
       const resp = await daemonClient.setCwd(agentIdentity, hostIdentity, path)
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Failed: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", (resp as any).error)) }] }
       }
       const data = resp.data as any
-      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, cwd: data.cwd, message: "已设置当前 AI 会话在该 host 上的虚拟 cwd；这不是远端 shell 的持久 cd，不会影响其他 AI 或共享 SSH 会话。" }) }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("cwd_result", {
+            success: true,
+            cwd: data.cwd,
+            message: "已设置当前 AI 会话在该 host 上的虚拟 cwd；这不是远端 shell 的持久 cd，不会影响其他 AI 或共享 SSH 会话。",
+          })),
+        }],
+      }
     },
   )
 
@@ -1026,9 +1042,16 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.queueStatus({ agent: { id: MCP_AGENT_ID, clientType: "mcp" }, hostId: host_id, limit })
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("queue_status", (resp as any).error)) }] }
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("queue_status", resp.data, [
+            "Use running/queued/recent to decide whether to wait, queue, or run independent read-only work. Do not duplicate queued taskIds.",
+          ])),
+        }],
+      }
     },
   )
 
@@ -1043,9 +1066,22 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.waitTask(task_id, timeout)
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("wait_result", (resp as any).error)) }] }
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
+      const task = resp.data as any
+      const waitTimedOut = task.status === "queued" || task.status === "running"
+      let output: any | undefined
+      if (!waitTimedOut) {
+        const outputResp = await daemonClient.getTaskOutput(task_id, "tail")
+        if (outputResp.ok) output = outputResp.data
+      }
+      const data = { task, output, waitTimedOut }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("wait_result", data, guidanceForWaitResult(task, waitTimedOut, output))),
+        }],
+      }
     },
   )
 
@@ -1059,9 +1095,9 @@ async function main() {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.dequeueTask(task_id, { id: MCP_AGENT_ID, clientType: "mcp" })
       if (!resp.ok) {
-        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("dequeue_result", (resp as any).error)) }] }
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data, null, 2) }] }
+      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("dequeue_result", resp.data)) }] }
     },
   )
 

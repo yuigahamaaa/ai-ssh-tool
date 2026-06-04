@@ -78,6 +78,7 @@ src/__tests__/background-exec.test.ts
 - IPC action encode/decode
 - daemon handler
 - schedule/queueStatus/waitTask/dequeueTask/setCwd
+- MCP response envelope helper：`ok/kind/data/agentGuidance`
 
 ### 4.3 L2：MCP/CLI 包装测试
 
@@ -89,6 +90,8 @@ src/__tests__/background-exec.test.ts
 - MCP helper 共享
 - CLI 参数解析
 - CLI daemon command handler
+
+`mcp-response.test.ts` 属于 L1：它不启动 MCP server，只锁定调度相关工具的 JSON 返回契约。`mcp-server.test.ts` 属于 L2：验证工具包装是否实际使用这些契约。
 
 ### 4.4 L3：端到端验收
 
@@ -516,6 +519,8 @@ class FakeRunner {
 
 扩展：`src/__tests__/mcp-server.test.ts`
 
+新增纯格式契约测试：`src/__tests__/mcp-response.test.ts`
+
 ### 11.1 tool schema
 
 验证 `ssh_exec` 新参数存在：
@@ -549,7 +554,45 @@ mock `DaemonClient.schedule()`。
 - schedule 被调用。
 - request.scheduler=`auto`。
 
-### 11.3 ssh_exec bypass
+### 11.3 统一返回 envelope
+
+覆盖 `src/mcp-response.ts`。
+
+步骤：
+
+1. 构造 queued `ScheduleDecision`。
+2. 调 `scheduleDecisionEnvelope()`。
+3. 构造 completed/failed/running task 和 output。
+4. 调 `guidanceForTaskStatus()`、`guidanceForWaitResult()`、`mcpEnvelope()`。
+
+期望：
+
+- 返回包含 `ok=true`。
+- 返回包含 `kind`，例如 `schedule_decision`、`task_status`、`wait_result`、`cancel_result`。
+- 返回包含 `data`，且 `data` 保留原始结构。
+- 返回包含 `agentGuidance`。
+- `ssh_exec` / `ssh_schedule` 使用的 schedule envelope 同时保留顶层 `action`、`taskId`、`result`，兼容旧提示词。
+- queued/wait timeout/truncated output 的 guidance 明确要求 AI 不要重复提交同一命令。
+
+### 11.4 ssh_exec_status / ssh_wait_task 输出契约
+
+期望：
+
+- `ssh_exec_status` 返回 `kind="task_status"`，主数据在 `data.task` 和 `data.output`。
+- `ssh_wait_task` 返回 `kind="wait_result"`。
+- wait 超时时 `data.waitTimedOut=true`，且 guidance 要求继续查同一个 `taskId`。
+- wait 完成时返回 `data.output`，包含 stdout/stderr tail、bytes、path、truncated。
+
+### 11.5 ssh_exec_cancel / queue / cleanup 输出契约
+
+期望：
+
+- `ssh_exec_cancel` 返回 `kind="cancel_result"` 和 `data.cancelled`，不返回纯文本。
+- `ssh_queue_status` / `ssh_list_tasks` 返回 `kind="queue_status"`。
+- `ssh_cleanup_outputs` 返回 `kind="cleanup_result"`。
+- 错误也返回 `ok=false`、`kind`、`error`、`agentGuidance`。
+
+### 11.6 ssh_exec bypass
 
 步骤：
 
@@ -561,7 +604,7 @@ mock `DaemonClient.schedule()`。
 - request.scheduler=`bypass`。
 - 不走本地 remoteExec。
 
-### 11.4 ssh_schedule 共享 helper
+### 11.7 ssh_schedule 共享 helper
 
 步骤：
 
@@ -571,7 +614,7 @@ mock `DaemonClient.schedule()`。
 
 - 使用和 `ssh_exec` 相同 helper 构造 ScheduleRequest。
 
-### 11.5 ssh_cd virtual cwd
+### 11.8 ssh_cd virtual cwd
 
 步骤：
 
@@ -794,4 +837,3 @@ node --test dist/__tests__/daemon-scheduler.test.js
 | daemon restart 恢复 | `scheduler-persistence.test.ts` |
 | ssh_cd 不串扰 | `virtual-cwd.test.ts`, `mcp-server.test.ts` |
 | effectiveCwd/classification | `scheduler-service.test.ts`, `mcp-server.test.ts` |
-

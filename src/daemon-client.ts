@@ -161,7 +161,8 @@ export class DaemonClient {
 
   /** Wait for a task to complete */
   async waitTask(taskId: string, timeoutMs?: number): Promise<IPCResponse> {
-    return this.send(createRequest("waitTask", { taskId, timeoutMs }), timeoutMs ?? 120000)
+    const ipcTimeoutMs = timeoutMs === undefined ? 120000 : timeoutMs + 5000
+    return this.send(createRequest("waitTask", { taskId, timeoutMs }), ipcTimeoutMs)
   }
 
   /** Remove a task from the queue */

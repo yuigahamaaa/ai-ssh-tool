@@ -136,6 +136,21 @@ ssh-tool/
 7. 如果返回 `result.truncated: true`，内联 stdout/stderr 只是 tail。完整输出在 `result.stdoutPath` / `result.stderrPath`，需要时读取文件或用 `ssh_exec_status(mode="full")`。
 8. 不要用远端 `cd` 期待跨工具调用保持目录。用 `ssh_cd` 设置当前 AI 会话的虚拟工作目录，或每次显式传 `cwd`。
 
+### 返回结构读取规则
+
+调度相关 MCP 工具统一返回 JSON envelope：
+
+```json
+{
+  "ok": true,
+  "kind": "schedule_decision",
+  "data": {},
+  "agentGuidance": []
+}
+```
+
+AI 优先读 `ok`、`kind`、`data`、`agentGuidance`。`ssh_exec` / `ssh_schedule` 为兼容旧提示词，仍会把 `action`、`taskId`、`result` 等调度字段保留在顶层。
+
 ---
 
 ## 调度器使用指南（新增！）
@@ -157,8 +172,15 @@ ssh-tool/
 }
 // 返回：
 {
+  "ok": true,
+  "kind": "schedule_decision",
   "action": "run_now",
   "taskId": "task-xxx",
+  "data": {
+    "action": "run_now",
+    "taskId": "task-xxx"
+  },
+  "agentGuidance": [],
   "result": {
     "stdout": " 10:00:00 up 1 day",
     "stderr": "",
@@ -180,13 +202,25 @@ ssh-tool/
 }
 // 返回：
 {
+  "ok": true,
+  "kind": "schedule_decision",
   "action": "queued",
   "taskId": "task-xxx",
   "queuePosition": 1,
+  "data": {
+    "action": "queued",
+    "taskId": "task-xxx",
+    "queuePosition": 1
+  },
+  "agentGuidance": [
+    "Task was queued. Do not immediately resubmit the same command..."
+  ],
   "reason": "Host has conflicting tasks; command queued.",
   "recommendedNextStep": "Do unrelated read-only work; call ssh_wait_task or ssh_queue_status later."
 }
 ```
+
+`ssh_exec_status` 返回 `kind: "task_status"`，主数据在 `data.task` 和 `data.output`。`ssh_wait_task` 返回 `kind: "wait_result"`，若 `data.waitTimedOut=true`，不要重跑原命令；继续等待或查同一个 `taskId`。
 
 ### 高级参数
 

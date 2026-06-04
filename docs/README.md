@@ -34,4 +34,5 @@
 
 - 默认执行路径是 daemon 内的 `src/scheduler/`。
 - MCP 和 CLI 都应通过 daemon scheduler，不各自维护队列。
+- 调度相关 MCP 返回统一 JSON envelope：`ok`、`kind`、`data`、`agentGuidance`；`ssh_exec` / `ssh_schedule` 额外保留顶层 `action`、`taskId`、`result` 兼容旧用法。
 - `src/exec-task-manager.ts` 和 `src/background-exec.ts` 仍保留用于 legacy/background compatibility；不要把它们理解为当前调度权威。

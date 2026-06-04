@@ -13,6 +13,26 @@
 7. 输出被截断时读 `stdoutPath` / `stderrPath`，不要重跑命令。
 8. 跨调用保持目录用 `ssh_cd` 或显式 `cwd`，不要依赖远端 shell 的 `cd`。
 
+## 返回结构读取规则
+
+调度相关 MCP 工具统一返回 JSON envelope。AI 应优先读取这些字段：
+
+```json
+{
+  "ok": true,
+  "kind": "schedule_decision",
+  "data": {},
+  "agentGuidance": []
+}
+```
+
+- `ok`：工具调用是否成功。
+- `kind`：结果类型，例如 `schedule_decision`、`task_status`、`wait_result`、`cancel_result`、`queue_status`。
+- `data`：该工具的主要结构化结果。
+- `agentGuidance`：给 AI 的下一步建议。排队、等待超时、输出截断时必须优先遵守。
+
+兼容说明：`ssh_exec` / `ssh_schedule` 仍会把 `action`、`taskId`、`result` 等调度字段保留在顶层，旧提示词可以继续读；新提示词优先读 `data` 和 `agentGuidance`。
+
 ## 推荐工作流
 
 ### 轻量检查
@@ -48,9 +68,19 @@
 
 ```json
 {
+  "ok": true,
+  "kind": "schedule_decision",
   "action": "queued",
   "taskId": "t_xxx",
-  "queuePosition": 1
+  "queuePosition": 1,
+  "data": {
+    "action": "queued",
+    "taskId": "t_xxx",
+    "queuePosition": 1
+  },
+  "agentGuidance": [
+    "Task was queued. Do not immediately resubmit the same command..."
+  ]
 }
 ```
 
@@ -76,6 +106,8 @@
   }
 }
 ```
+
+`ssh_wait_task` 返回 `kind: "wait_result"`。如果 `data.waitTimedOut=true`，任务仍在 queued/running，继续用同一个 `taskId` 等或查状态；如果已经结束，`data.output` 会包含 stdout/stderr tail 和完整输出路径。
 
 ### 等待超时
 
