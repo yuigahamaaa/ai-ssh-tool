@@ -1,8 +1,9 @@
 # SSH Tool - AI 远程执行工具 v2.0
 
-专为 AI Agent 设计的 SSH 工具，支持多级跳板机、MCP 协议、文件传输、后台执行。
+专为 AI Agent 设计的 SSH 工具，支持多级跳板机、MCP 协议、文件传输、后台执行、智能调度器。
 
 > 📄 生产环境部署、架构设计、性能调优等详细说明请查看 [README.md](./README.md)
+> 📄 调度器设计文档请查看 [docs/AI_COLLABORATIVE_SCHEDULER_DESIGN.zh-CN.md](./docs/AI_COLLABORATIVE_SCHEDULER_DESIGN.zh-CN.md)
 
 ---
 
@@ -12,6 +13,7 @@
 ssh-tool/
 ├── src/                    # 核心源码
 │   ├── mcp-server.ts       # MCP 工具入口（AI 调用的接口）
+│   ├── scheduler/          # 调度器模块（新增！）
 │   ├── profile-manager.ts  # Profile 管理（读取/保存配置）
 │   ├── exec-task-manager.ts# 统一任务管理器
 │   ├── remote-shell.ts     # 远程命令执行
@@ -60,7 +62,7 @@ ssh-tool/
 
 | 工具 | 功能 | 核心参数 |
 |------|------|----------|
-| `ssh_exec` | 执行远程命令 | `command` |
+| `ssh_exec` | 执行远程命令（通过调度器） | `command` |
 | `ssh_read_file` | 读取远程文件 | `path` |
 | `ssh_write_file` | 写入远程文件 | `path`, `content` |
 | `ssh_list_dir` | 列出目录 | `path` |
@@ -68,6 +70,19 @@ ssh-tool/
 | `ssh_stat` | 文件信息 | `path` |
 | `ssh_grep` | 搜索文件内容 | `pattern`, `path` |
 | `ssh_find` | 查找文件 | `path`, `name` |
+
+### 调度器 & 队列管理（新增！）
+
+| 工具 | 功能 | 核心参数 |
+|------|------|----------|
+| `ssh_exec` | 执行命令（走调度器，等待完成） | `command`, `scheduler` |
+| `ssh_schedule` | 提交调度任务（异步） | `command`, `intent`, `cost` |
+| `ssh_queue_status` | 查看队列状态 | `host_id`, `limit` |
+| `ssh_wait_task` | 等待任务完成 | `task_id`, `timeout_ms` |
+| `ssh_dequeue_task` | 从队列移除任务 | `task_id` |
+| `ssh_cd` | 设置虚拟工作目录 | `path` |
+| `ssh_register_agent` | 注册 Agent（可选） | - |
+| `ssh_heartbeat` | Agent 心跳（可选） | - |
 
 ### 文件传输
 
@@ -106,6 +121,85 @@ ssh-tool/
 | `ssh_list_sessions` | 列出会话 | - |
 | `ssh_disconnect` | 断开会话 | `session_id` |
 | `ssh_cd` | 切换目录 | `path` |
+
+---
+
+## 调度器使用指南（新增！）
+
+### ssh_exec 工作原理
+
+`ssh_exec` 现在默认通过调度器执行，行为如下：
+
+1. **调度决策**：`schedule()` 函数决定任务是立即执行还是排队
+2. **等待完成**：当决策是 `run_now` 时，内部会 `waitTask` 等待任务执行完毕
+3. **返回结果**：最终返回 `{ stdout, stderr, code, signal }` 给调用者
+
+```json
+// 正常执行（99% 场景）
+{
+  "name": "ssh_exec",
+  "parameters": { "command": "uptime", "profile_name": "prod" }
+}
+// 返回：
+{
+  "action": "run_now",
+  "taskId": "task-xxx",
+  "result": { "stdout": " 10:00:00 up 1 day", "stderr": "", "code": 0 }
+}
+```
+
+```json
+// 排队场景（有其他任务在执行）
+{
+  "name": "ssh_exec",
+  "parameters": { "command": "npm run build", "profile_name": "prod" }
+}
+// 返回：
+{
+  "action": "queued",
+  "taskId": "task-xxx",
+  "queuePosition": 1,
+  "reason": "Queue full or host busy"
+}
+```
+
+### 高级参数
+
+| 参数 | 可选值 | 说明 |
+|------|--------|------|
+| `scheduler` | `"auto"`（默认） / `"bypass"` | `auto`=走调度器排队；`bypass`=跳过排队直接执行（仍会记录任务状态） |
+| `intent` | `"inspect"` / `"search"` / `"test"` / `"build"` / `"install"` / `"server"` / `"deploy"` / `"migration"` / `"cleanup"` / `"custom"` | 任务意图（用于调度决策） |
+| `cost` | `"tiny"` / `"small"` / `"medium"` / `"large"` / `"exclusive"` | 预估成本（用于调度决策） |
+| `urgency` | `"low"` / `"normal"` / `"high"` / `"urgent"` | 紧急程度（暂未实现，保留） |
+| `if_busy` | `"run_anyway"` / `"wait"` / `"queue"` / `"fail"` | 主机忙时策略（暂未实现，保留） |
+| `force` | `true` / `false` | `true`=强制执行有风险的命令 |
+
+### 任务分类说明
+
+| cost | 描述 | 并发性 |
+|------|------|--------|
+| `tiny` | 简单读命令（ls, cat, uptime 等） | 可与其他任务并发 |
+| `small` | 轻量任务 | 可与其他任务并发 |
+| `medium` | 普通任务（默认分类） | 可与其他任务并发 |
+| `large` | 耗时任务（build, deploy 等） | 仅一个 large 任务可运行 |
+| `exclusive` | 独占任务（会修改全局状态） | 独占主机，阻塞所有其他任务 |
+
+### 虚拟工作目录（ssh_cd）
+
+```json
+// 设置当前 Agent 在目标主机的工作目录
+{
+  "name": "ssh_cd",
+  "parameters": { "path": "/var/www/html", "profile_name": "prod" }
+}
+// 后续执行命令会在该目录下进行
+{
+  "name": "ssh_exec",
+  "parameters": { "command": "ls -la", "profile_name": "prod" }
+}
+```
+
+> 💡 虚拟目录按 `Agent + Host` 隔离，不同 Agent 互不影响。
 
 ---
 
@@ -178,6 +272,73 @@ ssh-tool/
 }
 ```
 之后可通过 `localhost:5432` 访问远程数据库。
+
+### 案例 7：调度器高级用法（新增！）
+
+#### 场景 7.1：普通执行（默认走调度器）
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "ls -la",
+    "profile_name": "prod"
+  }
+}
+```
+
+#### 场景 7.2：指定 intent 和 cost（影响调度）
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "npm run build",
+    "intent": "build",
+    "cost": "large",
+    "profile_name": "prod"
+  }
+}
+```
+
+#### 场景 7.3：用 bypass 跳过排队（紧急操作）
+```json
+{
+  "name": "ssh_exec",
+  "parameters": {
+    "command": "tail -f /var/log/nginx/error.log",
+    "scheduler": "bypass",
+    "profile_name": "prod"
+  }
+}
+```
+
+#### 场景 7.4：查看队列状态
+```json
+{
+  "name": "ssh_queue_status",
+  "parameters": {
+    "profile_name": "prod",
+    "limit": 20
+  }
+}
+```
+
+#### 场景 7.5：异步提交任务 + 自己 wait
+```json
+// 提交
+{
+  "name": "ssh_schedule",
+  "parameters": {
+    "command": "npm run build",
+    "intent": "build",
+    "profile_name": "prod"
+  }
+}
+// 之后查询
+{
+  "name": "ssh_wait_task",
+  "parameters": { "task_id": "task-xxx", "timeout_ms": 120000 }
+}
+```
 
 ---
 
