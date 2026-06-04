@@ -32,6 +32,12 @@ import {
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
 
+interface BackgroundTaskHandle {
+  stream: any
+  stop: () => void
+}
+const backgroundTaskHandles = new Map<string, BackgroundTaskHandle>()
+
 interface DaemonSession {
   sessionId: string
   configHash: string
@@ -74,6 +80,102 @@ export class SSHDaemon {
           const result = await remoteExec(client, cmd, { timeout: 120_000 })
           return { code: result.code, stdout: result.stdout, stderr: result.stderr, signal: result.signal }
         },
+        startBackground: (
+          task: any,
+          onOutput: (stdout: string, stderr: string) => void,
+          onClose: (code: number, signal?: string) => void
+        ) => {
+          const conn = this.gateway.sessions.getConnection(task.sessionId)
+          if (!conn) throw new Error(`Session ${task.sessionId} not found for background task`)
+          const client = conn.getFinalClient()
+          
+          let fullCommand = task.command
+          if (task.effectiveCwd) {
+            fullCommand = `cd ${JSON.stringify(task.effectiveCwd)} && ${fullCommand}`
+          }
+          const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
+          
+          let currentPid: number | null = null
+          let pidCaptured = false
+          
+          client.exec(wrappedCommand, (err, stream) => {
+            if (err) {
+              logError("daemon", `Failed to start background task ${task.id}`, err)
+              onOutput("", err.message)
+              onClose(1)
+              return
+            }
+            
+            const handle: BackgroundTaskHandle = {
+              stream,
+              stop: () => {
+                if (currentPid) {
+                  const killCmd = `kill -TERM ${currentPid} 2>/dev/null; sleep 0.1; kill -9 ${currentPid} 2>/dev/null; true`
+                  client.exec(killCmd, () => {})
+                }
+                try { stream.close() } catch {}
+              }
+            }
+            backgroundTaskHandles.set(task.id, handle)
+            
+            stream.on("data", (data: Buffer) => {
+              const text = data.toString()
+              if (!pidCaptured) {
+                const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                if (pidMatch) {
+                  currentPid = parseInt(pidMatch[1])
+                  pidCaptured = true
+                  const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, '')
+                  if (remaining) {
+                    onOutput(remaining, "")
+                  }
+                } else {
+                  onOutput(text, "")
+                }
+              } else {
+                onOutput(text, "")
+              }
+            })
+            
+            stream.stderr.on("data", (data: Buffer) => {
+              const text = data.toString()
+              if (!pidCaptured) {
+                let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                if (pidMatch) {
+                  currentPid = parseInt(pidMatch[1])
+                  pidCaptured = true
+                  const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, '')
+                  if (remaining) {
+                    onOutput("", remaining)
+                  }
+                } else {
+                  onOutput("", text)
+                }
+              } else {
+                onOutput("", text)
+              }
+            })
+            
+            stream.on("close", (code?: number, signal?: string) => {
+              backgroundTaskHandles.delete(task.id)
+              onClose(code ?? 1, signal)
+            })
+            
+            stream.on("error", (streamErr: Error) => {
+              backgroundTaskHandles.delete(task.id)
+              onOutput("", streamErr.message)
+              onClose(1)
+            })
+          })
+          
+          return {
+            get pid() { return currentPid },
+            stop: () => {
+              const handle = backgroundTaskHandles.get(task.id)
+              if (handle) handle.stop()
+            }
+          }
+        }
       },
     })
   }
@@ -244,6 +346,14 @@ export class SSHDaemon {
 
       case "setCwd":
         resp = this.handleSetCwd(req as any)
+        break
+
+      case "cancelTask":
+        resp = this.handleCancelTask(req as any)
+        break
+
+      case "getTaskOutput":
+        resp = this.handleGetTaskOutput(req as any)
         break
 
       default:
@@ -461,6 +571,24 @@ export class SSHDaemon {
     try {
       const cwd = this.scheduler.setCwd(req.params.agent.id, req.params.host.id, req.params.cwd)
       return { id: req.id, ok: true, data: { success: true, cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" } }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleCancelTask(req: { id: string; params: { taskId: string } }): IPCResponse {
+    try {
+      const result = this.scheduler.cancelTask(req.params.taskId)
+      return { id: req.id, ok: true, data: result }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleGetTaskOutput(req: { id: string; params: { taskId: string; mode?: string } }): IPCResponse {
+    try {
+      const result = this.scheduler.getTaskOutput(req.params.taskId, req.params.mode as any)
+      return { id: req.id, ok: true, data: result }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
     }

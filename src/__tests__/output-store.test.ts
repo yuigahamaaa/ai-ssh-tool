@@ -4,7 +4,7 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
-import { OutputStore } from "../output-store.js"
+import { OutputStore } from "../scheduler/output-store.js"
 import { rmSync, mkdirSync, existsSync, readFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"

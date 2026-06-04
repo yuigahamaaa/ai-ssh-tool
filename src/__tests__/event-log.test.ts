@@ -4,7 +4,7 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
-import { EventLog } from "../event-log.js"
+import { EventLog } from "../scheduler/event-log.js"
 import { rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"

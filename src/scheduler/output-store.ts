@@ -47,11 +47,11 @@ export class OutputStore {
     if (!entry) return
     entry.stdoutTail += data
     entry.stdoutBytes += Buffer.byteLength(data)
-    if (entry.stdoutTail.length &gt; OUTPUT_TAIL_LIMIT) {
+    if (entry.stdoutTail.length > OUTPUT_TAIL_LIMIT) {
       entry.stdoutTail = entry.stdoutTail.slice(-OUTPUT_TAIL_LIMIT)
     }
     const stdoutPath = this.getStdoutPath(taskId)
-    if (entry.stdoutBytes &lt;= MAX_OUTPUT_FILE_SIZE) {
+    if (entry.stdoutBytes <= MAX_OUTPUT_FILE_SIZE) {
       appendFileSync(stdoutPath, data)
     }
   }
@@ -61,11 +61,11 @@ export class OutputStore {
     if (!entry) return
     entry.stderrTail += data
     entry.stderrBytes += Buffer.byteLength(data)
-    if (entry.stderrTail.length &gt; OUTPUT_TAIL_LIMIT) {
+    if (entry.stderrTail.length > OUTPUT_TAIL_LIMIT) {
       entry.stderrTail = entry.stderrTail.slice(-OUTPUT_TAIL_LIMIT)
     }
     const stderrPath = this.getStderrPath(taskId)
-    if (entry.stderrBytes &lt;= MAX_OUTPUT_FILE_SIZE) {
+    if (entry.stderrBytes <= MAX_OUTPUT_FILE_SIZE) {
       appendFileSync(stderrPath, data)
     }
   }

@@ -169,6 +169,16 @@ export class DaemonClient {
     return this.send(createRequest("dequeueTask", { taskId, agent }))
   }
 
+  /** Cancel a running or queued task */
+  async cancelTask(taskId: string): Promise<IPCResponse> {
+    return this.send(createRequest("cancelTask", { taskId }))
+  }
+
+  /** Get task output (stdout/stderr) */
+  async getTaskOutput(taskId: string, mode?: "tail" | "full"): Promise<IPCResponse> {
+    return this.send(createRequest("getTaskOutput", { taskId, mode }))
+  }
+
   /** Set virtual cwd for an agent on a host */
   async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string): Promise<IPCResponse> {
     return this.send(createRequest("setCwd", { agent, host, cwd }))

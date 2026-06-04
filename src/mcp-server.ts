@@ -647,19 +647,33 @@ async function main() {
     "Get the status and output of a background task.",
     {
       task_id: z.string().describe("Task ID from exec_background"),
-      stdout_offset: z.number().optional().describe("Read stdout from this byte offset (default: 0, returns all)"),
-      stderr_offset: z.number().optional().describe("Read stderr from this byte offset (default: 0, returns all)"),
+      mode: z.enum(["tail", "full"]).optional().describe("Output mode: tail (default) or full"),
     },
-    async ({ task_id, stdout_offset, stderr_offset }) => {
-      const task = taskManager.getStatus(task_id)
-      if (!task) {
-        return { content: [{ type: "text" as const, text: `Task ${task_id} not found` }] }
+    async ({ task_id, mode }) => {
+      await daemonClient.ensureDaemon()
+      // Get task output
+      const outputResp = await daemonClient.getTaskOutput(task_id, mode)
+      if (!outputResp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(outputResp as any).error}` }] }
       }
-      if (stdout_offset || stderr_offset) {
-        const partial = taskManager.getOutputSince(task_id, stdout_offset ?? 0, stderr_offset ?? 0)
-        return { content: [{ type: "text" as const, text: JSON.stringify({ ...task, ...partial }) }] }
+      
+      // Get task status from queue status
+      const queueResp = await daemonClient.queueStatus({})
+      let task: any = null
+      if (queueResp.ok) {
+        const allTasks = [
+          ...((queueResp.data as any)?.running || []),
+          ...((queueResp.data as any)?.queued || []),
+          ...((queueResp.data as any)?.recent || [])
+        ]
+        task = allTasks.find((t: any) => t.id === task_id)
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(task) }] }
+      
+      const result = {
+        ...task,
+        ...(outputResp.data as any)
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
   )
 
@@ -668,13 +682,14 @@ async function main() {
     "Cancel a running background task.",
     {
       task_id: z.string().describe("Task ID to cancel"),
-      profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
-      profile_json: z.string().optional().describe("JSON string of SSH profile"),
-      profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ task_id, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const cancelled = taskManager.cancel(task_id, client)
+    async ({ task_id }) => {
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.cancelTask(task_id)
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      const cancelled = (resp.data as any)?.cancelled
       return { content: [{ type: "text" as const, text: cancelled ? `Task ${task_id} cancelled` : `Task ${task_id} not found or already finished` }] }
     },
   )
@@ -686,8 +701,12 @@ async function main() {
       hostname: z.string().optional().describe("Filter tasks by remote hostname"),
     },
     async ({ hostname }) => {
-      const tasks = taskManager.list(hostname)
-      return { content: [{ type: "text" as const, text: JSON.stringify(tasks) }] }
+      await daemonClient.ensureDaemon()
+      const resp = await daemonClient.queueStatus({ hostId: hostname })
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: `Error: ${(resp as any).error}` }] }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(resp.data) }] }
     },
   )
 

@@ -4,7 +4,7 @@
 
 import { describe, it } from "node:test"
 import assert from "node:assert"
-import { LockManager } from "../lock-manager.js"
+import { LockManager } from "../scheduler/lock-manager.js"
 
 describe("LockManager", () => {
   it("acquires lock when no conflict", () => {

@@ -135,7 +135,24 @@ export interface VirtualCwdState {
 }
 
 export interface TaskRunner {
-  start(task: ScheduledTask): Promise&lt;{ code: number; stdout: string; stderr: string; signal?: string }&gt;
+  start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+  startBackground(
+    task: ScheduledTask,
+    onOutput: (stdout: string, stderr: string) => void,
+    onClose: (code: number, signal?: string) => void
+  ): void
+}
+
+export interface SchedulerServiceInterface {
+  schedule(req: ScheduleRequest): Promise<ScheduleDecision>
+  getStatus(): QueueStatus
+  getRecentEvents(limit?: number, hostId?: string): import("./types.js").SchedulerEvent[]
+  getTaskOutput(taskId: string, mode?: "tail" | "full"): { stdout: string; stderr: string }
+  waitTask(taskId: string, timeoutMs?: number): Promise<ScheduledTask>
+  dequeueTask(taskId: string): boolean
+  cancelTask(taskId: string): boolean
+  setCwd(agentId: string, hostId: string, cwd: string): string
+  resolveCwd(agentId: string, hostId: string, explicitCwd?: string): string | undefined
 }
 
 export type LockScope = "host" | "workdir" | "custom"
@@ -173,7 +190,7 @@ export interface SchedulerEvent {
   taskId?: string
   hostId?: string
   agentId?: string
-  data?: Record&lt;string, unknown&gt;
+  data?: Record<string, unknown>
 }
 
 export interface AgentRecord {

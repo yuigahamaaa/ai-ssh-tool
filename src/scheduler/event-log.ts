@@ -19,7 +19,7 @@ function getUserDataDir(): string {
 
 export class EventLog {
   private baseDir: string
-  private currentFile: string
+  private currentFile = ""
   private eventCount = 0
 
   constructor(baseDir?: string) {
@@ -39,7 +39,7 @@ export class EventLog {
 
   log(
     type: EventType,
-    params: { taskId?: string; hostId?: string; agentId?: string; data?: Record&lt;string, unknown&gt; }
+    params: { taskId?: string; hostId?: string; agentId?: string; data?: Record<string, unknown> }
   ): void {
     const event: SchedulerEvent = {
       id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -51,7 +51,7 @@ export class EventLog {
     appendFileSync(this.currentFile, JSON.stringify(event) + "\n", { mode: 0o600 })
     this.eventCount++
 
-    if (this.eventCount &gt;= MAX_EVENTS_PER_FILE) {
+    if (this.eventCount >= MAX_EVENTS_PER_FILE) {
       this.rotateFile()
     }
   }
@@ -62,7 +62,7 @@ export class EventLog {
       const content = readFileSync(this.currentFile, "utf8")
       const lines = content.trim().split("\n").reverse()
       for (const line of lines) {
-        if (events.length &gt;= limit) break
+        if (events.length >= limit) break
         if (!line.trim()) continue
         try {
           const event = JSON.parse(line) as SchedulerEvent

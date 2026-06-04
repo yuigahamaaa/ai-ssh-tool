@@ -37,6 +37,14 @@ class FakeRunner implements TaskRunner {
     })
   }
 
+  startBackground(
+    task: ScheduledTask,
+    onOutput: (stdout: string, stderr: string) => void,
+    onClose: (code: number, signal?: string) => void
+  ): void {
+    // no-op for tests
+  }
+
   finish(taskId: string, result: { code: number; stdout: string; stderr: string } = { code: 0, stdout: "", stderr: "" }) {
     const fn = this.pending.get(taskId)
     if (fn) {

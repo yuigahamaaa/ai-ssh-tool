@@ -5,7 +5,7 @@ import type { SchedulerLock, LockScope } from "./types.js"
 const DEFAULT_TTL = 30 * 60 * 1000
 
 export class LockManager {
-  private locks = new Map&lt;string, SchedulerLock&gt;()
+  private locks = new Map<string, SchedulerLock>()
   private ttl: number
 
   constructor(ttl?: number) {
@@ -77,14 +77,14 @@ export class LockManager {
 
   getLocksForHost(hostId: string): SchedulerLock[] {
     this.cleanExpired()
-    return Array.from(this.locks.values()).filter(l =&gt; l.hostId === hostId)
+    return Array.from(this.locks.values()).filter(l => l.hostId === hostId)
   }
 
   getConflictingLocks(scope: LockScope, key: string, hostId: string): SchedulerLock[] {
     this.cleanExpired()
     const conflicts: SchedulerLock[] = []
 
-    const checkKey = (s: LockScope, k: string) =&gt; {
+    const checkKey = (s: LockScope, k: string) => {
       const lk = this.lockKey(s, k, hostId)
       const lock = this.locks.get(lk)
       if (lock) conflicts.push(lock)
@@ -123,7 +123,7 @@ export class LockManager {
     const now = Date.now()
     const toRemove: string[] = []
     for (const [key, lock] of this.locks.entries()) {
-      if (lock.expiresAt &lt; now) {
+      if (lock.expiresAt < now) {
         toRemove.push(key)
       }
     }
