@@ -113,6 +113,10 @@ async function main() {
   // Client cache: profile name -> { client, forwardManager }
   const clientCache = new Map<string, ClientCacheEntry>()
 
+  // In-flight connection promises — prevents duplicate concurrent connections for the same profile
+  // Key: cacheKey, Value: Promise that resolves to ClientCacheEntry
+  const pendingConnections = new Map<string, Promise<ClientCacheEntry>>()
+
   // Helper: Get or create SSH connection for a profile
   async function getClientForProfile(
     profileName: string | undefined,
@@ -176,40 +180,55 @@ async function main() {
 
     const cacheKey = profileName || JSON.stringify(profile)
 
+    // Fast path: already cached
     if (clientCache.has(cacheKey)) {
-      const cached = clientCache.get(cacheKey)!
-      return cached
+      return clientCache.get(cacheKey)!
     }
 
-    const currentProfile = profile
-    const jumpHosts = currentProfile.chain.slice(0, -1).map((h) => ({
-      host: h.host,
-      port: h.port ?? 22,
-      username: h.auth.username,
-      password: h.auth.password,
-      privateKey: h.auth.privateKey,
-    }))
+    // Wait for an in-flight connection attempt for this key, if any
+    if (pendingConnections.has(cacheKey)) {
+      return pendingConnections.get(cacheKey)!
+    }
 
-    const targetHost = currentProfile.chain[currentProfile.chain.length - 1]
-    const session = await gw.connectSimple({
-      host: targetHost.host,
-      port: targetHost.port ?? 22,
-      username: targetHost.auth.username,
-      password: targetHost.auth.password,
-      privateKey: targetHost.auth.privateKey,
-      jumpHosts,
-      name: `mcp-${currentProfile.name}`,
-    })
+    // Create a new connection and track it as in-flight
+    const connectPromise = (async (): Promise<ClientCacheEntry> => {
+      try {
+        const jumpHosts = profile.chain.slice(0, -1).map((h) => ({
+          host: h.host,
+          port: h.port ?? 22,
+          username: h.auth.username,
+          password: h.auth.password,
+          privateKey: h.auth.privateKey,
+        }))
 
-    const connection = gw.sessions.getConnection(session.id)
-    if (!connection) throw new Error("Failed to establish SSH connection")
-    const client = connection.getFinalClient()
+        const targetHost = profile.chain[profile.chain.length - 1]
+        const session = await gw.connectSimple({
+          host: targetHost.host,
+          port: targetHost.port ?? 22,
+          username: targetHost.auth.username,
+          password: targetHost.auth.password,
+          privateKey: targetHost.auth.privateKey,
+          jumpHosts,
+          name: `mcp-${profile.name}`,
+        })
 
-    const forwardManager = new PortForwardManager(client)
-    log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
+        const connection = gw.sessions.getConnection(session.id)
+        if (!connection) throw new Error("Failed to establish SSH connection")
+        const client = connection.getFinalClient()
 
-    clientCache.set(cacheKey, { client, forwardManager })
-    return { client, forwardManager }
+        const forwardManager = new PortForwardManager(client)
+        log("mcp", `Connected to ${targetHost.host} (profile: ${profile.name})`)
+
+        return { client, forwardManager }
+      } finally {
+        pendingConnections.delete(cacheKey)
+      }
+    })()
+
+    pendingConnections.set(cacheKey, connectPromise)
+    const entry = await connectPromise
+    clientCache.set(cacheKey, entry)
+    return entry
   }
 
   const daemonClient = new DaemonClient()

@@ -20,6 +20,8 @@ export class DaemonClient {
   private pipePath: string
   private socket: Socket | null = null
   private ipc: IPCSocket | null = null
+  /** Tracks in-flight connect() call so concurrent connect() calls share the same promise */
+  private connecting: Promise<void> | null = null
 
   constructor(pipePath?: string) {
     this.pipePath = pipePath ?? getPipePath()
@@ -28,21 +30,28 @@ export class DaemonClient {
   /** Connect to the daemon */
   async connect(): Promise<void> {
     if (this.socket) return
+    if (this.connecting) return this.connecting
 
     log("client", `Connecting to daemon at ${this.pipePath}`)
-    this.socket = connect(this.pipePath)
-    await new Promise<void>((resolve, reject) => {
-      this.socket!.on("connect", () => {
-        this.ipc = new IPCSocket(this.socket!)
+    const socket = connect(this.pipePath)
+    this.socket = socket
+
+    this.connecting = new Promise<void>((resolve, reject) => {
+      socket.on("connect", () => {
+        this.ipc = new IPCSocket(socket)
         log("client", "Connected to daemon")
+        this.connecting = null
         resolve()
       })
-      this.socket!.on("error", (err) => {
+      socket.on("error", (err) => {
         logError("client", "Connection failed", err)
         this.socket = null
+        this.connecting = null
         reject(err)
       })
     })
+
+    return this.connecting
   }
 
   /** Disconnect from the daemon */
@@ -77,6 +86,9 @@ export class DaemonClient {
     }
   }
 
+  /** Tracks in-flight ensureDaemon call so concurrent calls share the same startup */
+  private ensuringDaemon: Promise<void> | null = null
+
   /** Ensure daemon is running, start it if not */
   async ensureDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
     // Try connecting first
@@ -88,22 +100,29 @@ export class DaemonClient {
       // not running
     }
 
-    // Start daemon
-    await this.startDaemon({ debug: opts?.debug, label: opts?.label })
+    // If another ensureDaemon is already in flight, wait for it instead of racing
+    if (this.ensuringDaemon) return this.ensuringDaemon
 
-    // Wait for it to be ready (retry with backoff)
-    for (let attempt = 0; attempt < 5; attempt++) {
-      await sleep(500 * (attempt + 1))
-      try {
-        this.disconnect()
-        await this.connect()
-        const resp = await this.ping()
-        if (resp.ok) return
-      } catch {
-        // retry
+    // Start daemon
+    this.ensuringDaemon = (async () => {
+      await this.startDaemon({ debug: opts?.debug, label: opts?.label })
+
+      // Wait for it to be ready (retry with backoff)
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await sleep(500 * (attempt + 1))
+        try {
+          this.disconnect()
+          await this.connect()
+          const resp = await this.ping()
+          if (resp.ok) return
+        } catch {
+          // retry
+        }
       }
-    }
-    throw new Error("Failed to start daemon after multiple attempts")
+      throw new Error("Failed to start daemon after multiple attempts")
+    })()
+
+    return this.ensuringDaemon
   }
 
   /** Ping the daemon */
