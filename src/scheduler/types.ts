@@ -187,6 +187,7 @@ export interface SchedulerServiceInterface {
   waitTask(taskId: string, timeoutMs?: number): Promise<ScheduledTask>
   dequeueTask(taskId: string): boolean
   cancelTask(taskId: string): boolean
+  abortActiveTasks(reason: string): { cancelled: number; cancelFailed: number }
   setCwd(agentId: string, hostId: string, cwd: string): string
   resolveCwd(agentId: string, hostId: string, explicitCwd?: string): string | undefined
 }

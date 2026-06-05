@@ -16,7 +16,7 @@ interface Rule {
 }
 
 const rules: Rule[] = [
-  { pattern: /^(sudo\s+)?(ls|pwd|cat|head|tail|file|stat|uname|whoami|id|date|wc|diff|sed\s+-n)\b/, intent: "inspect", cost: "tiny", blocking: false, mutates: false, risky: false },
+  { pattern: /^(sudo\s+)?(ls|pwd|cat|head|tail|file|stat|uname|whoami|id|date|wc|diff|sed\s+-n|echo)\b/, intent: "inspect", cost: "tiny", blocking: false, mutates: false, risky: false },
   { pattern: /^(sudo\s+)?(rg|grep|find|which|whereis|locate)\b/, intent: "search", cost: "tiny", blocking: false, mutates: false, risky: false },
   { pattern: /^(python|python3|py|python2)\s+.*\.py(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },
   { pattern: /^(bash|sh|zsh|dash)\s+.*\.(sh|bash|zsh)(?:\s|$)/, intent: "custom", cost: "large", blocking: true, mutates: true, risky: false },

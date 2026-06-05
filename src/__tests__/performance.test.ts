@@ -221,4 +221,56 @@ describe("Performance Tests", () => {
       assert.ok(growth < 20, `Memory grew ${growth.toFixed(1)}MB, should be < 20MB`)
     })
   })
+
+  describe("high concurrency exec", () => {
+    it("50 concurrent execs < 10s", async () => {
+      const start = Date.now()
+      const tasks = Array.from({ length: 50 }, (_, i) =>
+        remoteExec(conn.getFinalClient(), `echo stress-${i}`, { timeout: 10000 }),
+      )
+      const results = await Promise.all(tasks)
+      const duration = Date.now() - start
+      assert.ok(results.every(r => r.code === 0), "All execs should succeed")
+      assert.ok(duration < 10000, `50 concurrent execs took ${duration}ms, should be < 10000ms`)
+    })
+
+    it("100 concurrent execs do not crash", async () => {
+      const tasks = Array.from({ length: 100 }, (_, i) =>
+        remoteExec(conn.getFinalClient(), `echo bulk-${i}`, { timeout: 15000 }),
+      )
+      const results = await Promise.all(tasks)
+      assert.ok(results.every(r => r.code === 0), "All 100 execs should succeed")
+    })
+  })
+
+  describe("sustained throughput", () => {
+    it("100 sequential execs maintain consistent latency", async () => {
+      const latencies: number[] = []
+      for (let i = 0; i < 100; i++) {
+        const start = Date.now()
+        await remoteExec(conn.getFinalClient(), `echo seq-stress-${i}`, { timeout: 5000 })
+        latencies.push(Date.now() - start)
+      }
+
+      const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length
+      const p95 = latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.95)]
+      assert.ok(avg < 200, `Average latency ${avg.toFixed(0)}ms should be < 200ms`)
+      assert.ok(p95 < 500, `P95 latency ${p95}ms should be < 500ms`)
+    })
+  })
+
+  describe("memory under load", () => {
+    it("memory after 100 execs stays under limit", async () => {
+      measureMemory()
+      const before = measureMemory()
+
+      for (let i = 0; i < 100; i++) {
+        await remoteExec(conn.getFinalClient(), `echo load-${i}`, { timeout: 5000 })
+      }
+
+      const after = measureMemory()
+      const growth = after - before
+      assert.ok(growth < 50, `Memory grew ${growth.toFixed(1)}MB after 100 execs, should be < 50MB`)
+    })
+  })
 })

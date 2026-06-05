@@ -213,6 +213,34 @@ async function main() {
   }
 
   const daemonClient = new DaemonClient()
+  let handlingFatal = false
+  const handleFatal = (err: Error) => {
+    if (handlingFatal) {
+      console.error(`[ssh-mcp] Fatal during fatal handling: ${err.message}`)
+      process.exit(1)
+    }
+    handlingFatal = true
+    void (async () => {
+      console.error(`[ssh-mcp] Fatal error: ${err.message}`)
+      log("mcp", "Fatal error: " + err.message)
+      try {
+        await daemonClient.abortActiveTasks(`MCP server fatal error: ${err.message}`)
+      } catch (abortErr: any) {
+        log("mcp", "Failed to abort daemon tasks after fatal error: " + abortErr.message)
+      }
+      try {
+        await gw.disconnectAll()
+      } catch (disconnectErr: any) {
+        log("mcp", "Failed to disconnect MCP SSH sessions after fatal error: " + disconnectErr.message)
+      }
+      daemonClient.disconnect()
+      process.exit(1)
+    })()
+  }
+  process.on("uncaughtException", handleFatal)
+  process.on("unhandledRejection", (err) => {
+    handleFatal(err instanceof Error ? err : new Error(String(err)))
+  })
 
   async function scheduleCommand(params: {
     command: string
@@ -964,11 +992,11 @@ async function main() {
       if (!connectResp.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
       }
-      const { sessionId } = connectResp.data as any
+      const { sessionId, configHash } = connectResp.data as any
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
       const hostIdentity: HostIdentity = {
-        id: sessionId.slice(0, 16),
-        profileKey: sessionId.slice(0, 16),
+        id: configHash ?? sessionId.slice(0, 16),
+        profileKey: configHash ?? sessionId.slice(0, 16),
         targetHost: profile.chain[profile.chain.length - 1].host,
         targetUser: profile.chain[profile.chain.length - 1].auth.username,
         displayName: profile.name,

@@ -49,6 +49,12 @@ describe("IPC Scheduler Actions", () => {
     assert.equal(cleanupReq.action, "cleanupOutputs")
   })
 
+  it("createRequest supports abortActiveTasks action", () => {
+    const req = createRequest("abortActiveTasks", { reason: "fatal shutdown" })
+    assert.equal(req.action, "abortActiveTasks")
+    assert.equal((req as any).params.reason, "fatal shutdown")
+  })
+
   it("createRequest supports setCwd action", () => {
     const req = createRequest("setCwd", {
       agent: { id: "a1", clientType: "mcp" },

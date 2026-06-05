@@ -20,53 +20,84 @@ export class DaemonClient {
   private pipePath: string
   private socket: Socket | null = null
   private ipc: IPCSocket | null = null
+  private connecting: Promise<void> | null = null
+  private ensuring: Promise<void> | null = null
 
   constructor(pipePath?: string) {
     this.pipePath = pipePath ?? getPipePath()
   }
 
-  /** Connect to the daemon */
   async connect(): Promise<void> {
-    if (this.socket) return
+    if (this.ipc && this.socket && !this.socket.destroyed) return
+    if (this.connecting) return this.connecting
+
+    this.connecting = this._connect()
+    try {
+      await this.connecting
+    } finally {
+      this.connecting = null
+    }
+  }
+
+  private async _connect(): Promise<void> {
+    this.disconnect()
 
     log("client", `Connecting to daemon at ${this.pipePath}`)
     this.socket = connect(this.pipePath)
     await new Promise<void>((resolve, reject) => {
-      this.socket!.on("connect", () => {
-        this.ipc = new IPCSocket(this.socket!)
-        log("client", "Connected to daemon")
-        resolve()
-      })
-      this.socket!.on("error", (err) => {
+      const onError = (err: Error) => {
         logError("client", "Connection failed", err)
         this.socket = null
         reject(err)
+      }
+      this.socket!.once("error", onError)
+      this.socket!.once("connect", () => {
+        this.socket!.removeListener("error", onError)
+        this.ipc = new IPCSocket(this.socket!)
+        this.socket!.on("error", (err) => {
+          logError("client", "Socket error", err)
+          this.disconnect()
+        })
+        this.socket!.on("close", () => {
+          this.disconnect()
+        })
+        log("client", "Connected to daemon")
+        resolve()
       })
     })
   }
 
-  /** Disconnect from the daemon */
   disconnect(): void {
     if (this.ipc) {
       this.ipc.dispose()
       this.ipc = null
     }
     if (this.socket) {
+      this.socket.removeAllListeners()
       this.socket.destroy()
       this.socket = null
     }
   }
 
-  /** Send a request and wait for response */
-  async send(req: IPCRequest, timeoutMs?: number): Promise<IPCResponse> {
-    if (!this.ipc) await this.connect()
-    log("client", `Sending IPC: ${req.action}`, { id: req.id.slice(0, 8) })
-    const resp = await this.ipc!.send(req, timeoutMs)
-    log("client", `IPC response: ${req.action} ok=${resp.ok}`, { id: req.id.slice(0, 8) })
-    return resp
+  private isConnected(): boolean {
+    return this.ipc !== null && this.socket !== null && !this.socket.destroyed
   }
 
-  /** Check if daemon is running */
+  async send(req: IPCRequest, timeoutMs?: number): Promise<IPCResponse> {
+    if (!this.isConnected()) await this.connect()
+    log("client", `Sending IPC: ${req.action}`, { id: req.id.slice(0, 8) })
+    try {
+      const resp = await this.ipc!.send(req, timeoutMs)
+      log("client", `IPC response: ${req.action} ok=${resp.ok}`, { id: req.id.slice(0, 8) })
+      return resp
+    } catch (err: any) {
+      if (err.message?.includes("socket closed") || err.message?.includes("EPIPE") || err.message?.includes("ECONNRESET")) {
+        this.disconnect()
+      }
+      throw err
+    }
+  }
+
   async isRunning(): Promise<boolean> {
     try {
       await this.connect()
@@ -77,9 +108,17 @@ export class DaemonClient {
     }
   }
 
-  /** Ensure daemon is running, start it if not */
   async ensureDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
-    // Try connecting first
+    if (this.ensuring) return this.ensuring
+    this.ensuring = this._ensureDaemon(opts)
+    try {
+      await this.ensuring
+    } finally {
+      this.ensuring = null
+    }
+  }
+
+  private async _ensureDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
     try {
       await this.connect()
       const resp = await this.ping()
@@ -88,10 +127,8 @@ export class DaemonClient {
       // not running
     }
 
-    // Start daemon
     await this.startDaemon({ debug: opts?.debug, label: opts?.label })
 
-    // Wait for it to be ready (retry with backoff)
     for (let attempt = 0; attempt < 5; attempt++) {
       await sleep(500 * (attempt + 1))
       try {
@@ -106,38 +143,31 @@ export class DaemonClient {
     throw new Error("Failed to start daemon after multiple attempts")
   }
 
-  /** Ping the daemon */
   async ping(): Promise<IPCResponse> {
     return this.send(createRequest("ping"))
   }
 
-  /** Connect to a remote host via config file */
   async connectHost(configPath: string): Promise<IPCResponse> {
     const absPath = resolve(configPath)
     return this.send(createRequest("connect", { configPath: absPath }))
   }
 
-  /** Connect to a remote host via JSON config string */
   async connectHostJson(configJson: string): Promise<IPCResponse> {
     return this.send(createRequest("connectJson", { configJson }))
   }
 
-  /** Execute a command on a session */
   async exec(sessionId: string, command: string, timeout?: number): Promise<IPCResponse> {
     return this.send(createRequest("exec", { sessionId, command, timeout }), timeout ?? 60000)
   }
 
-  /** List active sessions */
   async list(): Promise<IPCResponse> {
     return this.send(createRequest("list"))
   }
 
-  /** Disconnect a session */
   async disconnectSession(sessionId: string): Promise<IPCResponse> {
     return this.send(createRequest("disconnect", { sessionId }))
   }
 
-  /** Shutdown the daemon */
   async shutdown(): Promise<IPCResponse> {
     try {
       const resp = await this.send(createRequest("shutdown"))
@@ -149,53 +179,47 @@ export class DaemonClient {
     }
   }
 
-  /** Schedule a command through the daemon scheduler */
   async schedule(req: Record<string, unknown>): Promise<IPCResponse> {
     return this.send(createRequest("schedule", req), 120000)
   }
 
-  /** Get queue status */
   async queueStatus(params: { agent?: { id: string; name?: string; clientType: string }; hostId?: string; limit?: number }): Promise<IPCResponse> {
     return this.send(createRequest("queueStatus", params))
   }
 
-  /** Wait for a task to complete */
   async waitTask(taskId: string, timeoutMs?: number): Promise<IPCResponse> {
     const ipcTimeoutMs = timeoutMs === undefined ? 120000 : timeoutMs + 5000
     return this.send(createRequest("waitTask", { taskId, timeoutMs }), ipcTimeoutMs)
   }
 
-  /** Remove a task from the queue */
   async dequeueTask(taskId: string, agent?: { id: string; name?: string; clientType: string }): Promise<IPCResponse> {
     return this.send(createRequest("dequeueTask", { taskId, agent }))
   }
 
-  /** Cancel a running or queued task */
   async cancelTask(taskId: string): Promise<IPCResponse> {
     return this.send(createRequest("cancelTask", { taskId }))
   }
 
-  /** Get task output (stdout/stderr) */
   async getTaskOutput(taskId: string, mode?: "tail" | "full"): Promise<IPCResponse> {
     return this.send(createRequest("getTaskOutput", { taskId, mode }))
   }
 
-  /** Get task status by id */
   async getTaskStatus(taskId: string): Promise<IPCResponse> {
     return this.send(createRequest("getTaskStatus", { taskId }))
   }
 
-  /** Manually cleanup old scheduler output files */
   async cleanupOutputs(): Promise<IPCResponse> {
     return this.send(createRequest("cleanupOutputs", {}))
   }
 
-  /** Set virtual cwd for an agent on a host */
+  async abortActiveTasks(reason: string): Promise<IPCResponse> {
+    return this.send(createRequest("abortActiveTasks", { reason }))
+  }
+
   async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string): Promise<IPCResponse> {
     return this.send(createRequest("setCwd", { agent, host, cwd }))
   }
 
-  /** Spawn daemon as a detached background process */
   private async startDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
     const daemonScript = this.findDaemonScript()
     const args = [daemonScript]

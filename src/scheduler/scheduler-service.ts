@@ -257,8 +257,9 @@ export class SchedulerService {
     if (task.status !== "queued" && task.status !== "running") return Promise.resolve(task)
 
     return new Promise((resolve, reject) => {
+      let entry: { resolve: (task: ScheduledTask) => void; timer: ReturnType<typeof setTimeout> }
       const timer = setTimeout(() => {
-        this.removeWaitResolver(taskId, resolve)
+        this.removeWaitResolver(taskId, entry)
         const current = this.tasks.get(taskId)
         if (current) {
           resolve(current)
@@ -267,8 +268,9 @@ export class SchedulerService {
         }
       }, timeoutMs)
 
+      entry = { resolve: (t) => { clearTimeout(timer); resolve(t) }, timer }
       const resolvers = this.waitResolvers.get(taskId) ?? []
-      resolvers.push({ resolve: (t) => { clearTimeout(timer); resolve(t) }, timer })
+      resolvers.push(entry)
       this.waitResolvers.set(taskId, resolvers)
     })
   }
@@ -283,6 +285,7 @@ export class SchedulerService {
     this.persistence.saveTask(task)
     this.eventLog.log("task_dequeued", { taskId, hostId: task.hostId, agentId: task.agentId })
     this.recomputeQueuePositions(task.hostId)
+    this.resolveWaiters(taskId, task)
     return true
   }
 
@@ -297,26 +300,52 @@ export class SchedulerService {
       return false
     }
 
+    const hostId = task.hostId
+
     if (task.status === "queued") {
-      this.recomputeQueuePositions(task.hostId)
+      this.recomputeQueuePositions(hostId)
     }
 
     task.status = "cancelled"
     task.updatedAt = Date.now()
     task.decisionReason = "Cancelled by cancel request."
+    this.lockManager.releaseForTask(taskId)
     this.persistence.saveTask(task)
-    this.eventLog.log("task_cancelled", { taskId, hostId: task.hostId, agentId: task.agentId })
+    this.eventLog.log("task_cancelled", { taskId, hostId, agentId: task.agentId })
 
-    const resolvers = this.waitResolvers.get(taskId)
-    if (resolvers) {
-      for (const r of resolvers) {
-        clearTimeout(r.timer)
-        r.resolve(task)
-      }
-      this.waitResolvers.delete(taskId)
-    }
+    this.resolveWaiters(taskId, task)
+
+    this.pumpQueue(hostId)
 
     return true
+  }
+
+  abortActiveTasks(reason: string): { cancelled: number; cancelFailed: number } {
+    let cancelled = 0
+    let cancelFailed = 0
+    const active = Array.from(this.tasks.values())
+      .filter(task => task.status === "queued" || task.status === "running")
+      .sort((a, b) => {
+        if (a.status === b.status) return 0
+        return a.status === "queued" ? -1 : 1
+      })
+
+    for (const task of active) {
+      const ok = this.cancelTask(task.id)
+      if (ok) {
+        task.decisionReason = reason
+        task.updatedAt = Date.now()
+        this.persistence.saveTask(task)
+        cancelled++
+      } else {
+        task.decisionReason = `${reason} Cancel attempt failed.`
+        task.updatedAt = Date.now()
+        this.persistence.saveTask(task)
+        cancelFailed++
+      }
+    }
+
+    return { cancelled, cancelFailed }
   }
 
   cleanupOutputs(): { deletedFiles: number; deletedBytes: number; keptFiles: number } {
@@ -424,6 +453,7 @@ export class SchedulerService {
   private finishTask(taskId: string, status: ScheduledTaskStatus, exitCode: number, signal?: string, stdout?: string, stderr?: string): void {
     const task = this.tasks.get(taskId)
     if (!task) return
+    if (task.status === "cancelled") return
 
     task.status = status
     task.exitCode = exitCode
@@ -451,14 +481,7 @@ export class SchedulerService {
     const eventType = status === "completed" ? "task_completed" : status === "failed" ? "task_failed" : status === "cancelled" ? "task_cancelled" : "task_timed_out"
     this.eventLog.log(eventType, { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { exitCode } })
 
-    const resolvers = this.waitResolvers.get(taskId)
-    if (resolvers) {
-      for (const r of resolvers) {
-        clearTimeout(r.timer)
-        r.resolve(task)
-      }
-      this.waitResolvers.delete(taskId)
-    }
+    this.resolveWaiters(taskId, task)
 
     this.pumpQueue(task.hostId)
     this.cleanupOutputsThrottled()
@@ -541,10 +564,20 @@ export class SchedulerService {
     })
   }
 
-  private removeWaitResolver(taskId: string, resolve: (task: ScheduledTask) => void): void {
+  private resolveWaiters(taskId: string, task: ScheduledTask): void {
     const resolvers = this.waitResolvers.get(taskId)
     if (!resolvers) return
-    const idx = resolvers.findIndex(r => r.resolve === resolve)
+    for (const r of resolvers) {
+      clearTimeout(r.timer)
+      r.resolve(task)
+    }
+    this.waitResolvers.delete(taskId)
+  }
+
+  private removeWaitResolver(taskId: string, entry: { resolve: (task: ScheduledTask) => void; timer: ReturnType<typeof setTimeout> }): void {
+    const resolvers = this.waitResolvers.get(taskId)
+    if (!resolvers) return
+    const idx = resolvers.indexOf(entry)
     if (idx !== -1) resolvers.splice(idx, 1)
     if (resolvers.length === 0) this.waitResolvers.delete(taskId)
   }

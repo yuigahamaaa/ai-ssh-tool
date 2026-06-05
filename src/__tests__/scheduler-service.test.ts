@@ -278,6 +278,79 @@ describe("SchedulerService", () => {
     assert.equal(scheduler.getTask(d.taskId!)?.status, "running")
   })
 
+  it("cancelTask frees running slot and ignores late runner completion", async () => {
+    const a = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a") }))
+    const b = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
+    assert.equal(a.action, "run_now")
+    assert.equal(b.action, "queued")
+
+    const cancelled = scheduler.cancelTask(a.taskId!)
+    assert.equal(cancelled, true)
+    await new Promise(r => setTimeout(r, 10))
+
+    assert.equal(scheduler.getTask(a.taskId!)?.status, "cancelled")
+    assert.equal(scheduler.getTask(b.taskId!)?.status, "running")
+
+    runner.finish(a.taskId!, { code: 0, stdout: "late\n", stderr: "" })
+    await new Promise(r => setTimeout(r, 10))
+
+    assert.equal(scheduler.getTask(a.taskId!)?.status, "cancelled")
+    assert.equal(scheduler.getTask(a.taskId!)?.exitCode, undefined)
+  })
+
+  it("cancelTask releases exclusive host lock before pumping queued work", async () => {
+    const a = scheduler.schedule(makeRequest({ command: "kubectl apply -f deploy.yaml", intent: "deploy", cost: "exclusive", force: true, agent: makeAgent("deploy") }))
+    const b = scheduler.schedule(makeRequest({ command: "rg foo src", cost: "tiny", agent: makeAgent("reader") }))
+    assert.equal(a.action, "run_now")
+    assert.equal(b.action, "queued")
+    assert.ok(scheduler.queueStatus("host-1").locks?.some(lock => lock.ownerTaskId === a.taskId))
+
+    const cancelled = scheduler.cancelTask(a.taskId!)
+    assert.equal(cancelled, true)
+    await new Promise(r => setTimeout(r, 10))
+
+    const status = scheduler.queueStatus("host-1")
+    assert.equal(status.locks?.some(lock => lock.ownerTaskId === a.taskId), false)
+    assert.equal(scheduler.getTask(b.taskId!)?.status, "running")
+  })
+
+  it("abortActiveTasks cancels running and queued tasks without promoting queued work", async () => {
+    const a = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a") }))
+    const b = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
+    const waitB = scheduler.waitTask(b.taskId!, 1000)
+
+    assert.equal(a.action, "run_now")
+    assert.equal(b.action, "queued")
+    assert.deepEqual(runner.started, [a.taskId])
+
+    const result = scheduler.abortActiveTasks("fatal shutdown")
+    const waitedB = await waitB
+
+    assert.deepEqual(result, { cancelled: 2, cancelFailed: 0 })
+    assert.deepEqual(runner.started, [a.taskId])
+    assert.equal(scheduler.getTask(a.taskId!)?.status, "cancelled")
+    assert.equal(scheduler.getTask(a.taskId!)?.decisionReason, "fatal shutdown")
+    assert.equal(scheduler.getTask(b.taskId!)?.status, "cancelled")
+    assert.equal(waitedB.status, "cancelled")
+    assert.equal(scheduler.queueStatus("host-1").running.length, 0)
+    assert.equal(scheduler.queueStatus("host-1").queued.length, 0)
+  })
+
+  it("abortActiveTasks reports running cancel failures and still cancels queued tasks", async () => {
+    const a = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a") }))
+    const b = scheduler.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
+    runner.cancelResult = false
+
+    const result = scheduler.abortActiveTasks("fatal shutdown")
+
+    assert.deepEqual(result, { cancelled: 1, cancelFailed: 1 })
+    assert.equal(scheduler.getTask(a.taskId!)?.status, "running")
+    assert.equal(scheduler.getTask(a.taskId!)?.decisionReason, "fatal shutdown Cancel attempt failed.")
+    assert.equal(scheduler.getTask(b.taskId!)?.status, "cancelled")
+    assert.equal(scheduler.getTask(b.taskId!)?.decisionReason, "fatal shutdown")
+    assert.equal(scheduler.queueStatus("host-1").queued.length, 0)
+  })
+
   it("queueStatus returns virtual cwd for the requesting agent", () => {
     scheduler.setCwd("agent-a", "host-1", "/repo-a")
     scheduler.setCwd("agent-b", "host-1", "/repo-b")

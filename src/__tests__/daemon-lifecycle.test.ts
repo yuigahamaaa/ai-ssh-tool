@@ -11,6 +11,31 @@ import { join } from "path"
 import { tmpdir } from "os"
 import { SSHDaemon } from "../daemon.js"
 import { DaemonClient } from "../daemon-client.js"
+import { SchedulerService } from "../scheduler/scheduler-service.js"
+import { PersistenceStore } from "../scheduler/persistence-store.js"
+import { OutputStore } from "../scheduler/output-store.js"
+import type { ScheduledTask, TaskRunner } from "../scheduler/types.js"
+
+class FakeSchedulerRunner implements TaskRunner {
+  started: string[] = []
+  cancelResult = true
+  private pending = new Map<string, (result: { code: number; stdout: string; stderr: string }) => void>()
+
+  async start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string }> {
+    this.started.push(task.id)
+    return new Promise(resolve => {
+      this.pending.set(task.id, (result) => resolve(result))
+    })
+  }
+
+  startBackground(task: ScheduledTask, _onOutput: (stdout: string, stderr: string) => void, _onClose: (code: number, signal?: string) => void): void {
+    this.started.push(task.id)
+  }
+
+  cancel(_task: ScheduledTask): boolean {
+    return this.cancelResult
+  }
+}
 
 describe("SSHDaemon", () => {
   let tmpDir: string
@@ -166,6 +191,49 @@ describe("SSHDaemon", () => {
 
       client1.disconnect()
       client2.disconnect()
+    })
+  })
+
+  describe("scheduler abort", () => {
+    it("should abort active scheduler tasks through IPC without starting queued work", async () => {
+      const runner = new FakeSchedulerRunner()
+      const scheduler = new SchedulerService({
+        persistence: new PersistenceStore(join(tmpDir, "scheduler")),
+        runner,
+        outputStore: new OutputStore(join(tmpDir, "outputs")),
+        maxLargeRunning: 1,
+      })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler })
+      await daemon.start()
+
+      const client = new DaemonClient(pipePath)
+      await client.connect()
+
+      const base = {
+        host: { id: "host-1", profileKey: "host-1", targetHost: "target.example.com", targetUser: "root", displayName: "target" },
+        sessionId: "sess-1",
+        command: "npm test",
+        cost: "large",
+        background: true,
+      }
+      const first = await client.schedule({ ...base, agent: { id: "agent-a", clientType: "cli" } })
+      const second = await client.schedule({ ...base, agent: { id: "agent-b", clientType: "mcp" } })
+
+      assert.equal(first.ok, true)
+      assert.equal((first.data as any).action, "run_now")
+      assert.equal(second.ok, true)
+      assert.equal((second.data as any).action, "queued")
+      assert.deepEqual(runner.started, [(first.data as any).taskId])
+
+      const aborted = await client.abortActiveTasks("fatal test")
+
+      assert.equal(aborted.ok, true)
+      assert.deepEqual(aborted.data, { cancelled: 2, cancelFailed: 0 })
+      assert.deepEqual(runner.started, [(first.data as any).taskId])
+      assert.equal(scheduler.queueStatus("host-1").running.length, 0)
+      assert.equal(scheduler.queueStatus("host-1").queued.length, 0)
+
+      client.disconnect()
     })
   })
 })

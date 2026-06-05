@@ -14,6 +14,8 @@
 import { createServer, type Server, type Socket } from "net"
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs"
 import { createHash } from "crypto"
+import { spawn } from "child_process"
+import { pathToFileURL } from "url"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
 import { upload, download } from "./file-transfer.js"
@@ -57,11 +59,14 @@ export class SSHDaemon {
   private pipePath: string
   private idleTimeoutMs: number
   private idleSweeper: ReturnType<typeof setInterval> | null = null
+  private sockets = new Set<Socket>()
   private sessionMap = new Map<string, DaemonSession>() // configHash -> session
   private configCache = new Map<string, CachedConfig>() // path -> cached hash
   private startedAt = Date.now()
   private forwardManagers = new Map<string, PortForwardManager>()
   private scheduler: SchedulerService
+  private stopping = false
+  private readonly signalShutdownHandler = () => { this.shutdown().catch(() => {}) }
 
   constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
@@ -234,11 +239,11 @@ export class SSHDaemon {
     this.idleSweeper = setInterval(() => this.sweepIdle(), 30_000)
 
     // Graceful shutdown (cross-platform)
-    process.on("SIGTERM", () => this.shutdown())
-    process.on("SIGINT", () => this.shutdown())
+    process.on("SIGTERM", this.signalShutdownHandler)
+    process.on("SIGINT", this.signalShutdownHandler)
     if (process.platform === "win32") {
       // Windows: handle Ctrl+C and process exit
-      process.on("SIGHUP", () => this.shutdown())
+      process.on("SIGHUP", this.signalShutdownHandler)
     }
 
     console.log(`[daemon] listening on ${this.pipePath}`)
@@ -246,18 +251,64 @@ export class SSHDaemon {
   }
 
   async shutdown(): Promise<void> {
+    await this.stop()
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopping) return
+    this.stopping = true
     console.log("[daemon] shutting down...")
+    process.off("SIGTERM", this.signalShutdownHandler)
+    process.off("SIGINT", this.signalShutdownHandler)
+    if (process.platform === "win32") {
+      process.off("SIGHUP", this.signalShutdownHandler)
+    }
     if (this.idleSweeper) clearInterval(this.idleSweeper)
+    this.idleSweeper = null
     await this.gateway.disconnectAll()
+    for (const socket of this.sockets) {
+      try { socket.end() } catch {}
+      try { socket.destroy() } catch {}
+    }
+    this.sockets.clear()
     if (this.server) {
-      this.server.close()
+      await new Promise<void>((resolve) => {
+        this.server!.close(() => resolve())
+      })
       this.server = null
     }
     this.removePid()
-    process.exit(0)
+  }
+
+  async handleFatal(err: Error, opts?: { restart?: boolean; exit?: boolean }): Promise<void> {
+    const reason = `Daemon fatal error: ${err.message}`
+    console.error(`[daemon] fatal: ${err.message}`)
+    logError("daemon", "fatal error", err)
+
+    try {
+      const result = this.scheduler.abortActiveTasks(reason)
+      log("daemon", "Aborted active scheduler tasks before fatal shutdown", result)
+    } catch (abortErr: any) {
+      log("daemon", "Failed to abort active scheduler tasks: " + abortErr.message)
+    }
+
+    try {
+      await this.stop()
+    } catch (stopErr: any) {
+      log("daemon", "Failed to stop daemon cleanly: " + stopErr.message)
+    }
+
+    if (opts?.restart) {
+      this.restartReplacement()
+    }
+
+    if (opts?.exit !== false) {
+      process.exit(1)
+    }
   }
 
   private handleConnection(socket: Socket): void {
+    this.sockets.add(socket)
     let buffer: Buffer<ArrayBuffer> = Buffer.alloc(0)
 
     socket.on("data", (data) => {
@@ -279,6 +330,7 @@ export class SSHDaemon {
     })
 
     socket.on("close", () => {
+      this.sockets.delete(socket)
       buffer = Buffer.alloc(0)
     })
   }
@@ -382,6 +434,10 @@ export class SSHDaemon {
 
       case "cleanupOutputs":
         resp = this.handleCleanupOutputs(req as any)
+        break
+
+      case "abortActiveTasks":
+        resp = this.handleAbortActiveTasks(req as any)
         break
 
       default:
@@ -513,7 +569,7 @@ export class SSHDaemon {
       })
 
       this.sessionMap.set(configHash, { sessionId: session.id, configHash })
-      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false } }
+      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash } }
     } catch (err: any) {
       for (const [sid, entry] of this.sessionMap) {
         const s = this.gateway.sessions.getSession(entry.sessionId)
@@ -693,6 +749,15 @@ export class SSHDaemon {
     }
   }
 
+  private handleAbortActiveTasks(req: { id: string; params: { reason: string } }): IPCResponse {
+    try {
+      const result = this.scheduler.abortActiveTasks(req.params.reason)
+      return { id: req.id, ok: true, data: result }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
   private async handleDisconnect(req: IPCRequest & { action: "disconnect" }): Promise<IPCResponse> {
     const { sessionId } = req.params
     try {
@@ -862,6 +927,26 @@ export class SSHDaemon {
       // ignore
     }
   }
+
+  private restartReplacement(): void {
+    const env = {
+      ...process.env,
+      SSH_TOOL_DAEMON_RESTART_COUNT: String(Number(process.env.SSH_TOOL_DAEMON_RESTART_COUNT ?? "0") + 1),
+    }
+    const restartCount = Number(env.SSH_TOOL_DAEMON_RESTART_COUNT)
+    if (restartCount > 3) {
+      log("daemon", "Not restarting daemon after fatal error: restart limit reached")
+      return
+    }
+
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      detached: true,
+      stdio: "ignore",
+      env,
+    })
+    child.unref()
+    log("daemon", `Spawned replacement daemon pid=${child.pid ?? "unknown"}`)
+  }
 }
 
 // --- Main ---
@@ -910,10 +995,29 @@ Options:
   }
 
   const daemon = new SSHDaemon({ pipePath, idleTimeoutMs: idleTimeout })
+  let handlingFatal = false
+  const handleFatal = (err: Error) => {
+    if (handlingFatal) {
+      console.error(`[daemon] fatal during fatal handling: ${err.message}`)
+      process.exit(1)
+    }
+    handlingFatal = true
+    daemon.handleFatal(err, { restart: true, exit: true }).catch((fatalErr) => {
+      console.error(`[daemon] fatal handler failed: ${fatalErr.message}`)
+      process.exit(1)
+    })
+  }
+  process.on("uncaughtException", handleFatal)
+  process.on("unhandledRejection", (err) => {
+    handleFatal(err instanceof Error ? err : new Error(String(err)))
+  })
+
   await daemon.start()
 }
 
-main().catch((err) => {
-  console.error(`[daemon] fatal: ${err.message}`)
-  process.exit(1)
-})
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(`[daemon] fatal: ${err.message}`)
+    process.exit(1)
+  })
+}

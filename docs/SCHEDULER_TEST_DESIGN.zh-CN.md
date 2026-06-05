@@ -20,6 +20,7 @@
 8. daemon 重启后 queued task 可恢复，running task 标记 stale。
 9. `ssh_cd` 是 agent + host 级 virtual cwd，不影响其他 agent。
 10. `ssh_exec` / `ssh_schedule` 响应包含 `effectiveCwd` 和 classification。
+11. daemon/MCP 遇到未知 fatal 异常时不吞异常：先中断 active scheduler tasks，再退出；daemon 可拉起 replacement，MCP 交给宿主重启。
 
 ## 2. 测试框架
 
@@ -286,7 +287,36 @@ class FakeRunner {
 - `ifBusy=fail` -> rejected
 - `ifBusy=run_anyway` -> run_now，即使存在 blockers
 
-### 6.8 bypass 行为
+### 6.8 cancel running 行为
+
+步骤：
+
+1. A large running。
+2. B large queued。
+3. cancel A。
+
+期望：
+
+- A status=`cancelled`。
+- B 被 pump 成 running。
+- wait A 的所有 waiter 都收到 cancelled。
+- 如果 runner 后续迟到返回 completed/failed，A 仍保持 cancelled，不被覆盖。
+
+### 6.9 cancel exclusive lock 行为
+
+步骤：
+
+1. A exclusive running，持有 host lock。
+2. B tiny queued。
+3. cancel A。
+
+期望：
+
+- A 的 host lock 被释放。
+- B 被 pump 成 running。
+- queueStatus 不再显示 A 的 lock。
+
+### 6.10 bypass 行为
 
 步骤：
 
@@ -300,7 +330,7 @@ class FakeRunner {
 - B 出现在 running tasks
 - B 不影响 queue admission 计数或按设计标记不参与准入
 
-### 6.9 finish 后状态
+### 6.11 finish 后状态
 
 步骤：
 
@@ -313,6 +343,23 @@ class FakeRunner {
 - finishedAt 有值
 - exitCode=0
 - persistence.saveTask 被调用至少两次：running 和 completed
+
+### 6.12 fatal abort active tasks
+
+步骤：
+
+1. A large running。
+2. B large queued，并启动 `waitTask(B)`。
+3. 调 `abortActiveTasks("fatal shutdown")`。
+
+期望：
+
+- A 被尝试 cancel，成功时 status=`cancelled`。
+- B 直接 status=`cancelled`，不能因为 A 释放 slot 被 promote 成 running。
+- `runner.started` 仍只有 A。
+- `waitTask(B)` 立即 resolve cancelled。
+- queueStatus 中 running/queued 均为空。
+- 返回 `{ cancelled, cancelFailed }`，如果 runner.cancel 返回 false，running task 保持 running 并计入 `cancelFailed`，不能被乐观标成 cancelled。
 
 ## 7. Persistence 测试
 
@@ -437,6 +484,7 @@ class FakeRunner {
 - `queueStatus`
 - `waitTask`
 - `dequeueTask`
+- `abortActiveTasks`
 - `setCwd`
 
 期望：
@@ -514,6 +562,37 @@ class FakeRunner {
 期望：
 
 - decision.effectiveCwd=`/repo`。
+
+### 10.6 abortActiveTasks
+
+步骤：
+
+1. daemon 注入 fake `SchedulerService` runner。
+2. 通过 IPC schedule large A（background=true）。
+3. 通过 IPC schedule large B（background=true）。
+4. 通过 IPC 调 `abortActiveTasks`。
+
+期望：
+
+- A run_now，B queued。
+- abort 返回 `{ cancelled: 2, cancelFailed: 0 }`。
+- B 没有被 promote，fake runner 只启动过 A。
+- queueStatus running/queued 均为空。
+
+### 10.7 fatal recovery lifecycle
+
+步骤：
+
+1. daemon 中存在 running/queued task。
+2. 触发 `handleFatal(err, { restart: false, exit: false })` 或等价可测入口。
+
+期望：
+
+- 调用 `scheduler.abortActiveTasks()`。
+- 调用 `gateway.disconnectAll()`，关闭 IPC server，移除 PID/socket。
+- 未知异常不继续吞掉，最终进程应退出非 0。
+- daemon 自拉 replacement 时带 `SSH_TOOL_DAEMON_RESTART_COUNT`，超过上限不再循环重启。
+- MCP server fatal 时只请求 daemon abort、断开本地 SSH、退出；不要在 stdio MCP 内自行 fork 新 MCP server。
 
 ## 11. MCP 测试
 
@@ -777,8 +856,8 @@ MVP 实现后更新 `package.json`：
 ```json
 {
   "scripts": {
-    "test:scheduler": "npm run build:test && node --test dist/__tests__/scheduler-classifier.test.js dist/__tests__/scheduler-service.test.js dist/__tests__/scheduler-persistence.test.js dist/__tests__/virtual-cwd.test.js dist/__tests__/daemon-scheduler.test.js",
-    "test:fast": "npm run build:test && node --test dist/__tests__/profile-manager.test.js dist/__tests__/logger.test.js dist/__tests__/session-manager.test.js dist/__tests__/daemon-ipc.test.js dist/__tests__/scheduler-classifier.test.js dist/__tests__/scheduler-service.test.js dist/__tests__/scheduler-persistence.test.js dist/__tests__/virtual-cwd.test.js"
+    "test:scheduler": "npm run build:test && node --test dist/__tests__/scheduler-classifier.test.js dist/__tests__/scheduler-service.test.js dist/__tests__/scheduler-persistence.test.js dist/__tests__/output-store.test.js dist/__tests__/virtual-cwd.test.js dist/__tests__/daemon-scheduler.test.js dist/__tests__/concurrency.test.js dist/__tests__/multi-session-concurrency.test.js",
+    "test:fast": "npm run build:test && node --test dist/__tests__/profile-manager.test.js dist/__tests__/logger.test.js dist/__tests__/session-manager.test.js dist/__tests__/daemon-ipc.test.js dist/__tests__/scheduler-classifier.test.js dist/__tests__/scheduler-service.test.js dist/__tests__/scheduler-persistence.test.js dist/__tests__/output-store.test.js dist/__tests__/virtual-cwd.test.js dist/__tests__/daemon-scheduler.test.js dist/__tests__/concurrency.test.js dist/__tests__/multi-session-concurrency.test.js dist/__tests__/stress-test.test.js"
   }
 }
 ```
@@ -803,8 +882,11 @@ npm run build:test
 node --test dist/__tests__/scheduler-classifier.test.js
 node --test dist/__tests__/scheduler-service.test.js
 node --test dist/__tests__/scheduler-persistence.test.js
+node --test dist/__tests__/output-store.test.js
 node --test dist/__tests__/virtual-cwd.test.js
 node --test dist/__tests__/daemon-scheduler.test.js
+node --test dist/__tests__/concurrency.test.js
+node --test dist/__tests__/multi-session-concurrency.test.js
 ```
 
 ## 17. 测试实现顺序
@@ -830,9 +912,11 @@ node --test dist/__tests__/daemon-scheduler.test.js
 | MCP/CLI ssh_exec 默认走 scheduler | `mcp-server.test.ts`, `cli-scheduler.test.ts` |
 | MCP/CLI 不各自维护队列 | mock DaemonClient.schedule，确认包装层调用 daemon |
 | large 不并发 | `scheduler-service.test.ts`, `daemon-scheduler.test.ts` |
-| tiny 可并发 | `scheduler-service.test.ts` |
+| tiny 可并发 | `scheduler-service.test.ts`, `concurrency.test.ts` |
 | bypass 可见 | `scheduler-service.test.ts`, `mcp-server.test.ts` |
-| queued 可查/等/取消 | `daemon-scheduler.test.ts` |
+| queued 可查/等/取消 | `daemon-scheduler.test.ts`, `concurrency.test.ts`, `multi-session-concurrency.test.ts` |
+| cancel 后释放 slot/lock，迟到完成不覆盖 cancelled | `scheduler-service.test.ts`, `concurrency.test.ts` |
+| 多 agent/多 host 并发隔离 | `multi-session-concurrency.test.ts` |
 | task 持久化 | `scheduler-persistence.test.ts`, ExecTaskManager 测试 |
 | daemon restart 恢复 | `scheduler-persistence.test.ts` |
 | ssh_cd 不串扰 | `virtual-cwd.test.ts`, `mcp-server.test.ts` |
