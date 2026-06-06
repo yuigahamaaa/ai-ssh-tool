@@ -94,6 +94,14 @@ src/__tests__/background-exec.test.ts
 
 `mcp-response.test.ts` 属于 L1：它不启动 MCP server，只锁定调度相关工具的 JSON 返回契约。`mcp-server.test.ts` 属于 L2：验证工具包装是否实际使用这些契约。
 
+当前新增的 `mcp-scheduler-contract.test.ts` 和 `cli-scheduler-contract.test.ts` 属于 L2 契约测试。它们不连接真实 SSH，也不启动完整 MCP server，而是锁定 AI 入口层最容易回归的两个事实：
+
+1. MCP/CLI 默认把 `ssh_exec`/`daemon exec` 组装成 `ScheduleRequest`，且 `scheduler="auto"`。
+2. MCP/CLI 只做薄包装，把 `reason`、`intent`、`cost`、`urgency`、`if_busy`、`cwd`、`timeout`、`force`、host identity 等参数原样传给 daemon scheduler。
+3. 显式 `scheduler="bypass"` 只是传给 daemon，由 daemon 决定绕过调度；入口层不能偷偷退回 raw exec。
+
+这类测试主要防止“入口层绕开调度器”的回归。它不证明真实命令能跑，也不证明 large task 串行；这些由 `daemon-scheduler.test.ts`、`scheduler-service.test.ts` 和并发测试覆盖。
+
 ### 4.4 L3：端到端验收
 
 使用现有测试 SSH server 或人工 profile。
@@ -594,6 +602,16 @@ class FakeRunner {
 - daemon 自拉 replacement 时带 `SSH_TOOL_DAEMON_RESTART_COUNT`，超过上限不再循环重启。
 - MCP server fatal 时只请求 daemon abort、断开本地 SSH、退出；不要在 stdio MCP 内自行 fork 新 MCP server。
 
+当前新增的 `daemon-replacement.test.ts` 是进程级恢复测试，专门验证 fatal recovery 的外层生命周期：
+
+1. 测试进程启动一个真实 `dist/daemon.js`，使用独立 pipe，避免碰到用户正在用的 daemon。
+2. 通过测试专用参数 `--test-fatal-after-start` 触发 daemon 的 fatal handler。
+3. 断言原 daemon 以非 0 退出。
+4. 断言 replacement daemon 能在同一个 pipe 上响应 `ping`，说明客户端不需要换地址。
+5. 当 `SSH_TOOL_DAEMON_RESTART_COUNT` 达到上限时，断言不会继续拉起 replacement，避免崩溃循环。
+
+这个测试不连接 SSH，也不执行远端命令。它验证的是“fatal 后服务可被替换恢复”的守护进程行为；running/queued task 是否被 abort、取消是否释放调度槽，仍由 scheduler/daemon 的单元和 IPC 测试覆盖。
+
 ## 11. MCP 测试
 
 扩展：`src/__tests__/mcp-server.test.ts`
@@ -632,6 +650,16 @@ mock `DaemonClient.schedule()`。
 
 - schedule 被调用。
 - request.scheduler=`auto`。
+
+补充：`mcp-scheduler-contract.test.ts` 是该场景的轻量契约版。它直接测试 `createMcpScheduleRequest()`：
+
+- 默认 `scheduler="auto"`。
+- `if_busy` 正确映射为 daemon 侧 `ifBusy`。
+- profile chain 最后一跳成为 `host.targetHost` / `host.targetUser`。
+- `configHash` 优先作为 `host.id/profileKey`，没有时用 `sessionId` 前缀。
+- `reason/intent/cost/urgency/cwd/timeout/force/background` 不丢失。
+
+以后如果改 MCP 工具参数名或调度请求结构，先改这个 helper 和测试，再改实际 MCP tool。
 
 ### 11.3 统一返回 envelope
 
@@ -768,6 +796,14 @@ schedule 返回 queued。
 期望：
 
 - CLI 输出包含 taskId、queuePosition、recommendedNextStep。
+
+补充：`cli-scheduler-contract.test.ts` 是该场景的轻量契约版。它注入 fake `DaemonClient`，验证：
+
+- `daemon exec` 会先 `ensureDaemon()`，再 connect host，最后调用 `schedule()`。
+- 不再调用 daemon 的 raw `exec()`。
+- 默认 `scheduler="auto"`，显式 `--scheduler bypass` 会保留。
+- CLI 参数 `--reason/--intent/--cost/--urgency/--if-busy/--cwd/--timeout/--force` 会进入同一份 `ScheduleRequest`。
+- `--config-json` 的 target host/user 会进入 host identity，方便 queue/status 对 AI 展示真实目标。
 - exitCode=0。
 
 ## 13. 修正现有模块的测试

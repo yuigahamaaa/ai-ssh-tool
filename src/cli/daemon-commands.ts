@@ -10,6 +10,18 @@ import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 
+interface DaemonCommandClient {
+  ensureDaemon(opts?: { debug?: boolean; label?: string }): Promise<void>
+  connectHost(configPath: string): Promise<any>
+  connectHostJson(configJson: string): Promise<any>
+  schedule(req: Record<string, unknown>): Promise<any>
+  disconnect(): void
+}
+
+interface DaemonCommandDeps {
+  clientFactory?: () => DaemonCommandClient
+}
+
 function createClient(): DaemonClient {
   return new DaemonClient()
 }
@@ -40,6 +52,21 @@ function profileToLegacyConfigJson(profile: SSHProfile): string {
   }
   
   return JSON.stringify(legacyConfig)
+}
+
+function hostIdentityFromConfigJson(configJson: string | undefined): { targetHost: string; targetUser: string } {
+  if (!configJson) {
+    return { targetHost: "unknown", targetUser: "unknown" }
+  }
+  try {
+    const config = JSON.parse(configJson) as { target?: { host?: string; username?: string } }
+    return {
+      targetHost: config.target?.host ?? "unknown",
+      targetUser: config.target?.username ?? "unknown",
+    }
+  } catch {
+    return { targetHost: "unknown", targetUser: "unknown" }
+  }
 }
 
 export async function handleDaemonStart(args: string[]): Promise<void> {
@@ -86,7 +113,7 @@ export async function handleDaemonStop(): Promise<void> {
   }
 }
 
-export async function handleDaemonExec(args: string[]): Promise<void> {
+export async function handleDaemonExec(args: string[], deps: DaemonCommandDeps = {}): Promise<void> {
   let configPath: string | undefined
   let configJson: string | undefined
   let profileName: string | undefined
@@ -146,7 +173,7 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
   }
 
   const debug = args.includes("--debug")
-  const client = createClient()
+  const client = deps.clientFactory?.() ?? createClient()
   try {
     log("daemon-cli", `daemon exec: config=${configPath ?? profileName ?? "inline-json"}, command=${command}`)
     await client.ensureDaemon({ debug })
@@ -158,6 +185,7 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
     if (configJson) {
       log("daemon-cli", "Connecting to host via inline JSON")
       connectResp = await client.connectHostJson(configJson)
+      finalConfigJson = configJson
       sourceType = "config-json"
     } else if (profileJson) {
       log("daemon-cli", "Connecting to host via profile JSON")
@@ -202,8 +230,7 @@ export async function handleDaemonExec(args: string[]): Promise<void> {
     const hostIdentity: HostIdentity = {
       id: configHash ?? sessionId.slice(0, 16),
       profileKey: configHash ?? sessionId.slice(0, 16),
-      targetHost: (connectResp.data as any)?.host ?? "unknown",
-      targetUser: "unknown",
+      ...hostIdentityFromConfigJson(finalConfigJson),
       displayName: profileName ?? configPath ?? "inline",
     }
     const agentIdentity: AgentIdentity = {

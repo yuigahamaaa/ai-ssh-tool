@@ -29,7 +29,8 @@ import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
-import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
+import type { AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
+import { createMcpScheduleRequest, profileToLegacyConfigJson } from "./mcp-scheduler-contract.js"
 import {
   guidanceForTaskStatus,
   guidanceForWaitResult,
@@ -268,35 +269,23 @@ async function main() {
     }
     const { sessionId, configHash } = connectResp.data as any
 
-    const hostIdentity: HostIdentity = {
-      id: configHash ?? sessionId.slice(0, 16),
-      profileKey: configHash ?? sessionId.slice(0, 16),
-      targetHost: profile.chain[profile.chain.length - 1].host,
-      targetUser: profile.chain[profile.chain.length - 1].auth.username,
-      displayName: profile.name,
-    }
-    const agentIdentity: AgentIdentity = {
-      id: MCP_AGENT_ID,
-      name: "mcp-server",
-      clientType: "mcp",
-    }
-
-    const scheduleReq: ScheduleRequest = {
-      agent: agentIdentity,
-      host: hostIdentity,
+    const scheduleReq = createMcpScheduleRequest({
+      profile,
       sessionId,
+      configHash,
+      agentId: MCP_AGENT_ID,
       command: params.command,
       cwd: params.cwd,
       reason: params.reason,
       intent: params.intent,
       cost: params.cost,
       urgency: params.urgency,
-      ifBusy: params.if_busy,
+      if_busy: params.if_busy,
       scheduler: params.scheduler ?? "auto",
-      timeoutMs: params.timeout,
+      timeout: params.timeout,
       force: params.force,
       background: params.background,
-    }
+    })
 
     const resp = await daemonClient.schedule(scheduleReq as unknown as Record<string, unknown>)
     if (!resp.ok) {
@@ -307,28 +296,6 @@ async function main() {
 
   function formatScheduleDecisionForAgent(decision: ScheduleDecision): string {
     return jsonText(scheduleDecisionEnvelope(decision))
-  }
-
-  function profileToLegacyConfigJson(profile: SSHProfile): string {
-    const chain = profile.chain
-    const target = chain[chain.length - 1]
-    const gateways = chain.slice(0, -1)
-    return JSON.stringify({
-      gateways: gateways.map(g => ({
-        host: g.host,
-        port: g.port,
-        username: g.auth.username,
-        password: g.auth.password,
-        privateKey: g.auth.privateKey,
-      })),
-      target: {
-        host: target.host,
-        port: target.port,
-        username: target.auth.username,
-        password: target.auth.password,
-        privateKey: target.auth.privateKey,
-      },
-    })
   }
 
   async function getProfileForScheduler(

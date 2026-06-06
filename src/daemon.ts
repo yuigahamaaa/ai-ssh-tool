@@ -939,7 +939,7 @@ export class SSHDaemon {
       return
     }
 
-    const child = spawn(process.execPath, process.argv.slice(1), {
+    const child = spawn(process.execPath, replacementDaemonArgs(process.argv.slice(1)), {
       detached: true,
       stdio: "ignore",
       env,
@@ -952,6 +952,18 @@ export class SSHDaemon {
 // --- Main ---
 
 import { checkDeps } from "./check-deps.js"
+
+function replacementDaemonArgs(args: string[]): string[] {
+  const filtered: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--test-fatal-after-start") {
+      i++
+      continue
+    }
+    filtered.push(args[i])
+  }
+  return filtered
+}
 
 async function main() {
   checkDeps()
@@ -985,12 +997,15 @@ Options:
 
   let idleTimeout = 10 * 60 * 1000
   let pipePath: string | undefined
+  let testFatalAfterStartMs: number | undefined
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--idle-timeout" && i + 1 < args.length) {
       idleTimeout = parseInt(args[++i]) * 1000
     } else if (args[i] === "--pipe" && i + 1 < args.length) {
       pipePath = args[++i]
+    } else if (args[i] === "--test-fatal-after-start" && i + 1 < args.length) {
+      testFatalAfterStartMs = parseInt(args[++i], 10)
     }
   }
 
@@ -1013,6 +1028,14 @@ Options:
   })
 
   await daemon.start()
+  if (testFatalAfterStartMs !== undefined) {
+    if (process.env.SSH_TOOL_ENABLE_TEST_HOOKS !== "1") {
+      throw new Error("--test-fatal-after-start requires SSH_TOOL_ENABLE_TEST_HOOKS=1")
+    }
+    setTimeout(() => {
+      handleFatal(new Error("test fatal"))
+    }, testFatalAfterStartMs)
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
