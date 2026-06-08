@@ -557,16 +557,20 @@ async function main() {
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
       overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
+      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion)"),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("File encoding: auto, utf8, gbk, latin1. Converts between encodings during transfer."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, profile_name, profile_json, profile_file }) => {
+    async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await upload(client, local_path, remote_path, {
         compressionLevel: compression_level,
         overwrite: overwrite as any,
         skipSymlinks: skip_symlinks,
+        lineEnding: line_ending as any,
+        encoding: encoding as any,
       })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
@@ -581,16 +585,20 @@ async function main() {
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
       overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
+      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion)"),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("File encoding: auto, utf8, gbk, latin1. Converts between encodings during transfer."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, profile_name, profile_json, profile_file }) => {
+    async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await download(client, remote_path, local_path, {
         compressionLevel: compression_level,
         overwrite: overwrite as any,
         skipSymlinks: skip_symlinks,
+        lineEnding: line_ending as any,
+        encoding: encoding as any,
       })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },

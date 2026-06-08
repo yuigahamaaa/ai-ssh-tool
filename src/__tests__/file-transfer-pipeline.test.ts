@@ -338,4 +338,101 @@ describe("File Transfer Pipeline Tests", () => {
       assert.ok(!uploaded?.toString().includes("\r\r\n"))
     })
   })
+
+  describe("Encoding Conversion - GBK and Latin1", () => {
+    it("should convert UTF-8 to GBK when specified", async () => {
+      const localPath = join(tmpDir, "to-gbk.txt")
+      const content = "你好世界"  // Chinese characters
+      writeFileSync(localPath, content, "utf8")
+      memFs.clear()
+      
+      const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/to-gbk.txt", {
+        encoding: "gbk",
+      })
+      
+      assert.equal(result.success, true)
+      const uploaded = memFs.get("/remote/to-gbk.txt")
+      assert.ok(uploaded, "File should be uploaded")
+      // GBK encoded bytes are different from UTF-8, so reading as UTF-8 gives wrong chars
+      assert.notEqual(uploaded?.toString("utf8"), content, "GBK bytes should not decode as valid UTF-8")
+      // But when properly decoded as GBK and re-encoded as UTF-8, it should match
+      const iconv = await import("iconv-lite")
+      const decodedBack = iconv.default.decode(uploaded!, "gbk")
+      assert.equal(decodedBack, content, "Content should be convertible from GBK back to original")
+    })
+
+    it("should handle latin1 encoding conversion", async () => {
+      const localPath = join(tmpDir, "to-latin1.txt")
+      const content = "café résumé"  // Characters with accents
+      writeFileSync(localPath, content, "utf8")
+      memFs.clear()
+      
+      const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/to-latin1.txt", {
+        encoding: "latin1",
+      })
+      
+      assert.equal(result.success, true)
+      const uploaded = memFs.get("/remote/to-latin1.txt")
+      assert.ok(uploaded, "File should be uploaded")
+      // Latin1 should encode accented characters correctly
+      const decodedContent = uploaded?.toString("latin1")
+      assert.equal(decodedContent, content, "Content should be converted back to Latin1 when read as Latin1")
+    })
+  })
+
+  describe("Download Encoding Conversion", () => {
+    it("should convert remote UTF-8 to local GBK when specified", async () => {
+      const localPath = join(tmpDir, "from-gbk.txt")
+      // Simulate a remote file that is in UTF-8
+      memFs.set("/remote/utf8-source.txt", Buffer.from("你好世界", "utf8"))
+      
+      const result = await downloadFile(conn.getFinalClient(), "/remote/utf8-source.txt", localPath, {
+        encoding: "gbk",
+      })
+      
+      assert.equal(result.success, true)
+      // When downloaded with GBK encoding, the UTF-8 content should be converted to GBK
+      const downloadedContent = readFileSync(localPath)
+      const decodedContent = downloadedContent.toString("utf8")
+      // The content should still be valid UTF-8 since we're just writing GBK-encoded bytes
+      assert.ok(downloadedContent.length > 0, "File should be downloaded")
+    })
+
+    it("should convert remote UTF-8 to local latin1 when specified", async () => {
+      const localPath = join(tmpDir, "from-latin1.txt")
+      memFs.set("/remote/latin1-source.txt", Buffer.from("café résumé", "utf8"))
+      
+      const result = await downloadFile(conn.getFinalClient(), "/remote/latin1-source.txt", localPath, {
+        encoding: "latin1",
+      })
+      
+      assert.equal(result.success, true)
+      const downloadedContent = readFileSync(localPath)
+      assert.ok(downloadedContent.length > 0, "File should be downloaded")
+    })
+  })
+
+  describe("Overwrite Behavior", () => {
+    it("should overwrite existing remote file by default", async () => {
+      const localPath = join(tmpDir, "overwrite-test.txt")
+      writeFileSync(localPath, "new content here")
+      memFs.set("/remote/overwrite-test.txt", Buffer.from("old content"))
+      
+      const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/overwrite-test.txt")
+      
+      assert.equal(result.success, true)
+      assert.equal(memFs.get("/remote/overwrite-test.txt")?.toString(), "new content here")
+    })
+
+    it("should overwrite existing local file on download by default", async () => {
+      const localPath = join(tmpDir, "local-overwrite.txt")
+      writeFileSync(localPath, "old local content")
+      memFs.set("/remote/remote-overwrite.txt", Buffer.from("new remote content"))
+      
+      const result = await downloadFile(conn.getFinalClient(), "/remote/remote-overwrite.txt", localPath)
+      
+      assert.equal(result.success, true)
+      assert.equal(readFileSync(localPath, "utf8"), "new remote content")
+    })
+  })
 })

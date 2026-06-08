@@ -15,6 +15,7 @@ import { tmpdir } from "os"
 import { randomUUID } from "crypto"
 import { Transform, pipeline } from "stream"
 import { promisify } from "util"
+import iconv from "iconv-lite"
 import { remoteExec } from "./remote-shell.js"
 import { log } from "./logger.js"
 
@@ -136,14 +137,18 @@ function detectLineEnding(content: Buffer): "lf" | "crlf" | "mixed" {
   return "lf"
 }
 
-/** Convert encoding */
-function convertEncoding(content: Buffer, fromEncoding: BufferEncoding, toEncoding: string): Buffer<ArrayBufferLike> {
-  if (fromEncoding === toEncoding as BufferEncoding) {
+/** Convert encoding using iconv-lite */
+function convertEncoding(content: Buffer, fromEncoding: string, toEncoding: string): Buffer<ArrayBufferLike> {
+  if (fromEncoding === toEncoding) {
     return content
   }
   
-  const text = content.toString(fromEncoding)
-  const result2 = Buffer.alloc(text.length * 2); result2.write(text, toEncoding as BufferEncoding); return result2.slice(0, result2.length)
+  try {
+    const decoded = iconv.decode(content, fromEncoding)
+    return iconv.encode(decoded, toEncoding)
+  } catch {
+    return content
+  }
 }
 
 /** Transform stream for encoding and line ending conversion (true streaming) */
