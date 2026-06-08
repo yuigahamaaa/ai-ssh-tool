@@ -5,7 +5,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
 import { OutputStore } from "../scheduler/output-store.js"
-import { rmSync, mkdirSync, existsSync, readFileSync, symlinkSync, utimesSync } from "fs"
+import { rmSync, mkdirSync, existsSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 
@@ -99,6 +99,26 @@ describe("OutputStore", () => {
     assert.equal(output.truncated, true)
     assert.equal(output.stdoutTruncated, true)
     assert.equal(output.stdoutPath, join(testDir, "task-1.stdout"))
+  })
+
+  it("loads tail from disk without reading the full output file", () => {
+    const store = new OutputStore(testDir)
+    const paths = store.getPaths("task-1")
+    writeFileSync(paths.stdout, "a".repeat(4 * 1024) + "tail")
+    writeFileSync(paths.stderr, "")
+    const original = store.getFullStdout
+    store.getFullStdout = (() => {
+      throw new Error("full stdout should not be read for tail output")
+    }) as typeof store.getFullStdout
+
+    try {
+      const output = store.getOutput("task-1", "tail", 16)
+      assert.equal(output.stdout, "aaaaaaaaaaaatail")
+      assert.equal(output.stdoutBytes, 4 * 1024 + 4)
+      assert.equal(output.truncated, true)
+    } finally {
+      store.getFullStdout = original
+    }
   })
 
   it("tracks file truncation separately from logical byte count", () => {

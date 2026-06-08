@@ -50,6 +50,7 @@ export class SchedulerService {
   private tasks = new Map<string, ScheduledTask>()
   private waitResolvers = new Map<string, { resolve: (task: ScheduledTask) => void; timer: ReturnType<typeof setTimeout> }[]>()
   private agents = new Map<string, AgentRecord>()
+  private streamedOutputTasks = new Map<string, { stdout: boolean; stderr: boolean }>()
   private lastOutputCleanupAt = 0
   private outputCleanupThrottleMs: number
 
@@ -444,7 +445,17 @@ export class SchedulerService {
         },
       )
     } else {
-      this.runner.start(task)
+      const onOutput = (stdout: string, stderr: string): void => {
+        if (stdout) {
+          this.markStreamedOutput(task.id, "stdout")
+          this.outputStore.appendStdout(task.id, stdout)
+        }
+        if (stderr) {
+          this.markStreamedOutput(task.id, "stderr")
+          this.outputStore.appendStderr(task.id, stderr)
+        }
+      }
+      this.runner.start(task, onOutput)
         .then(result => this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
         .catch(err => this.finishTask(task.id, "failed", 1, undefined, "", err.message))
     }
@@ -461,10 +472,13 @@ export class SchedulerService {
     task.finishedAt = Date.now()
     task.updatedAt = Date.now()
 
-    if (stdout) {
+    const alreadyStreamed = this.streamedOutputTasks.get(taskId)
+    this.streamedOutputTasks.delete(taskId)
+
+    if (stdout && !alreadyStreamed?.stdout) {
       this.outputStore.appendStdout(taskId, stdout)
     }
-    if (stderr) {
+    if (stderr && !alreadyStreamed?.stderr) {
       this.outputStore.appendStderr(taskId, stderr)
     }
     const output = this.outputStore.get(taskId)
@@ -587,6 +601,12 @@ export class SchedulerService {
     if (classification.cost === "large") return "queue"
     if (classification.cost === "medium") return "queue"
     return "run_anyway"
+  }
+
+  private markStreamedOutput(taskId: string, stream: "stdout" | "stderr"): void {
+    const state = this.streamedOutputTasks.get(taskId) ?? { stdout: false, stderr: false }
+    state[stream] = true
+    this.streamedOutputTasks.set(taskId, state)
   }
 
   private cleanupOutputsThrottled(): void {

@@ -1,8 +1,11 @@
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  openSync,
   lstatSync,
   mkdirSync,
+  readSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -143,8 +146,8 @@ export class OutputStore {
     const stdoutFileTruncated = entry?.stdoutFileTruncated ?? false
     const stderrFileTruncated = entry?.stderrFileTruncated ?? false
 
-    let stdout = mode === "full" ? this.getFullStdout(taskId) : (entry?.stdoutTail ?? "")
-    let stderr = mode === "full" ? this.getFullStderr(taskId) : (entry?.stderrTail ?? "")
+    let stdout = mode === "full" ? this.getFullStdout(taskId) : (entry?.stdoutTail ?? this.readFileTail(paths.stdout, returnLimit))
+    let stderr = mode === "full" ? this.getFullStderr(taskId) : (entry?.stderrTail ?? this.readFileTail(paths.stderr, returnLimit))
     let stdoutTruncated = stdoutBytes > Buffer.byteLength(stdout) || stdoutFileTruncated
     let stderrTruncated = stderrBytes > Buffer.byteLength(stderr) || stderrFileTruncated
 
@@ -295,9 +298,23 @@ export class OutputStore {
     }
   }
 
-  private readFileTail(path: string): string {
-    const content = this.readFile(path)
-    return content.length > OUTPUT_TAIL_LIMIT ? content.slice(-OUTPUT_TAIL_LIMIT) : content
+  private readFileTail(path: string, maxBytes = OUTPUT_TAIL_LIMIT): string {
+    try {
+      if (!this.isSafeRegularFile(path)) return ""
+      const size = statSync(path).size
+      if (size === 0) return ""
+      const bytesToRead = Math.min(size, maxBytes)
+      const buffer = Buffer.allocUnsafe(bytesToRead)
+      const fd = openSync(path, "r")
+      try {
+        readSync(fd, buffer, 0, bytesToRead, size - bytesToRead)
+      } finally {
+        closeSync(fd)
+      }
+      return buffer.toString("utf8")
+    } catch {
+      return ""
+    }
   }
 
   private sizeOf(path: string): number {

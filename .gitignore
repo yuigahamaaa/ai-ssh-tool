@@ -13,3 +13,4 @@ test-*.log
 !tsconfig*.json
 !package*.json
 .opencode/
+.codegraph/

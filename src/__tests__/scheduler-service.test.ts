@@ -60,6 +60,41 @@ class FakeRunner implements TaskRunner {
   }
 }
 
+class StreamingRunner implements TaskRunner {
+  private pending = new Map<string, (result: { code: number; stdout: string; stderr: string }) => void>()
+
+  constructor(private streamedChunks: { stdout: string; stderr: string }[] = [
+    { stdout: "streamed-stdout\n", stderr: "" },
+    { stdout: "", stderr: "streamed-stderr\n" },
+  ]) {}
+
+  async start(
+    task: ScheduledTask,
+    onOutput?: (stdout: string, stderr: string) => void
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    for (const chunk of this.streamedChunks) {
+      onOutput?.(chunk.stdout, chunk.stderr)
+    }
+    return new Promise(resolve => {
+      this.pending.set(task.id, (result) => resolve(result))
+    })
+  }
+
+  startBackground(
+    _task: ScheduledTask,
+    _onOutput: (stdout: string, stderr: string) => void,
+    _onClose: (code: number, signal?: string) => void
+  ): void {}
+
+  finish(taskId: string, result: { code: number; stdout: string; stderr: string }) {
+    const fn = this.pending.get(taskId)
+    if (fn) {
+      this.pending.delete(taskId)
+      fn(result)
+    }
+  }
+}
+
 describe("SchedulerService", () => {
   let tmpDir: string
   let persistence: PersistenceStore
@@ -266,6 +301,48 @@ describe("SchedulerService", () => {
     assert.equal(output.stdoutBytes, 40 * 1024)
     assert.equal(output.truncated, true)
     assert.ok(output.stdoutPath.endsWith(`${d.taskId}.stdout`))
+  })
+
+  it("foreground streaming output is not duplicated by aggregated runner result", async () => {
+    const streamingRunner = new StreamingRunner()
+    const outputStore = new OutputStore(join(tmpDir, "streaming-outputs"))
+    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore })
+    const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
+    assert.equal(d.action, "run_now")
+
+    streamingRunner.finish(d.taskId!, {
+      code: 0,
+      stdout: "streamed-stdout\n",
+      stderr: "streamed-stderr\n",
+    })
+    await new Promise(r => setTimeout(r, 10))
+
+    const output = s.getTaskOutput(d.taskId!, "full")
+    assert.equal(output.stdout, "streamed-stdout\n")
+    assert.equal(output.stderr, "streamed-stderr\n")
+    assert.equal(output.stdoutBytes, Buffer.byteLength("streamed-stdout\n"))
+    assert.equal(output.stderrBytes, Buffer.byteLength("streamed-stderr\n"))
+  })
+
+  it("foreground streaming only suppresses the streams that were actually streamed", async () => {
+    const streamingRunner = new StreamingRunner([{ stdout: "streamed-stdout\n", stderr: "" }])
+    const outputStore = new OutputStore(join(tmpDir, "partial-streaming-outputs"))
+    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore })
+    const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
+    assert.equal(d.action, "run_now")
+
+    streamingRunner.finish(d.taskId!, {
+      code: 1,
+      stdout: "streamed-stdout\n",
+      stderr: "late-stderr\n",
+    })
+    await new Promise(r => setTimeout(r, 10))
+
+    const output = s.getTaskOutput(d.taskId!, "full")
+    assert.equal(output.stdout, "streamed-stdout\n")
+    assert.equal(output.stderr, "late-stderr\n")
+    assert.equal(output.stdoutBytes, Buffer.byteLength("streamed-stdout\n"))
+    assert.equal(output.stderrBytes, Buffer.byteLength("late-stderr\n"))
   })
 
   it("cancelTask does not mark running task cancelled when runner cannot cancel", () => {

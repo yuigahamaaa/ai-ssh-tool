@@ -449,6 +449,29 @@ interface HostConcurrencyPolicy {
 
 第一版可以用模式表实现。后续可以把分类结果返回给 AI，让 AI 修正。
 
+未来可以考虑接入端侧小模型作为可选分类顾问，但它不应该替代规则分类器。当前调度器已经采用保守策略：无法高置信度识别时默认按更重、更安全的方式排队，因此本地模型不是 MVP 必需能力。
+
+如果后续要做，建议遵守这些边界：
+
+- 默认关闭，只在用户显式配置后启用。
+- 只在规则分类低置信度、命令结构复杂、或队列优先级难判断时调用。
+- 模型只输出建议，例如 `intent`、`cost`、`risk`、`priorityHint`、`confidence` 和简短原因。
+- 最终决策仍由 policy engine 做；模型不能绕过 large/exclusive 串行、确认机制、锁和队列上限。
+- 必须有很短的 deadline，例如 200-500ms；超时、解析失败、模型不可用时直接回退规则分类器。
+- 结果可缓存，按 normalized command、cwd/project hints、历史队列场景复用。
+- 离线内网环境应通过单独模型 bundle 或内部制品库安装，不把几百 MB 模型塞进主包。
+
+适合的架构是：
+
+```text
+Rule classifier
+  -> confidence low?
+  -> optional local advisor model
+  -> policy engine final decision
+```
+
+这样本地模型只提升复杂命令的分类和排序准确度，不会让调度器变慢、变黑箱，或破坏保守设计。
+
 ### 7.5 调度决策
 
 ```ts
@@ -1056,6 +1079,7 @@ AI 更容易响应清晰上下文：
 - 每个 repo 的 `.ssh-tool-policy.json`。
 - 端口锁检测，避免多个 dev server 抢端口。
 - 从历史命令学习分类。
+- 可选端侧小模型 advisor：用于复杂命令分类和 queued task priority hint，默认关闭，规则与 policy engine 仍是权威。
 - 任务依赖：“task X 成功后再运行 task Y”。
 - MCP resource 或 event stream 通知 agent。
 - 远端轻量 supervisor，用于 daemon 重启后的运行任务恢复。

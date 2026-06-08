@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import {
   encodeMessage,
   parseMessages,
+  IPCMessageParser,
   normalizeConfig,
   createRequest,
 } from "../ipc-protocol.js";
@@ -123,6 +124,40 @@ describe("Daemon IPC Tests", () => {
       const remainder = parseMessages(buf, (m) => received.push(m));
       assert.equal(received.length, 0);
       assert.equal(remainder.length, 0);
+    });
+  });
+
+  describe("IPCMessageParser", () => {
+    it("parses incremental string chunks without caller-side Buffer concatenation", () => {
+      const parser = new IPCMessageParser();
+      const received: (IPCRequest | IPCResponse)[] = [];
+      const raw =
+        encodeMessage({ id: "s1", action: "ping" }) +
+        encodeMessage({ id: "s2", action: "list" });
+
+      for (const ch of raw) {
+        parser.push(Buffer.from(ch), (m) => received.push(m));
+      }
+
+      assert.equal(received.length, 2);
+      assert.equal((received[0] as IPCRequest).id, "s1");
+      assert.equal((received[1] as IPCRequest).id, "s2");
+      assert.equal(parser.remainderLength, 0);
+    });
+
+    it("keeps only the incomplete trailing line between pushes", () => {
+      const parser = new IPCMessageParser();
+      const received: (IPCRequest | IPCResponse)[] = [];
+      const raw = encodeMessage({ id: "partial-parser", action: "ping" });
+
+      parser.push(Buffer.from(raw.slice(0, -2)), (m) => received.push(m));
+      assert.equal(received.length, 0);
+      assert.equal(parser.remainderLength, raw.length - 2);
+
+      parser.push(Buffer.from(raw.slice(-2)), (m) => received.push(m));
+      assert.equal(received.length, 1);
+      assert.equal((received[0] as IPCRequest).id, "partial-parser");
+      assert.equal(parser.remainderLength, 0);
     });
   });
 

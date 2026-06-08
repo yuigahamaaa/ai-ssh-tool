@@ -12,6 +12,7 @@
  */
 
 import { createServer, type Server, type Socket } from "net"
+import type { Client, ClientChannel } from "ssh2"
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs"
 import { createHash } from "crypto"
 import { spawn } from "child_process"
@@ -25,7 +26,7 @@ import {
   getPipePath,
   getPidPath,
   encodeMessage,
-  parseMessages,
+  IPCMessageParser,
   type IPCRequest,
   type IPCResponse,
   normalizeConfig,
@@ -53,6 +54,74 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
+export function execScheduledStream(
+  client: Client,
+  command: string,
+  timeoutMs: number,
+  onOutput?: (stdout: string, stderr: string) => void,
+  onPid?: (pid: number) => void,
+): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
+  return new Promise((resolve, reject) => {
+    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${command}`
+    let pid: number | null = null
+    let pidCaptured = false
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const settle = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      fn()
+    }
+
+    client.exec(wrappedCommand, (err: Error | undefined, stream: ClientChannel) => {
+      if (err) {
+        settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
+        return
+      }
+
+      timer = setTimeout(() => {
+        if (settled) return
+        if (pid) {
+          const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+          client.exec(killCmd, () => {})
+        }
+        try { stream.close() } catch {}
+        settle(() => resolve({ code: 124, stdout: "", stderr: "", signal: "TERM" }))
+      }, timeoutMs)
+
+      stream.on("data", (data: Buffer) => {
+        onOutput?.(data.toString(), "")
+      })
+
+      stream.stderr.on("data", (data: Buffer) => {
+        const text = data.toString()
+        if (!pidCaptured) {
+          const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+          if (pidMatch) {
+            pid = parseInt(pidMatch[1], 10)
+            onPid?.(pid)
+            pidCaptured = true
+            const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, "")
+            if (remaining) onOutput?.("", remaining)
+            return
+          }
+        }
+        onOutput?.("", text)
+      })
+
+      stream.on("close", (code?: number, signal?: string) => {
+        settle(() => resolve({ code: code ?? 0, stdout: "", stderr: "", signal }))
+      })
+
+      stream.on("error", (streamErr: Error) => {
+        settle(() => reject(new Error(`Stream error: ${streamErr.message}`)))
+      })
+    })
+  })
+}
+
 export class SSHDaemon {
   private gateway: SSHGateway
   private server: Server | null = null
@@ -77,15 +146,16 @@ export class SSHDaemon {
     })
     this.scheduler = opts?.scheduler ?? new SchedulerService({
       runner: {
-        start: async (task) => {
+        start: async (task, onOutput) => {
           const conn = this.gateway.sessions.getConnection(task.sessionId)
           if (!conn) throw new Error(`Session ${task.sessionId} not found for scheduled task`)
           const client = conn.getFinalClient()
           const cmd = task.effectiveCwd
             ? `cd ${shellQuote(task.effectiveCwd)} && ${task.command}`
             : task.command
-          const result = await remoteExec(client, cmd, { timeout: task.timeoutMs ?? 120_000 })
-          return { code: result.code, stdout: result.stdout, stderr: result.stderr, signal: result.signal }
+          return execScheduledStream(client, cmd, task.timeoutMs ?? 120_000, onOutput, (pid) => {
+            task.pid = pid
+          })
         },
         cancel: (task) => {
           const conn = this.gateway.sessions.getConnection(task.sessionId)
@@ -309,11 +379,10 @@ export class SSHDaemon {
 
   private handleConnection(socket: Socket): void {
     this.sockets.add(socket)
-    let buffer: Buffer<ArrayBuffer> = Buffer.alloc(0)
+    const parser = new IPCMessageParser()
 
     socket.on("data", (data) => {
-      buffer = Buffer.concat([buffer, data])
-      buffer = parseMessages(buffer, (msg) => {
+      parser.push(data, (msg) => {
         this.handleRequest(socket, msg as IPCRequest).catch((err) => {
           const resp: IPCResponse = {
             id: (msg as IPCRequest).id,
@@ -331,7 +400,7 @@ export class SSHDaemon {
 
     socket.on("close", () => {
       this.sockets.delete(socket)
-      buffer = Buffer.alloc(0)
+      parser.reset()
     })
   }
 

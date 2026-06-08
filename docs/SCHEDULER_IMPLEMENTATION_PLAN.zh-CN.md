@@ -1052,6 +1052,6 @@ MVP 完成必须满足：
 3. 事件日志 JSONL
 4. 远端 Supervisor 与任务重新接管
 5. 跨用户/跨机器分布式调度
+6. 可选端侧小模型 advisor：只在复杂命令/低置信度分类时给 `intent/cost/risk/priorityHint` 建议，默认关闭，不能替代规则分类器和 policy engine
 
 详细后续计划参见：[AI 协作调度器设计文档](./AI_COLLABORATIVE_SCHEDULER_DESIGN.zh-CN.md)
-

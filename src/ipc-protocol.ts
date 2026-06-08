@@ -98,6 +98,41 @@ export function parseMessages(
   return Buffer.from(remainder, "utf-8")
 }
 
+/**
+ * Incremental newline-delimited JSON parser for socket streams.
+ * Keeps the partial trailing line as a string to avoid Buffer.concat on every chunk.
+ */
+export class IPCMessageParser {
+  private remainder = ""
+
+  get remainderLength(): number {
+    return Buffer.byteLength(this.remainder, "utf8")
+  }
+
+  push(
+    chunk: Buffer | string,
+    onMessage: (msg: IPCRequest | IPCResponse) => void,
+  ): void {
+    const text = this.remainder + chunk.toString()
+    const lines = text.split("\n")
+    this.remainder = lines.pop() ?? ""
+
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          onMessage(JSON.parse(line))
+        } catch {
+          // skip malformed lines
+        }
+      }
+    }
+  }
+
+  reset(): void {
+    this.remainder = ""
+  }
+}
+
 // --- Request helpers ---
 
 export function createRequest(
@@ -138,7 +173,7 @@ interface PendingRequest {
  * No shared global state — safe for concurrent use across multiple sockets.
  */
 export class IPCSocket {
-  private buffer = Buffer.alloc(0)
+  private parser = new IPCMessageParser()
   private pending = new Map<string, PendingRequest>()
   private dataHandler: ((data: Buffer) => void) | null = null
   private closeHandler: (() => void) | null = null
@@ -151,8 +186,7 @@ export class IPCSocket {
     socket.on("close", this.closeHandler)
 
     this.dataHandler = (data: Buffer) => {
-      this.buffer = Buffer.concat([this.buffer, data])
-      this.buffer = parseMessages(this.buffer, (msg) => {
+      this.parser.push(data, (msg) => {
         const resp = msg as IPCResponse
         if (resp.id && this.pending.has(resp.id)) {
           const p = this.pending.get(resp.id)!
@@ -198,6 +232,6 @@ export class IPCSocket {
       this.socket.off("close", this.closeHandler)
       this.closeHandler = null
     }
-    this.buffer = Buffer.alloc(0)
+    this.parser.reset()
   }
 }

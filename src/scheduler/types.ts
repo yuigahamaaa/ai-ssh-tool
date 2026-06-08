@@ -169,7 +169,10 @@ export interface VirtualCwdState {
 }
 
 export interface TaskRunner {
-  start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+  start(
+    task: ScheduledTask,
+    onOutput?: (stdout: string, stderr: string) => void
+  ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
   cancel?(task: ScheduledTask): boolean
   startBackground(
     task: ScheduledTask,
