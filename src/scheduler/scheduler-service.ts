@@ -27,6 +27,7 @@ import { LockManager } from "./lock-manager.js"
 
 const FINISHED_TASK_TTL_MS = 60 * 60 * 1000
 const EVICT_BATCH_SIZE = 100
+const IDLE_EVICT_INTERVAL_MS = 5 * 60 * 1000
 
 export interface SchedulerServiceOptions {
   persistence?: PersistenceStore
@@ -80,6 +81,11 @@ export class SchedulerService {
 
     this.restore()
     this.cleanupOutputs()
+
+    // Idle eviction: periodically clean up finished tasks even when scheduler is idle
+    setInterval(() => {
+      this.evictOldTasks()
+    }, IDLE_EVICT_INTERVAL_MS)
   }
 
   private restore(): void {
@@ -693,6 +699,7 @@ export class SchedulerService {
       const finishedAt = task.finishedAt ?? task.updatedAt ?? 0
       if (now - finishedAt > FINISHED_TASK_TTL_MS) {
         this.tasks.delete(id)
+        this.streamedOutputTasks.delete(id)
         evicted++
       }
     }
