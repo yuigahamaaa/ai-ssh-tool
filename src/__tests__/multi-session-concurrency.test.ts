@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
 import { OutputStore } from "../scheduler/output-store.js"
+import { EventLog } from "../scheduler/event-log.js"
 import { SSHDaemon } from "../daemon.js"
 import { DaemonClient } from "../daemon-client.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, ScheduledTask, TaskRunner } from "../scheduler/types.js"
@@ -65,7 +66,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("10 agents schedule tiny tasks on same host, all run concurrently", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p1"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")), eventLog: new EventLog(join(tmpDir, "events-o1")) })
 
       const decisions: { action: string; taskId?: string }[] = []
       for (let i = 0; i < 10; i++) {
@@ -85,7 +86,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p2"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")),
         maxLargeRunning: 1, maxTotalRunning: 4,
       })
 
@@ -106,7 +107,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("agent heartbeat concurrent updates do not throw", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p3"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), eventLog: new EventLog(join(tmpDir, "events-o3")) })
 
       for (let i = 0; i < 20; i++) {
         s.registerAgent(makeAgent(`agent-${i}`))
@@ -123,7 +124,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "ch1"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho1")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho1")), eventLog: new EventLog(join(tmpDir, "events-cho1")),
         maxLargeRunning: 1, maxTotalRunning: 4,
       })
 
@@ -145,7 +146,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "ch2"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho2")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho2")), eventLog: new EventLog(join(tmpDir, "events-cho2")),
         maxLargeRunning: 1,
       })
 
@@ -165,7 +166,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("exclusive task on host-alpha does not block host-beta", () => {
       const persistence = new PersistenceStore(join(tmpDir, "ch3"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho3")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho3")), eventLog: new EventLog(join(tmpDir, "events-cho3")) })
 
       s.schedule(makeRequest("deployer", "host-alpha", {
         command: "kubectl apply -f deploy.yaml", intent: "deploy", cost: "exclusive", force: true,
@@ -181,7 +182,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "ch4"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho4")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "cho4")), eventLog: new EventLog(join(tmpDir, "events-cho4")),
         maxLargeRunning: 2, maxTotalRunning: 20,
       })
 
@@ -204,7 +205,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("10 agents set different CWDs on same host, all isolated", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd1"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo1")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo1")), eventLog: new EventLog(join(tmpDir, "events-cwdo1")) })
 
       for (let i = 0; i < 10; i++) {
         s.setCwd(`agent-${i}`, "shared-host", `/project-${i}`)
@@ -218,7 +219,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("agent CWD on different hosts are independent", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd2"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo2")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo2")), eventLog: new EventLog(join(tmpDir, "events-cwdo2")) })
 
       s.setCwd("agent-1", "host-a", "/repo-a")
       s.setCwd("agent-1", "host-b", "/repo-b")
@@ -232,7 +233,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("virtual CWD appears in scheduled task decision", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd3"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo3")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo3")), eventLog: new EventLog(join(tmpDir, "events-cwdo3")) })
 
       s.setCwd("agent-1", "host-1", "/workspace")
       const d = s.schedule(makeRequest("agent-1", "host-1"))
@@ -242,7 +243,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("explicit cwd overrides virtual cwd for specific task", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd4"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo4")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo4")), eventLog: new EventLog(join(tmpDir, "events-cwdo4")) })
 
       s.setCwd("agent-1", "host-1", "/workspace")
       const d = s.schedule(makeRequest("agent-1", "host-1", { cwd: "/tmp" }))
@@ -252,7 +253,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("rapid CWD switching does not corrupt state", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd5"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo5")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo5")), eventLog: new EventLog(join(tmpDir, "events-cwdo5")) })
 
       for (let i = 0; i < 100; i++) {
         s.setCwd("agent-1", "host-1", `/dir-${i}`)
@@ -269,7 +270,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("queueStatus returns correct virtualCwd per requesting agent", () => {
       const persistence = new PersistenceStore(join(tmpDir, "cwd6"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo6")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "cwdo6")), eventLog: new EventLog(join(tmpDir, "events-cwdo6")) })
 
       s.setCwd("alice", "host-1", "/alice-project")
       s.setCwd("bob", "host-1", "/bob-project")
@@ -381,7 +382,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "lc1"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco1")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco1")), eventLog: new EventLog(join(tmpDir, "events-lco1")),
         maxLargeRunning: 1,
       })
 
@@ -411,7 +412,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "lc2"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco2")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco2")), eventLog: new EventLog(join(tmpDir, "events-lco2")),
         maxLargeRunning: 1,
       })
 
@@ -433,7 +434,7 @@ describe("Multi-Session Concurrency Tests", () => {
       const persistence = new PersistenceStore(join(tmpDir, "lc3"))
       const runner = new MultiRunner()
       const s = new SchedulerService({
-        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco3")),
+        persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco3")), eventLog: new EventLog(join(tmpDir, "events-lco3")),
         maxLargeRunning: 1,
       })
 
@@ -451,7 +452,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("getRecentEvents shows events from multiple agents", () => {
       const persistence = new PersistenceStore(join(tmpDir, "lc4"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco4")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "lco4")), eventLog: new EventLog(join(tmpDir, "events-lco4")) })
 
       for (let i = 0; i < 10; i++) {
         s.schedule(makeRequest(`agent-${i}`, "host-1", { command: `echo ${i}` }))
@@ -468,7 +469,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("output from different agents' tasks are isolated", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "oi1"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "oio1")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "oio1")), eventLog: new EventLog(join(tmpDir, "events-oio1")) })
 
       const tasks: { taskId: string; agentId: string }[] = []
       for (let i = 0; i < 5; i++) {
@@ -490,7 +491,7 @@ describe("Multi-Session Concurrency Tests", () => {
     it("concurrent getTaskOutput calls on different tasks do not interfere", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "oi2"))
       const runner = new MultiRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "oio2")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "oio2")), eventLog: new EventLog(join(tmpDir, "events-oio2")) })
 
       const ids: string[] = []
       for (let i = 0; i < 10; i++) {

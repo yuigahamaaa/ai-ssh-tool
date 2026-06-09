@@ -6,6 +6,7 @@ const DEFAULT_TTL = 30 * 60 * 1000
 
 export class LockManager {
   private locks = new Map<string, SchedulerLock>()
+  private lockIdToKey = new Map<string, string>()
   private ttl: number
 
   constructor(ttl?: number) {
@@ -50,13 +51,23 @@ export class LockManager {
       renewedAt: Date.now(),
     }
     this.locks.set(lockKey, lock)
+    this.lockIdToKey.set(lock.id, lockKey)
     return lock
   }
 
   release(lockId: string): boolean {
-    for (const [key, lock] of this.locks.entries()) {
+    const key = this.lockIdToKey.get(lockId)
+    if (key !== undefined) {
+      const existed = this.locks.delete(key)
+      if (existed) {
+        this.lockIdToKey.delete(lockId)
+        return true
+      }
+    }
+    for (const [k, lock] of this.locks.entries()) {
       if (lock.id === lockId) {
-        this.locks.delete(key)
+        this.locks.delete(k)
+        this.lockIdToKey.delete(lockId)
         return true
       }
     }
@@ -68,6 +79,7 @@ export class LockManager {
     for (const [key, lock] of this.locks.entries()) {
       if (lock.ownerTaskId === taskId) {
         toRemove.push(key)
+        this.lockIdToKey.delete(lock.id)
       }
     }
     for (const key of toRemove) {
@@ -109,6 +121,15 @@ export class LockManager {
   }
 
   renew(lockId: string): boolean {
+    const key = this.lockIdToKey.get(lockId)
+    if (key !== undefined) {
+      const lock = this.locks.get(key)
+      if (lock) {
+        lock.renewedAt = Date.now()
+        lock.expiresAt = lock.renewedAt + this.ttl
+        return true
+      }
+    }
     for (const lock of this.locks.values()) {
       if (lock.id === lockId) {
         lock.renewedAt = Date.now()
@@ -125,6 +146,7 @@ export class LockManager {
     for (const [key, lock] of this.locks.entries()) {
       if (lock.expiresAt < now) {
         toRemove.push(key)
+        this.lockIdToKey.delete(lock.id)
       }
     }
     for (const key of toRemove) {

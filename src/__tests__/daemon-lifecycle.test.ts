@@ -14,6 +14,7 @@ import { DaemonClient } from "../daemon-client.js"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
 import { OutputStore } from "../scheduler/output-store.js"
+import { EventLog } from "../scheduler/event-log.js"
 import type { ScheduledTask, TaskRunner } from "../scheduler/types.js"
 
 class FakeSchedulerRunner implements TaskRunner {
@@ -201,6 +202,7 @@ describe("SSHDaemon", () => {
         persistence: new PersistenceStore(join(tmpDir, "scheduler")),
         runner,
         outputStore: new OutputStore(join(tmpDir, "outputs")),
+        eventLog: new EventLog(join(tmpDir, "events")),
         maxLargeRunning: 1,
       })
       daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler })

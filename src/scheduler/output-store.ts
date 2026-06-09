@@ -208,8 +208,11 @@ export class OutputStore {
     let keptFiles = 0
     let totalBytes = files.reduce((sum, file) => sum + file.size, 0)
 
+    const deleted = new Set<string>()
+
     const deleteFile = (file: OutputFileRecord): void => {
       if (!this.safeUnlink(file.path)) return
+      deleted.add(file.path)
       deletedFiles += 1
       deletedBytes += file.size
       totalBytes -= file.size
@@ -229,7 +232,9 @@ export class OutputStore {
     }
 
     if (totalBytes > maxTotalBytes) {
-      for (const file of this.listOutputFiles().sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+      const remaining = files.filter((f) => !deleted.has(f.path))
+      remaining.sort((a, b) => a.mtimeMs - b.mtimeMs)
+      for (const file of remaining) {
         if (totalBytes <= maxTotalBytes) break
         if (protectedIds.has(file.taskId) || recentTaskIds.has(file.taskId)) {
           keptFiles += 1

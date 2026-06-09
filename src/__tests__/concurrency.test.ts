@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
 import { OutputStore } from "../scheduler/output-store.js"
+import { EventLog } from "../scheduler/event-log.js"
 import { LockManager } from "../scheduler/lock-manager.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, ScheduledTask, TaskRunner } from "../scheduler/types.js"
 import { mkdtempSync } from "fs"
@@ -78,7 +79,7 @@ describe("Concurrency Tests", () => {
     it("multiple tiny tasks from different agents all run_now concurrently", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p1"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")) })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")), eventLog: new EventLog(join(tmpDir, "events-o1")) })
 
       const results: { action: string }[] = []
       for (let i = 0; i < 20; i++) {
@@ -96,7 +97,7 @@ describe("Concurrency Tests", () => {
     it("multiple large tasks serialize correctly with concurrent calls", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p2"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), maxLargeRunning: 1, maxTotalRunning: 4 })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxLargeRunning: 1, maxTotalRunning: 4 })
 
       const results: { action: string; taskId?: string }[] = []
       for (let i = 0; i < 10; i++) {

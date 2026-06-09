@@ -80,7 +80,7 @@ describe("Stress Tests", () => {
     it("schedules 500 tiny tasks without error", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o")), maxQueueSize: 200, maxTotalRunning: 50 })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o")), eventLog: new EventLog(join(tmpDir, "events-o")), maxQueueSize: 200, maxTotalRunning: 50 })
 
       for (let i = 0; i < 500; i++) {
         const d = s.schedule(makeRequest({
@@ -98,7 +98,7 @@ describe("Stress Tests", () => {
     it("schedules 100 large tasks and processes queue correctly", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "p2"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), maxQueueSize: 100, maxTotalRunning: 4, maxLargeRunning: 1 })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxQueueSize: 100, maxTotalRunning: 4, maxLargeRunning: 1 })
 
       const decisions: { action: string; taskId?: string }[] = []
       for (let i = 0; i < 100; i++) {
@@ -135,7 +135,7 @@ describe("Stress Tests", () => {
     it("rejects tasks when queue is full, then accepts after drain", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "p3"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), maxQueueSize: 3, maxTotalRunning: 2, maxLargeRunning: 1 })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), eventLog: new EventLog(join(tmpDir, "events-o3")), maxQueueSize: 3, maxTotalRunning: 2, maxLargeRunning: 1 })
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a0") }))
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
@@ -321,7 +321,7 @@ describe("Stress Tests", () => {
 
       const persistence = new PersistenceStore(join(tmpDir, "mem"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "mem-o")), maxQueueSize: 200, maxTotalRunning: 50 })
+      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "mem-o")), eventLog: new EventLog(join(tmpDir, "events-mem")), maxQueueSize: 200, maxTotalRunning: 50 })
 
       for (let cycle = 0; cycle < 5; cycle++) {
         const ids: string[] = []

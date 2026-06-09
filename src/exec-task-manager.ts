@@ -192,9 +192,17 @@ export class ExecTaskManager {
     }
   }
 
-  private trimBuffer(task: ExecTask, field: "stdout" | "stderr"): void {
-    if (task[field].length > this.maxOutputBuffer) {
-      task[field] = task[field].slice(-this.maxOutputBuffer)
+  private trimChunks(chunks: Buffer[]): void {
+    let totalSize = 0
+    for (const chunk of chunks) {
+      totalSize += chunk.length
+    }
+    while (totalSize > this.maxOutputBuffer && chunks.length > 1) {
+      const removed = chunks.shift()!
+      totalSize -= removed.length
+    }
+    if (totalSize > this.maxOutputBuffer && chunks.length === 1) {
+      chunks[0] = chunks[0].slice(chunks[0].length - this.maxOutputBuffer)
     }
   }
 
@@ -259,6 +267,17 @@ export class ExecTaskManager {
     this.tasks.set(id, entry)
     this.saveTask(entry, true)
 
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    let chunksFlushed = false
+
+    const flushChunks = () => {
+      if (chunksFlushed) return
+      chunksFlushed = true
+      task.stdout = Buffer.concat(stdoutChunks).toString("utf8")
+      task.stderr = Buffer.concat(stderrChunks).toString("utf8")
+    }
+
     const promise = new Promise<ExecResult>((resolve, reject) => {
       // 对于后台任务，先保持简单，我们先不用复杂的 nohup 包装，避免转义问题
       // 保持原来的简单逻辑：echo SSH_TOOL_PID，然后执行命令
@@ -267,6 +286,7 @@ export class ExecTaskManager {
 
       client.exec(wrappedCommand, (err, stream) => {
         if (err) {
+          flushChunks()
           this.finishTask(id, "failed", 1, undefined, err.message)
           reject(new Error(`Failed to exec: ${err.message}`))
           return
@@ -290,19 +310,19 @@ export class ExecTaskManager {
                 if (persistImmediate) this.saveTask(entry, true)
                 const remaining = firstLine.slice(firstLine.indexOf("\n") + 1) + text.slice(firstLine.length)
                 if (remaining) {
-                  task.stdout += remaining
-                  this.trimBuffer(task, "stdout")
+                  stdoutChunks.push(Buffer.from(remaining))
+                  this.trimChunks(stdoutChunks)
                 }
               } else {
                 pidCaptured = true
-                task.stdout += firstLine
-                this.trimBuffer(task, "stdout")
+                stdoutChunks.push(Buffer.from(firstLine))
+                this.trimChunks(stdoutChunks)
               }
               firstLine = ""
             }
           } else {
-            task.stdout += text
-            this.trimBuffer(task, "stdout")
+            stdoutChunks.push(data)
+            this.trimChunks(stdoutChunks)
           }
           task.updatedAt = Date.now()
           this.saveTask(entry, false)
@@ -322,21 +342,22 @@ export class ExecTaskManager {
               pidCaptured = true
               const remaining = text.replace(/SSH_TOOL_(NOHUP_)?PID:\d+\n?/g, "")
               if (remaining) {
-                task.stderr += remaining
-                this.trimBuffer(task, "stderr")
+                stderrChunks.push(Buffer.from(remaining))
+                this.trimChunks(stderrChunks)
               }
               task.updatedAt = Date.now()
               if (persistImmediate) this.saveTask(entry, true)
               return
             }
           }
-          task.stderr += text
-          this.trimBuffer(task, "stderr")
+          stderrChunks.push(data)
+          this.trimChunks(stderrChunks)
           task.updatedAt = Date.now()
           this.saveTask(entry, false)
         })
 
         stream.on("close", (code?: number, signal?: string) => {
+          flushChunks()
           const status = code === 0 ? "completed" : "failed"
           this.finishTask(id, status, code ?? 0, signal ?? undefined)
           resolve({
@@ -348,6 +369,7 @@ export class ExecTaskManager {
         })
 
         stream.on("error", (streamErr: Error) => {
+          flushChunks()
           this.finishTask(id, "failed", 1, undefined, streamErr.message)
           reject(new Error(`Stream error: ${streamErr.message}`))
         })
@@ -366,6 +388,7 @@ export class ExecTaskManager {
                   currentTask.stream.close()
                 } catch {}
               }
+              flushChunks()
               this.finishTask(id, "timeout", 124, "TERM")
               reject(new Error(`Command timed out after ${options.timeout}ms`))
             }

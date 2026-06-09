@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
 import { DEFAULT_OUTPUT_RETURN_LIMIT, OutputStore } from "../scheduler/output-store.js"
+import { EventLog } from "../scheduler/event-log.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, ScheduledTask, TaskRunner } from "../scheduler/types.js"
 import { mkdtempSync, rmSync } from "fs"
 import { join } from "path"
@@ -105,7 +106,7 @@ describe("SchedulerService", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "sched-test-"))
     persistence = new PersistenceStore(tmpDir)
     runner = new FakeRunner()
-    scheduler = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "outputs")), maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 })
+    scheduler = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "outputs")), eventLog: new EventLog(join(tmpDir, "events")), maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 })
   })
 
   it("large blocks large", () => {
@@ -167,7 +168,7 @@ describe("SchedulerService", () => {
     const sTmpDir = mkdtempSync(join(tmpdir(), "sched-maxq-"))
     const sPersistence = new PersistenceStore(sTmpDir)
     const sRunner = new FakeRunner()
-    const s = new SchedulerService({ persistence: sPersistence, runner: sRunner, outputStore: new OutputStore(join(sTmpDir, "outputs")), maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 })
+    const s = new SchedulerService({ persistence: sPersistence, runner: sRunner, outputStore: new OutputStore(join(sTmpDir, "outputs")), eventLog: new EventLog(join(sTmpDir, "events")), maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 })
 
     s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
@@ -291,7 +292,7 @@ describe("SchedulerService", () => {
 
   it("foreground-style output includes truncation metadata", async () => {
     const outputStore = new OutputStore(join(tmpDir, "outputs"))
-    const s = new SchedulerService({ persistence, runner, outputStore, outputCleanupThrottleMs: 0 })
+    const s = new SchedulerService({ persistence, runner, outputStore, eventLog: new EventLog(join(tmpDir, "events-truncation")), outputCleanupThrottleMs: 0 })
     const d = s.schedule(makeRequest({ command: "echo lots" }))
     runner.finish(d.taskId!, { code: 0, stdout: "x".repeat(40 * 1024), stderr: "" })
     await new Promise(r => setTimeout(r, 10))
@@ -306,7 +307,7 @@ describe("SchedulerService", () => {
   it("foreground streaming output is not duplicated by aggregated runner result", async () => {
     const streamingRunner = new StreamingRunner()
     const outputStore = new OutputStore(join(tmpDir, "streaming-outputs"))
-    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore })
+    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-streaming")) })
     const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     assert.equal(d.action, "run_now")
 
@@ -327,7 +328,7 @@ describe("SchedulerService", () => {
   it("foreground streaming only suppresses the streams that were actually streamed", async () => {
     const streamingRunner = new StreamingRunner([{ stdout: "streamed-stdout\n", stderr: "" }])
     const outputStore = new OutputStore(join(tmpDir, "partial-streaming-outputs"))
-    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore })
+    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-partial-streaming")) })
     const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     assert.equal(d.action, "run_now")
 

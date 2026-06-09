@@ -40,24 +40,22 @@ function parseLine(line: string): { key: string; value: string } | null {
 
 function parseContent(content: string, baseDir: string): SSHConfigHostEntry[] {
   const entries: SSHConfigHostEntry[] = []
-  let current: SSHConfigHostEntry | null = null
+  let currentGroup: SSHConfigHostEntry[] | null = null
 
   for (const line of content.split(/\r?\n/)) {
     const parsed = parseLine(line)
     if (!parsed) continue
     const { key, value } = parsed
 
-    if (key === "Host") {
+    if (key === "host") {
       // Multiple patterns on one line: Host web1 web2 *.corp.com
       const patterns = value.split(/\s+/).filter(Boolean)
-      for (const pattern of patterns) {
-        current = { hostPattern: pattern }
-        entries.push(current)
-      }
+      currentGroup = patterns.map(pattern => ({ hostPattern: pattern }))
+      entries.push(...currentGroup)
       continue
     }
 
-    if (key === "Include") {
+    if (key === "include") {
       // Include can be relative to ~/.ssh or absolute
       const includePath = value.startsWith("/") || value.match(/^[A-Z]:\\/i)
         ? value
@@ -74,31 +72,35 @@ function parseContent(content: string, baseDir: string): SSHConfigHostEntry[] {
       continue
     }
 
-    if (!current) continue
+    if (!currentGroup || currentGroup.length === 0) continue
 
     switch (key) {
       case "hostname":
-        current.hostName = value
+        for (const c of currentGroup) c.hostName = value
         break
       case "user":
-        current.user = value
+        for (const c of currentGroup) c.user = value
         break
       case "port":
-        current.port = parseInt(value, 10)
+        for (const c of currentGroup) c.port = parseInt(value, 10)
         break
       case "identityfile":
-        current.identityFile = current.identityFile ?? []
-        current.identityFile.push(value)
+        for (const c of currentGroup) {
+          c.identityFile = c.identityFile ?? []
+          c.identityFile.push(value)
+        }
         break
       case "proxyjump":
         // ProxyJump can be comma-separated: jump1,jump2
-        current.proxyJump = value.split(",").map(s => s.trim()).filter(Boolean)
+        for (const c of currentGroup) {
+          c.proxyJump = value.split(",").map(s => s.trim()).filter(Boolean)
+        }
         break
       case "forwardagent":
-        current.forwardAgent = value.toLowerCase() === "yes"
+        for (const c of currentGroup) c.forwardAgent = value.toLowerCase() === "yes"
         break
       case "identityagent":
-        current.identityAgent = value
+        for (const c of currentGroup) c.identityAgent = value
         break
     }
   }

@@ -1,5 +1,6 @@
 
 import { existsSync, mkdirSync, appendFileSync, readFileSync } from "fs"
+import { openSync, readSync, closeSync, fstatSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 import type { SchedulerEvent, EventType } from "./types.js"
@@ -57,25 +58,57 @@ export class EventLog {
   }
 
   getRecent(limit = 100, hostId?: string): SchedulerEvent[] {
-    const events: SchedulerEvent[] = []
     try {
-      const content = readFileSync(this.currentFile, "utf8")
-      const lines = content.trim().split("\n").reverse()
-      for (const line of lines) {
-        if (events.length >= limit) break
-        if (!line.trim()) continue
-        try {
-          const event = JSON.parse(line) as SchedulerEvent
-          if (!hostId || event.hostId === hostId) {
-            events.push(event)
+      const TAIL_CHUNK = 64 * 1024
+      const fd = openSync(this.currentFile, "r")
+      try {
+        const stats = fstatSync(fd)
+        const fileSize = stats.size
+        if (fileSize === 0) return []
+        const readSize = Math.min(TAIL_CHUNK, fileSize)
+        const buffer = Buffer.alloc(readSize)
+        readSync(fd, buffer, 0, readSize, fileSize - readSize)
+        const chunk = buffer.toString("utf8")
+        const events: SchedulerEvent[] = []
+        const lines = chunk.split("\n")
+        const startIdx = fileSize > readSize ? 1 : 0
+        for (let i = lines.length - 1; i >= startIdx; i--) {
+          if (events.length >= limit) break
+          const line = lines[i].trim()
+          if (!line) continue
+          try {
+            const event = JSON.parse(line) as SchedulerEvent
+            if (!hostId || event.hostId === hostId) {
+              events.push(event)
+            }
+          } catch {
+            continue
           }
-        } catch {
-          continue
         }
+        if (events.length < limit && fileSize > readSize) {
+          const fullContent = readFileSync(this.currentFile, "utf8")
+          const allLines = fullContent.trim().split("\n").reverse()
+          const fallback: SchedulerEvent[] = []
+          for (const line of allLines) {
+            if (fallback.length >= limit) break
+            if (!line.trim()) continue
+            try {
+              const event = JSON.parse(line) as SchedulerEvent
+              if (!hostId || event.hostId === hostId) {
+                fallback.push(event)
+              }
+            } catch {
+              continue
+            }
+          }
+          return fallback
+        }
+        return events
+      } finally {
+        closeSync(fd)
       }
     } catch {
-      // ignore
+      return []
     }
-    return events
   }
 }
