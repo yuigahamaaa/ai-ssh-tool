@@ -1114,6 +1114,13 @@ export class SSHDaemon {
       env,
     })
     child.unref()
+    // P2-7: without an 'error' handler, a failed spawn (e.g. ENOENT on
+    // process.execPath) would emit an unhandled 'error' event and Node
+    // would crash the daemon — exactly the failure mode the restart
+    // is supposed to recover from.
+    child.once("error", (err) => {
+      log("daemon", `Replacement daemon spawn failed: ${err.message}`)
+    })
     log("daemon", `Spawned replacement daemon pid=${child.pid ?? "unknown"}`)
   }
 }

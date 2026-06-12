@@ -10,6 +10,19 @@ import { join } from "path"
 import { homedir } from "os"
 
 /**
+ * Debug logger for malformed-frame diagnostics. We intentionally avoid
+ * importing the project's debug-aware logger to keep the parser free of
+ * side-effects that complicate unit tests. The output is gated by the
+ * SSH_TOOL_DEBUG env var (matching the rest of the project).
+ */
+function debugLog(channel: string, message: string): void {
+  if (process.env.SSH_TOOL_DEBUG === "1" || process.env.SSH_TOOL_DEBUG === "true") {
+    // eslint-disable-next-line no-console
+    console.error(`[${channel}] ${message}`)
+  }
+}
+
+/**
  * Get user data directory with cross-platform support.
  */
 function getUserDataDir(): string {
@@ -89,8 +102,11 @@ export function parseMessages(
     if (line.trim()) {
       try {
         onMessage(JSON.parse(line))
-      } catch {
-        // skip malformed lines
+      } catch (e) {
+        // P2-7: log malformed IPC lines so debugging a corrupt client
+        // or a partial frame is possible. The line is dropped (we can't
+        // recover), but we record what it was.
+        debugLog("ipc", `Skipped malformed IPC line (${(e as Error).message}): ${line.slice(0, 256)}`)
       }
     }
   }
@@ -244,8 +260,11 @@ export class IPCMessageParser {
     if (!line) return
     try {
       onMessage(JSON.parse(line))
-    } catch {
-      // skip malformed lines
+    } catch (e) {
+      // P2-7: same as the legacy split() path — log the malformed
+      // frame so the daemon can tell the operator why a request was
+      // dropped without a response.
+      debugLog("ipc", `Skipped malformed IPC frame (${(e as Error).message}): ${line.slice(0, 256)}`)
     }
   }
 
