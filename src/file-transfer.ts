@@ -345,7 +345,7 @@ export async function uploadFile(
       try {
         const readStream = createReadStream(localPath)
         let transformStream: Transform | null = null
-        
+
         if (options?.lineEnding || options?.encoding) {
           transformStream = new FileTransformStream({
             lineEnding: options.lineEnding,
@@ -358,7 +358,7 @@ export async function uploadFile(
         })
 
         let transferred = 0
-        
+
         // Track progress
         readStream.on("data", (chunk: string | Buffer) => {
           transferred += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length
@@ -372,13 +372,12 @@ export async function uploadFile(
           }
         })
 
-                if (transformStream) {
+        if (transformStream) {
           await pipelineAsync(readStream, transformStream, writeStream)
         } else {
           await pipelineAsync(readStream, writeStream)
         }
 
-        sftp.end()
         const duration = Date.now() - startTime
         log("transfer", `Upload (streaming) complete: ${localPath} -> ${finalRemotePath} (${totalSize} bytes, ${duration}ms)`)
         resolve({
@@ -388,8 +387,11 @@ export async function uploadFile(
           duration,
         })
       } catch (pipelineErr: any) {
-        sftp.end()
         reject(new Error(`Upload failed for ${localPath}: ${pipelineErr.message}`))
+      } finally {
+        // Always release the SFTP channel, even on success/error paths.
+        // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
+        try { sftp.end() } catch { /* best-effort cleanup */ }
       }
     })
   })
@@ -439,21 +441,27 @@ async function uploadFileDirect(
         mode: options?.mode ?? statInfo.mode,
       })
 
+      let settled = false
+      const finishOnce = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        try { sftp.end() } catch { /* best-effort cleanup */ }
+        fn()
+      }
+
       writeStream.on("error", (streamErr: Error) => {
-        sftp.end()
-        reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`))
+        finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
       })
 
       writeStream.on("close", () => {
-        sftp.end()
         const duration = Date.now() - startTime
         log("transfer", `Upload (direct) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
-        resolve({
+        finishOnce(() => resolve({
           success: true,
           path: remotePath,
           size: totalSize,
           duration,
-        })
+        }))
       })
 
       writeStream.end(data)
@@ -528,12 +536,11 @@ export async function downloadFile(
 
         const totalSize = Number(stats.size)
         const remoteMode = stats.mode ? ((stats.mode as number) & 0o777) : 0o644
-        
+
         if (options?.skipSymlinks) {
           const isSymlink = await remoteIsSymlink(client, remotePath)
           if (isSymlink) {
             log("transfer", `Skipping symbolic link: ${remotePath}`)
-            sftp.end()
             return resolve({
               success: true,
               path: localPath,
@@ -542,42 +549,41 @@ export async function downloadFile(
             })
           }
         }
-        
+
         const shouldUseStreaming = totalSize > fileSizeThreshold
 
         if (!shouldUseStreaming) {
           // Direct download for small files
           const chunks: Buffer[] = []
           const readStream = sftp.createReadStream(remotePath)
-          
+
           await new Promise<void>((resolve, reject) => {
             readStream.on("data", (chunk: Buffer) => chunks.push(chunk))
             readStream.on("close", resolve)
             readStream.on("error", reject)
           })
-          
+
           let data: Buffer<ArrayBufferLike> = Buffer.concat(chunks)
-          
+
           if (options?.lineEnding || options?.encoding) {
             let lineEnding = options.lineEnding ?? "auto"
             let encoding = options.encoding ?? "auto"
-            
+
             if (lineEnding === "auto") {
               lineEnding = process.platform === "win32" ? "crlf" : "lf"
             }
-            
+
             if (encoding !== "auto") {
               data = convertEncoding(data, "utf-8", encoding)
             }
-            
+
             if (lineEnding !== "binary") {
               data = convertLineEndings(data, detectLineEnding(data), lineEnding)
             }
           }
-          
+
           writeFileSync(localPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
-          
-          sftp.end()
+
           const duration = Date.now() - startTime
           log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
           return resolve({
@@ -591,7 +597,7 @@ export async function downloadFile(
         // Streaming download with pipeline for large files
         const readStream = sftp.createReadStream(remotePath)
         let transformStream: Transform | null = null
-        
+
         if (options?.lineEnding || options?.encoding) {
           transformStream = new FileTransformStream({
             lineEnding: options.lineEnding,
@@ -604,7 +610,7 @@ export async function downloadFile(
         })
 
         let transferred = 0
-        
+
         // Track progress
         readStream.on("data", (chunk: string | Buffer) => {
           transferred += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length
@@ -618,13 +624,12 @@ export async function downloadFile(
           }
         })
 
-                if (transformStream) {
+        if (transformStream) {
           await pipelineAsync(readStream, transformStream, writeStream)
         } else {
           await pipelineAsync(readStream, writeStream)
         }
 
-        sftp.end()
         const duration = Date.now() - startTime
         log("transfer", `Download (streaming) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
         resolve({
@@ -634,8 +639,11 @@ export async function downloadFile(
           duration,
         })
       } catch (error: any) {
-        sftp.end()
         reject(new Error(`Download failed: ${error.message}`))
+      } finally {
+        // Always release the SFTP channel, even on success/error paths.
+        // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
+        try { sftp.end() } catch { /* best-effort cleanup */ }
       }
     })
   })
