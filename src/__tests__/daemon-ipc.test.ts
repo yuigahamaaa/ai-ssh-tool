@@ -293,6 +293,36 @@ describe("Daemon IPC Tests", () => {
       assert.equal(received.length, 1)
       assert.equal(received[0].id, "fresh")
     })
+
+    it("daemon socket handler catches parser throw and destroys the socket", () => {
+      // Simulate the daemon-side socket data handler logic: when parser.push
+      // throws (over-limit), we send an error response and destroy the socket.
+      const parser = new IPCMessageParser(50)
+      let socketDestroyed = false
+      let errorWritten = false
+      const mockSocket = {
+        write: (data: string) => {
+          const parsed = JSON.parse(data.trim())
+          errorWritten = true
+          assert.equal(parsed.ok, false)
+          assert.ok(parsed.error.includes("exceeded max size"))
+          assert.equal(parsed.id, "max-remainder")
+        },
+        destroy: () => { socketDestroyed = true },
+      } as unknown as { write: (s: string) => void; destroy: () => void }
+
+      try {
+        parser.push(Buffer.from("x".repeat(80)), () => {})
+      } catch (err: any) {
+        // Simulate daemon-side handler: write error + destroy
+        const errorResp: IPCResponse = { id: "max-remainder", ok: false, error: err.message }
+        mockSocket.write(encodeMessage(errorResp))
+        mockSocket.destroy()
+      }
+
+      assert.equal(socketDestroyed, true, "socket should be destroyed")
+      assert.equal(errorWritten, true, "error response should be written")
+    })
   });
 
   describe("normalizeConfig", () => {

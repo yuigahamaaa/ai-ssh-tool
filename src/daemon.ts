@@ -389,16 +389,29 @@ export class SSHDaemon {
     const parser = new IPCMessageParser()
 
     socket.on("data", (data) => {
-      parser.push(data, (msg) => {
-        this.handleRequest(socket, msg as IPCRequest).catch((err) => {
-          const resp: IPCResponse = {
-            id: (msg as IPCRequest).id,
-            ok: false,
-            error: err.message,
-          }
-          socket.write(encodeMessage(resp))
+      try {
+        parser.push(data, (msg) => {
+          this.handleRequest(socket, msg as IPCRequest).catch((err) => {
+            const resp: IPCResponse = {
+              id: (msg as IPCRequest).id,
+              ok: false,
+              error: err.message,
+            }
+            socket.write(encodeMessage(resp))
+          })
         })
-      })
+      } catch (err: any) {
+        // maxRemainderBytes limit exceeded or other parse error.
+        // Send an error response so the client knows why the socket is closing,
+        // then destroy the socket to prevent further malformed input.
+        const errorResp: IPCResponse = {
+          id: "max-remainder",
+          ok: false,
+          error: err.message,
+        }
+        socket.write(encodeMessage(errorResp))
+        socket.destroy()
+      }
     })
 
     socket.on("error", () => {
