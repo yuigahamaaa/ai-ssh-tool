@@ -34,14 +34,77 @@ interface ActiveLocalForward {
 
 interface ActiveRemoteForward {
   forward: PortForward
+  routeKey: string            // key into remoteRoutes for cleanup on stop
+}
+
+interface RemoteRoute {
+  forwardId: string
+  localDstAddr: string
+  localDstPort: number
+  forward: PortForward
 }
 
 export class PortForwardManager {
   private forwards = new Map<string, ActiveLocalForward | ActiveRemoteForward>()
   private client: Client
+  // Single dispatcher for "tcp connection" events — keyed by `${dstIP}:${dstPort}`.
+  // Replaces the previous per-forward listener model which leaked listeners on
+  // stop and caused multiple forwards to interfere with each other.
+  private remoteRoutes = new Map<string, RemoteRoute>()
+  private tcpConnectionBound = false
 
   constructor(client: Client) {
     this.client = client
+  }
+
+  /** Ensure the single "tcp connection" dispatcher is installed on the client. */
+  private bindTcpConnection(): void {
+    if (this.tcpConnectionBound) return
+    this.tcpConnectionBound = true
+
+    this.client.on("tcp connection", (details, accept, rejectConn) => {
+      const key = `${details.dstIP}:${details.dstPort}`
+      const route = this.remoteRoutes.get(key)
+      if (!route) {
+        rejectConn()
+        return
+      }
+
+      route.forward.connections++
+      log("fwd", `[${route.forwardId}] Incoming remote connection (total: ${route.forward.connections})`)
+
+      const stream = accept()
+      const net = require("net") as typeof import("net")
+      const localSocket = net.createConnection(route.localDstPort, route.localDstAddr)
+
+      localSocket.on("connect", () => {
+        stream.pipe(localSocket)
+        localSocket.pipe(stream)
+      })
+
+      localSocket.on("error", (socketErr: Error) => {
+        log("fwd", `[${route.forwardId}] Local connection error: ${socketErr.message}`)
+        try { stream.close() } catch {}
+      })
+
+      stream.on("error", (streamErr: Error) => {
+        log("fwd", `[${route.forwardId}] Stream error: ${streamErr.message}`)
+        localSocket.destroy()
+      })
+
+      stream.on("close", () => {
+        route.forward.connections--
+        localSocket.destroy()
+      })
+    })
+  }
+
+  /** Remove the dispatcher when no remote forwards remain. */
+  private unbindTcpConnection(): void {
+    if (this.tcpConnectionBound && this.remoteRoutes.size === 0) {
+      this.client.removeAllListeners("tcp connection")
+      this.tcpConnectionBound = false
+    }
   }
 
   /**
@@ -87,9 +150,19 @@ export class PortForwardManager {
           socket.pipe(stream)
           stream.pipe(socket)
 
+          socket.on("error", (socketErr: Error) => {
+            log("fwd", `[${id}] Socket error: ${socketErr.message}`)
+            try { stream.close() } catch {}
+          })
+
+          stream.on("error", (streamErr: Error) => {
+            log("fwd", `[${id}] Stream error: ${streamErr.message}`)
+            socket.destroy()
+          })
+
           socket.on("close", () => {
             forward.connections--
-            stream.close()
+            try { stream.close() } catch {}
             log("fwd", `[${id}] Connection closed (remaining: ${forward.connections})`)
           })
 
@@ -152,35 +225,11 @@ export class PortForwardManager {
 
         log("fwd", `[${id}] Remote forward registered: ${remoteBindAddr}:${remoteBindPort} -> ${localDstAddr}:${localDstPort}`)
 
-        this.client.on("tcp connection", (details, accept, rejectConn) => {
-          if (details.dstPort === remoteBindPort && details.dstIP === remoteBindAddr) {
-            forward.connections++
-            log("fwd", `[${id}] Incoming remote connection (total: ${forward.connections})`)
+        const routeKey = `${remoteBindAddr}:${remoteBindPort}`
+        this.remoteRoutes.set(routeKey, { forwardId: id, localDstAddr, localDstPort, forward })
+        this.bindTcpConnection()
 
-            const stream = accept()
-            const net = require("net") as typeof import("net")
-            const localSocket = net.createConnection(localDstPort, localDstAddr)
-
-            localSocket.on("connect", () => {
-              stream.pipe(localSocket)
-              localSocket.pipe(stream)
-            })
-
-            localSocket.on("error", (socketErr: Error) => {
-              log("fwd", `[${id}] Local connection error: ${socketErr.message}`)
-              stream.close()
-            })
-
-            stream.on("close", () => {
-              forward.connections--
-              localSocket.destroy()
-            })
-          } else {
-            rejectConn()
-          }
-        })
-
-        this.forwards.set(id, { forward })
+        this.forwards.set(id, { forward, routeKey })
         resolve(forward)
       })
     })
@@ -199,7 +248,12 @@ export class PortForwardManager {
         server.close(() => resolve())
       })
     } else {
+      const remoteEntry = entry as ActiveRemoteForward
       this.client.unforwardIn(entry.forward.bindAddr, entry.forward.bindPort, () => {})
+      if (remoteEntry.routeKey) {
+        this.remoteRoutes.delete(remoteEntry.routeKey)
+        this.unbindTcpConnection()
+      }
     }
 
     entry.forward.status = "stopped"

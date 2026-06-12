@@ -11,7 +11,7 @@
 import type { Client, ClientChannel } from "ssh2"
 import { randomUUID } from "crypto"
 import { join } from "path"
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, renameSync } from "fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync } from "fs"
 import { homedir } from "os"
 import { log } from "./logger.js"
 
@@ -54,6 +54,10 @@ export interface RunningTaskEntry {
   task: ExecTask
   client: Client
   persistImmediate: boolean // true for background tasks, false for regular exec
+  stdoutChunks: Buffer[]    // live output buffers, promoted from closure for runtime reads
+  stderrChunks: Buffer[]    // live error buffers, promoted from closure for runtime reads
+  chunksFlushed: boolean    // prevents double-flush on close + timeout
+  lastPersistAt: number     // per-task throttle, prevents multi-task interference
 }
 
 function getTaskStorageDir(): string {
@@ -79,11 +83,9 @@ function getHostIdentifier(client: Client): string {
 export class ExecTaskManager {
   private tasks = new Map<string, RunningTaskEntry>()
   private maxOutputBuffer = 10 * 1024 * 1024
-  private lastPersistAt: number = 0
   private lastCleanupAt: number = 0
   private PERSIST_INTERVAL = 1000
   private CLEANUP_INTERVAL = 5 * 60 * 1000
-  private CLEANUP_THRESHOLD = 20
   private TASK_RETENTION_MS = 24 * 60 * 60 * 1000
 
   constructor() {
@@ -93,20 +95,9 @@ export class ExecTaskManager {
 
   private maybeCleanup(): void {
     const now = Date.now()
-    const taskCount = this.tasks.size + this.countDiskTasks()
-    if (now - this.lastCleanupAt > this.CLEANUP_INTERVAL || taskCount > this.CLEANUP_THRESHOLD) {
+    if (now - this.lastCleanupAt > this.CLEANUP_INTERVAL) {
       this.cleanupOldTasks()
       this.lastCleanupAt = now
-    }
-  }
-
-  private countDiskTasks(): number {
-    try {
-      const storageDir = getTaskStorageDir()
-      if (!existsSync(storageDir)) return 0
-      return readdirSync(storageDir).filter(f => f.endsWith(".json")).length
-    } catch {
-      return 0
     }
   }
 
@@ -144,7 +135,6 @@ export class ExecTaskManager {
       if (!file.endsWith(".json")) continue
       const taskPath = join(storageDir, file)
       try {
-        const stat = statSync(taskPath)
         const content = readFileSync(taskPath, "utf8")
         const task = JSON.parse(content) as ExecTask
         const shouldRemove = (task.finishedAt && (now - task.finishedAt > this.TASK_RETENTION_MS)) ||
@@ -164,7 +154,7 @@ export class ExecTaskManager {
   private saveTask(entry: RunningTaskEntry, immediate: boolean): void {
     if (!immediate) {
       const now = Date.now()
-      if (now - this.lastPersistAt < this.PERSIST_INTERVAL) {
+      if (now - entry.lastPersistAt < this.PERSIST_INTERVAL) {
         return
       }
     }
@@ -172,9 +162,11 @@ export class ExecTaskManager {
     const taskPath = getTaskFilePath(entry.task.id)
     const tempPath = `${taskPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     try {
-      writeFileSync(tempPath, JSON.stringify(entry.task, null, 2), { mode: 0o600 })
+      // Machine-read: no indentation. Each task can be up to ~10MB
+      // (maxOutputBuffer), so saving ~30% on every state transition matters.
+      writeFileSync(tempPath, JSON.stringify(entry.task), { mode: 0o600 })
       renameSync(tempPath, taskPath)
-      this.lastPersistAt = Date.now()
+      entry.lastPersistAt = Date.now()
     } catch (err) {
       log("exec-task", `Failed to save task ${entry.task.id}: ${err}`)
       try { unlinkSync(tempPath) } catch {}
@@ -257,23 +249,27 @@ export class ExecTaskManager {
       cwd: options?.cwd,
     }
 
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+
     const entry: RunningTaskEntry = {
       stream: null as any,
       task,
       client,
       persistImmediate,
+      stdoutChunks,
+      stderrChunks,
+      chunksFlushed: false,
+      lastPersistAt: 0,
     }
 
     this.tasks.set(id, entry)
     this.saveTask(entry, true)
 
-    const stdoutChunks: Buffer[] = []
-    const stderrChunks: Buffer[] = []
-    let chunksFlushed = false
 
     const flushChunks = () => {
-      if (chunksFlushed) return
-      chunksFlushed = true
+      if (entry.chunksFlushed) return
+      entry.chunksFlushed = true
       task.stdout = Buffer.concat(stdoutChunks).toString("utf8")
       task.stderr = Buffer.concat(stderrChunks).toString("utf8")
     }
@@ -300,6 +296,14 @@ export class ExecTaskManager {
           const text = data.toString()
           if (!pidCaptured) {
             firstLine += text
+            // Cap firstLine at 4KB — if PID hasn't appeared by then, the command
+            // likely doesn't echo PID to stdout (it's echoed to stderr via >&2).
+            if (firstLine.length > 4096) {
+              pidCaptured = true
+              stdoutChunks.push(Buffer.from(firstLine))
+              this.trimChunks(stdoutChunks)
+              firstLine = ""
+            } else
             if (firstLine.includes("\n")) {
               const pidStr = firstLine.split("\n")[0].trim()
               const pid = parseInt(pidStr)
@@ -473,7 +477,13 @@ export class ExecTaskManager {
   getStatus(id: string): ExecTask | null {
     const entry = this.tasks.get(id)
     if (entry) {
-      return { ...entry.task }
+      // Return live output for running tasks (chunks are only flushed on close)
+      const snapshot = { ...entry.task }
+      if (snapshot.status === "running" && !entry.chunksFlushed) {
+        snapshot.stdout = Buffer.concat(entry.stdoutChunks).toString("utf8")
+        snapshot.stderr = Buffer.concat(entry.stderrChunks).toString("utf8")
+      }
+      return snapshot
     }
 
     const taskPath = getTaskFilePath(id)
@@ -489,7 +499,13 @@ export class ExecTaskManager {
   list(hostname?: string): ExecTask[] {
     this.maybeCleanup()
 
-    const tasks: ExecTask[] = []
+    // Merge disk-loaded tasks with in-memory tasks by id, then filter by
+    // hostname and sort. Using a Map for the merge keeps this O(n + m)
+    // (where n = disk files, m = in-memory) instead of the previous
+    // O(n * m) findIndex scan inside the inner loop. In-memory tasks win
+    // over disk snapshots of the same id, matching the original
+    // last-write-wins semantics.
+    const merged = new Map<string, ExecTask>()
     const storageDir = getTaskStorageDir()
 
     if (existsSync(storageDir)) {
@@ -501,28 +517,37 @@ export class ExecTaskManager {
           const content = readFileSync(taskPath, "utf8")
           const task = JSON.parse(content) as ExecTask
           if (!hostname || task.hostname === hostname) {
-            tasks.push(task)
+            merged.set(task.id, task)
           }
         } catch {}
       }
     }
 
-    for (const [id, entry] of this.tasks) {
-      const idx = tasks.findIndex(t => t.id === id)
-      if (idx >= 0) {
-        tasks[idx] = { ...entry.task }
-      } else if (!hostname || entry.task.hostname === hostname) {
-        tasks.push({ ...entry.task })
+    for (const [_id, entry] of this.tasks) {
+      if (!hostname || entry.task.hostname === hostname) {
+        // Include live output for running tasks (chunks only flushed on close)
+        const snapshot = { ...entry.task }
+        if (snapshot.status === "running" && !entry.chunksFlushed) {
+          snapshot.stdout = Buffer.concat(entry.stdoutChunks).toString("utf8")
+          snapshot.stderr = Buffer.concat(entry.stderrChunks).toString("utf8")
+        }
+        merged.set(_id, snapshot)
       }
     }
 
-    tasks.sort((a, b) => b.startedAt - a.startedAt)
-    return tasks
+    return Array.from(merged.values()).sort((a, b) => b.startedAt - a.startedAt)
   }
 
   getOutput(id: string): { stdout: string; stderr: string } | null {
     const entry = this.tasks.get(id)
     if (entry) {
+      // Return live output from chunks while task is running
+      if (!entry.chunksFlushed) {
+        return {
+          stdout: Buffer.concat(entry.stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(entry.stderrChunks).toString("utf8"),
+        }
+      }
       return { stdout: entry.task.stdout, stderr: entry.task.stderr }
     }
 

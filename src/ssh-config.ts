@@ -38,7 +38,9 @@ function parseLine(line: string): { key: string; value: string } | null {
   return { key, value }
 }
 
-function parseContent(content: string, baseDir: string): SSHConfigHostEntry[] {
+function parseContent(content: string, baseDir: string, visited?: Set<string>): SSHConfigHostEntry[] {
+  // Cycle detection for Include directives
+  if (!visited) visited = new Set()
   const entries: SSHConfigHostEntry[] = []
   let currentGroup: SSHConfigHostEntry[] | null = null
 
@@ -60,11 +62,14 @@ function parseContent(content: string, baseDir: string): SSHConfigHostEntry[] {
       const includePath = value.startsWith("/") || value.match(/^[A-Z]:\\/i)
         ? value
         : join(baseDir, value)
+      const resolvedPath = resolve(includePath)
+      if (visited.has(resolvedPath)) continue // skip circular include
+      visited.add(resolvedPath)
       try {
-        if (existsSync(includePath)) {
-          const includeContent = readFileSync(includePath, "utf-8")
-          const includeDir = resolve(includePath, "..")
-          entries.push(...parseContent(includeContent, includeDir))
+        if (existsSync(resolvedPath)) {
+          const includeContent = readFileSync(resolvedPath, "utf-8")
+          const includeDir = resolve(resolvedPath, "..")
+          entries.push(...parseContent(includeContent, includeDir, visited))
         }
       } catch {
         // ignore unreadable includes

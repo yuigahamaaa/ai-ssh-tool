@@ -235,6 +235,22 @@ describe("Daemon IPC Tests", () => {
       );
     });
 
+    it("reports the cumulative buffered size when incremental pushes exceed the limit", () => {
+      const parser = new IPCMessageParser(200);
+      parser.push(Buffer.from("a".repeat(100)), () => {});
+
+      let caught: Error | null = null;
+      try {
+        parser.push(Buffer.from("b".repeat(150)), () => {});
+      } catch (err) {
+        caught = err as Error;
+      }
+
+      assert.ok(caught, "expected an over-limit error on the second push");
+      assert.ok(caught!.message.includes("250 bytes"), "should report the cumulative buffered size");
+      assert.ok(caught!.message.includes("200 bytes limit"), "should report the configured limit");
+    });
+
     it("does not throw when pushes stay at or just under the limit", () => {
       const parser = new IPCMessageParser(200);
       // 200 bytes of data with no newline fits exactly at the cap

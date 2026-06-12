@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test"
+import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
@@ -71,16 +71,30 @@ class FastRunner implements TaskRunner {
 
 describe("Stress Tests", () => {
   let tmpDir: string
+  let schedulers: SchedulerService[]
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "stress-test-"))
+    schedulers = []
   })
+
+  afterEach(() => {
+    for (const scheduler of schedulers) {
+      scheduler.dispose()
+    }
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  function trackScheduler(scheduler: SchedulerService): SchedulerService {
+    schedulers.push(scheduler)
+    return scheduler
+  }
 
   describe("high throughput scheduling", () => {
     it("schedules 500 tiny tasks without error", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o")), eventLog: new EventLog(join(tmpDir, "events-o")), maxQueueSize: 200, maxTotalRunning: 50 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o")), eventLog: new EventLog(join(tmpDir, "events-o")), maxQueueSize: 200, maxTotalRunning: 50 }))
 
       for (let i = 0; i < 500; i++) {
         const d = s.schedule(makeRequest({
@@ -98,7 +112,7 @@ describe("Stress Tests", () => {
     it("schedules 100 large tasks and processes queue correctly", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "p2"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxQueueSize: 100, maxTotalRunning: 4, maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxQueueSize: 100, maxTotalRunning: 4, maxLargeRunning: 1 }))
 
       const decisions: { action: string; taskId?: string }[] = []
       for (let i = 0; i < 100; i++) {
@@ -135,7 +149,7 @@ describe("Stress Tests", () => {
     it("rejects tasks when queue is full, then accepts after drain", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "p3"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), eventLog: new EventLog(join(tmpDir, "events-o3")), maxQueueSize: 3, maxTotalRunning: 2, maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), eventLog: new EventLog(join(tmpDir, "events-o3")), maxQueueSize: 3, maxTotalRunning: 2, maxLargeRunning: 1 }))
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a0") }))
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
@@ -321,7 +335,7 @@ describe("Stress Tests", () => {
 
       const persistence = new PersistenceStore(join(tmpDir, "mem"))
       const runner = new FastRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "mem-o")), eventLog: new EventLog(join(tmpDir, "events-mem")), maxQueueSize: 200, maxTotalRunning: 50 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "mem-o")), eventLog: new EventLog(join(tmpDir, "events-mem")), maxQueueSize: 200, maxTotalRunning: 50 }))
 
       for (let cycle = 0; cycle < 5; cycle++) {
         const ids: string[] = []

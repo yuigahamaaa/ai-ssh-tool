@@ -105,7 +105,8 @@ export function parseMessages(
 const DEFAULT_MAX_REMAINDER_BYTES = 16 * 1024 * 1024 // 16MB
 
 export class IPCMessageParser {
-  private remainder = ""
+  private chunks: Buffer[] = []
+  private totalBytes = 0
   private maxRemainderBytes: number
 
   constructor(maxRemainderBytes?: number) {
@@ -113,40 +114,75 @@ export class IPCMessageParser {
   }
 
   get remainderLength(): number {
-    return Buffer.byteLength(this.remainder, "utf8")
+    return this.totalBytes
   }
 
   push(
     chunk: Buffer | string,
     onMessage: (msg: IPCRequest | IPCResponse) => void,
   ): void {
-    const text = this.remainder + chunk.toString()
-    const textSize = Buffer.byteLength(text, "utf8")
-    if (textSize > this.maxRemainderBytes) {
-      this.remainder = ""
+    const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk
+    this.totalBytes += buf.length
+    if (this.totalBytes > this.maxRemainderBytes) {
+      const actualBytes = this.totalBytes
+      this.chunks = []
+      this.totalBytes = 0
       throw new Error(
-        `IPC frame exceeded max size: ${textSize} bytes > ${this.maxRemainderBytes} bytes limit. ` +
+        `IPC frame exceeded max size: ${actualBytes} bytes > ${this.maxRemainderBytes} bytes limit. ` +
         `The remote peer is sending malformed data or an oversized message without a newline terminator. ` +
         `Suggestion: reconnect to the daemon and resend the request. ` +
         `If this recurs, check for corrupt JSON or extremely large command output that should be transferred via SFTP instead.`,
       )
     }
-    const lines = text.split("\n")
-    this.remainder = lines.pop() ?? ""
 
-    for (const line of lines) {
-      if (line.trim()) {
-        try {
-          onMessage(JSON.parse(line))
-        } catch {
-          // skip malformed lines
+    // Scan the new chunk for newline boundaries without full concat.
+    // Only Buffer.concat when we find at least one complete frame.
+    this.chunks.push(buf)
+
+    let hasNewline = false
+    for (let i = buf.length - 1; i >= 0; i--) {
+      if (buf[i] === 10) { // '\n'
+        hasNewline = true
+        break
+      }
+    }
+    // If no newline in this chunk, just accumulate — don't concat yet.
+    if (!hasNewline) return
+
+    const combined = Buffer.concat(this.chunks)
+    this.chunks = []
+    this.totalBytes = 0
+
+    // Split on newline (byte 10)
+    let start = 0
+    for (let i = 0; i < combined.length; i++) {
+      if (combined[i] === 10) {
+        const lineBuf = combined.subarray(start, i)
+        start = i + 1
+        if (lineBuf.length > 0) {
+          const line = lineBuf.toString("utf8").trim()
+          if (line) {
+            try {
+              onMessage(JSON.parse(line))
+            } catch {
+              // skip malformed lines
+            }
+          }
         }
       }
+    }
+
+    // Remaining bytes after the last newline become the new accumulator
+    if (start < combined.length) {
+      const remainder = combined.subarray(start)
+      this.chunks.push(remainder)
+      this.totalBytes = remainder.length
     }
   }
 
   reset(): void {
-    this.remainder = ""
+    this.chunks = []
+    this.totalBytes = 0
   }
 }
 

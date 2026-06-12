@@ -32,6 +32,7 @@ import {
   normalizeConfig,
 } from "./ipc-protocol.js"
 import { SchedulerService } from "./scheduler/scheduler-service.js"
+import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
 
 interface BackgroundTaskHandle {
@@ -48,6 +49,8 @@ interface DaemonSession {
 interface CachedConfig {
   hash: string
   mtime: number
+  content: string           // raw JSON string, avoids re-read on cache hit
+  parsed?: Record<string, unknown>  // pre-parsed config object, avoids double JSON.parse
 }
 
 function shellQuote(value: string): string {
@@ -145,6 +148,11 @@ export class SSHDaemon {
       maxSessions: 50,
     })
     this.scheduler = opts?.scheduler ?? new SchedulerService({
+      // Use batched persistence so a task's many state-transition writes
+      // (create → queue → start → finish) coalesce into ~1 disk write per
+      // 100ms quiet window instead of 6-8 synchronous writeFileSync calls
+      // hitting the event loop on every transition.
+      persistence: new BatchedPersistenceStore(new PersistenceStore()),
       runner: {
         start: async (task, onOutput) => {
           const conn = this.gateway.sessions.getConnection(task.sessionId)
@@ -548,12 +556,13 @@ export class SSHDaemon {
 
     if (cached && cached.mtime === statResult.mtimeMs) {
       configHash = cached.hash
-      configContent = readFileSync(configPath, "utf-8")
+      configContent = cached.content
     } else {
       configContent = readFileSync(configPath, "utf-8")
       const normalized = normalizeConfig(configContent)
       configHash = createHash("md5").update(normalized).digest("hex")
-      this.configCache.set(configPath, { hash: configHash, mtime: statResult.mtimeMs })
+      const parsed = JSON.parse(configContent)
+      this.configCache.set(configPath, { hash: configHash, mtime: statResult.mtimeMs, content: configContent, parsed })
     }
 
     const existing = this.sessionMap.get(configHash)
@@ -571,7 +580,8 @@ export class SSHDaemon {
     }
 
     // Parse config and connect
-    const config = JSON.parse(configContent)
+    const cachedEntry = this.configCache.get(configPath)
+    const config = cachedEntry?.parsed ?? JSON.parse(configContent)
     if (!config.target?.host || !config.target?.username) {
       return { id: req.id, ok: false, error: "Config must have target.host and target.username" }
     }

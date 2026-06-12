@@ -18,6 +18,7 @@ describe("VirtualCwdStore", () => {
   })
 
   afterEach(() => {
+    store.dispose()
     rmSync(tmpDir, { recursive: true, force: true })
   })
 
@@ -56,6 +57,7 @@ describe("VirtualCwdStore", () => {
     const freshStore = new VirtualCwdStore(freshPersistence)
 
     assert.equal(freshStore.resolve("agentA", "host1"), "/repo-a")
+    freshStore.dispose()
   })
 
   it("dispose() flushes pending writes synchronously", () => {
@@ -66,6 +68,7 @@ describe("VirtualCwdStore", () => {
     const freshPersistence = new PersistenceStore(tmpDir)
     const freshStore = new VirtualCwdStore(freshPersistence)
     assert.equal(freshStore.resolve("agentA", "host1"), "/repo-a")
+    freshStore.dispose()
   })
 
   it("coalesces multiple sets in the debounce window into one disk write", () => {

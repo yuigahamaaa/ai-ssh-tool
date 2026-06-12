@@ -45,10 +45,19 @@ function atomicWrite(filePath: string, data: string): void {
 }
 
 export class PersistenceStore {
+  /**
+   * The configured on-disk base directory. Public so that subclasses
+   * (notably `BatchedPersistenceStore`) can forward the same layout to
+   * their `super()` call without duplicating the directory-resolution
+   * logic. Marked readonly to make sure nobody reassigns it after
+   * construction.
+   */
+  public readonly baseDir: string | undefined
   private tasksDir: string
   private stateDir: string
 
   constructor(baseDir?: string) {
+    this.baseDir = baseDir
     if (baseDir) {
       this.tasksDir = join(baseDir, "tasks")
       this.stateDir = join(baseDir, "state")
@@ -60,9 +69,23 @@ export class PersistenceStore {
     }
   }
 
+  /**
+   * Drain any pending writes. The base `PersistenceStore` writes
+   * synchronously on every `saveTask`, so this is a no-op; the
+   * `BatchedPersistenceStore` subclass overrides it to flush its
+   * in-memory queue. Exposed publicly so callers (notably
+   * `SchedulerService.dispose()`) can call it without a cast.
+   */
+  flushSync(): void {
+    // no-op in the base class
+  }
+
   saveTask(task: ScheduledTask): void {
     const taskPath = join(this.tasksDir, `${task.id}.json`)
-    atomicWrite(taskPath, JSON.stringify(task, null, 2))
+    // Machine-read format: no indentation. Drops write size ~30-40% and
+    // reduces JSON.stringify CPU. CLI/MCP responses keep pretty-print for
+    // human readability; on-disk task files are never inspected by hand.
+    atomicWrite(taskPath, JSON.stringify(task))
   }
   loadTask(taskId: string): ScheduledTask | null {
     const taskPath = join(this.tasksDir, `${taskId}.json`)
@@ -121,7 +144,8 @@ export class PersistenceStore {
 
   saveVirtualCwdMap(data: Record<string, VirtualCwdState>): void {
     const filePath = join(this.stateDir, "virtual-cwd.json")
-    atomicWrite(filePath, JSON.stringify(data, null, 2))
+    // Machine-read: no indentation (see saveTask for rationale).
+    atomicWrite(filePath, JSON.stringify(data))
   }
 
   loadVirtualCwdMap(): Record<string, VirtualCwdState> {
@@ -145,15 +169,24 @@ export class PersistenceStore {
  *
  * `flushSync()` (callable from `dispose()`) drains the queue immediately so
  * no data is lost when the scheduler shuts down.
+ *
+ * Inherits all read-side methods (`loadTask` / `loadAllTasks` / `deleteTask`
+ * / `restore` / `loadVirtualCwdMap` / `saveVirtualCwdMap`) from the inner
+ * `PersistenceStore` — they do not need batching, since reads are not on
+ * the hot path and writes to non-task state (virtual cwd) are already
+ * debounced at the `VirtualCwdStore` layer.
  */
-export class BatchedPersistenceStore {
-  private inner: PersistenceStore
+export class BatchedPersistenceStore extends PersistenceStore {
   private pending = new Map<string, ScheduledTask>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private flushIntervalMs: number
 
   constructor(inner: PersistenceStore, flushIntervalMs = 100) {
-    this.inner = inner
+    // Forward the inner store's base directory so we share the same on-disk
+    // layout. Rebuilding the dir layout is cheap and keeps the two stores in
+    // sync regardless of how `inner` was constructed (default HOME path or
+    // explicit `baseDir`).
+    super(inner.baseDir)
     this.flushIntervalMs = flushIntervalMs
   }
 
@@ -188,7 +221,9 @@ export class BatchedPersistenceStore {
     this.pending.clear()
     for (const task of batch) {
       try {
-        this.inner.saveTask(task)
+        // Use super.saveTask to bypass the batched override and write
+        // directly through PersistenceStore's atomic-write path.
+        super.saveTask(task)
       } catch (err) {
         // Re-queue on failure so the next flush retries. Don't block the rest
         // of the batch.

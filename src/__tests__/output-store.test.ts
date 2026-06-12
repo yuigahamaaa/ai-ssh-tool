@@ -20,10 +20,16 @@ describe("OutputStore", () => {
     try { rmSync(testDir, { recursive: true }) } catch {}
   })
 
-  it("creates stdout/stderr files on create", () => {
+  it("defers stdout/stderr file creation until first append", () => {
     const store = new OutputStore(testDir)
     store.create("task-1")
-    
+
+    assert.ok(!existsSync(join(testDir, "task-1.stdout")))
+    assert.ok(!existsSync(join(testDir, "task-1.stderr")))
+
+    store.appendStdout("task-1", "hello\n")
+    store.appendStderr("task-1", "error\n")
+
     assert.ok(existsSync(join(testDir, "task-1.stdout")))
     assert.ok(existsSync(join(testDir, "task-1.stderr")))
   })
@@ -137,8 +143,10 @@ describe("OutputStore", () => {
     const store = new OutputStore(testDir)
     store.create("old-task")
     store.appendStdout("old-task", "old")
+    store.appendStderr("old-task", "")
     store.create("protected-task")
     store.appendStdout("protected-task", "keep")
+    store.appendStderr("protected-task", "")
 
     const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000)
     utimesSync(join(testDir, "old-task.stdout"), oldDate, oldDate)
