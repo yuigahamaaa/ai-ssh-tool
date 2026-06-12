@@ -99,6 +99,8 @@ describe("Logger", () => {
 
     it("should write init messages", () => {
       const path = logger.getLogPath()
+      // enableDebug already calls flushNow() on its bootstrap lines, so
+      // the init messages are on disk synchronously. No flushLogs() needed.
       const content = readFileSync(path, "utf-8")
       assert.ok(content.includes("[init] Session started"))
       assert.ok(content.includes("[init] Platform:"))
@@ -109,6 +111,7 @@ describe("Logger", () => {
   describe("log content format", () => {
     it("should write messages with [timestamp] [category] format", () => {
       logger.log("conn", "Connecting to host")
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes("[conn] Connecting to host"))
       // Timestamp format: [HH:MM:SS.mmm]
@@ -117,6 +120,7 @@ describe("Logger", () => {
 
     it("should include data as JSON when provided", () => {
       logger.log("exec", "Running command", { cmd: "ls", timeout: 5000 })
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes('"cmd":"ls"'))
       assert.ok(content.includes('"timeout":5000'))
@@ -127,6 +131,7 @@ describe("Logger", () => {
       circular.self = circular
       // Should not throw
       logger.log("test", "circular", circular)
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes("[unserializable]"))
     })
@@ -135,12 +140,14 @@ describe("Logger", () => {
   describe("logError", () => {
     it("should write error message with context", () => {
       logger.logError("conn", "connection failed", new Error("timeout"))
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes("[conn] ERROR connection failed: timeout"))
     })
 
     it("should write stack trace", () => {
       logger.logError("exec", "exec failed", new Error("bad command"))
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes("Stack:"))
     })
@@ -205,6 +212,7 @@ describe("Logger", () => {
       for (let i = 0; i < 100; i++) {
         logger.log("stress", `message ${i}`, { index: i })
       }
+      logger.flushLogs()
       const content = readFileSync(logger.getLogPath(), "utf-8")
       assert.ok(content.includes("message 0"))
       assert.ok(content.includes("message 99"))
