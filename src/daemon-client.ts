@@ -21,6 +21,12 @@ export class DaemonClient {
   private socket: Socket | null = null
   private ipc: IPCSocket | null = null
   private connecting: Promise<void> | null = null
+  /**
+   * If a connect() is in flight, disconnect() can settle that promise
+   * explicitly with a "disconnected" error so the awaiter never hangs.
+   * Reset to null whenever the in-flight connect settles.
+   */
+  private connectingReject: ((err: Error) => void) | null = null
   private ensuring: Promise<void> | null = null
 
   constructor(pipePath?: string) {
@@ -36,6 +42,7 @@ export class DaemonClient {
       await this.connecting
     } finally {
       this.connecting = null
+      this.connectingReject = null
     }
   }
 
@@ -45,6 +52,9 @@ export class DaemonClient {
     log("client", `Connecting to daemon at ${this.pipePath}`)
     this.socket = connect(this.pipePath)
     await new Promise<void>((resolve, reject) => {
+      // Expose the reject handle so a concurrent disconnect() can settle
+      // the in-flight connect promise instead of leaving the awaiter hanging.
+      this.connectingReject = reject
       const onError = (err: Error) => {
         logError("client", "Connection failed", err)
         this.socket = null
@@ -68,6 +78,15 @@ export class DaemonClient {
   }
 
   disconnect(): void {
+    // If a connect() is in flight, settle it before tearing the socket
+    // down — otherwise the awaiter would hang forever (we're about to
+    // remove all listeners and destroy the only transport the connect
+    // promise is waiting on).
+    if (this.connectingReject) {
+      const reject = this.connectingReject
+      this.connectingReject = null
+      reject(new Error("disconnected"))
+    }
     if (this.ipc) {
       this.ipc.dispose()
       this.ipc = null
