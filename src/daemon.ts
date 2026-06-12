@@ -33,6 +33,7 @@ import {
 } from "./ipc-protocol.js"
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
+import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
 
 interface BackgroundTaskHandle {
@@ -344,6 +345,24 @@ export class SSHDaemon {
       } catch {
         // non-fatal
       }
+    }
+
+    // One-shot migration of legacy exec-tasks → scheduler layout. Idempotent;
+    // counts are logged so operators can see the first-boot migration size.
+    try {
+      const homedir = process.env.HOME || process.env.USERPROFILE || ""
+      const srcDir = `${homedir}/.ssh-tool/exec-tasks`
+      const schedulerBase = `${homedir}/.ssh-tool/scheduler`
+      const destTaskDir = `${schedulerBase}/tasks`
+      const destOutputDir = `${schedulerBase}/outputs`
+      const migration = migrateExecTasks({ srcDir, destTaskDir, destOutputDir })
+      if (migration.migrated > 0 || migration.failed > 0) {
+        log("daemon", `migrated ${migration.migrated} legacy tasks (skipped=${migration.skipped}, failed=${migration.failed})`)
+      }
+    } catch (err) {
+      // Migration failure must not block daemon startup; legacy data is
+      // preserved on disk and will be retried on next boot.
+      log("daemon", `migrator threw: ${(err as Error).message}`)
     }
 
     // Start idle sweeper

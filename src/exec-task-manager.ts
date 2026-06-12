@@ -14,6 +14,7 @@ import { join } from "path"
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync } from "fs"
 import { homedir } from "os"
 import { log } from "./logger.js"
+import type { SchedulerService } from "./scheduler/scheduler-service.js"
 
 /**
  * Get user data directory with cross-platform support.
@@ -91,8 +92,15 @@ export class ExecTaskManager {
   private PERSIST_INTERVAL = 1000
   private CLEANUP_INTERVAL = 5 * 60 * 1000
   private TASK_RETENTION_MS = 24 * 60 * 60 * 1000
+  /**
+   * Optional scheduler reference. When present, getStatus/getOutput/list
+   * consult the scheduler first so the legacy facade stays in sync with
+   * tasks created via the modern scheduler path. Stage 2 / Task 2.3.
+   */
+  private scheduler: SchedulerService | null = null
 
-  constructor() {
+  constructor(opts?: { scheduler?: SchedulerService }) {
+    this.scheduler = opts?.scheduler ?? null
     this.loadTasksFromDisk()
     this.cleanupOldTasks()
   }
@@ -468,6 +476,15 @@ export class ExecTaskManager {
   }
 
   getStatus(id: string): ExecTask | null {
+    // Scheduler delegation: scheduler is the source of truth for tasks
+    // created via the modern path. Stage 2 / Task 2.3.
+    if (this.scheduler) {
+      const st = this.scheduler.getTask(id)
+      if (st) {
+        return this.schedulerTaskToExecTask(st)
+      }
+    }
+
     const entry = this.tasks.get(id)
     if (entry) {
       // Return live output for running tasks (chunks are only flushed on close)
@@ -499,6 +516,16 @@ export class ExecTaskManager {
     // over disk snapshots of the same id, matching the original
     // last-write-wins semantics.
     const merged = new Map<string, ExecTask>()
+
+    // Scheduler delegation: include scheduler-owned tasks first so they
+    // take priority over legacy disk snapshots of the same id (a migrated
+    // task that was re-run via the scheduler). Stage 2 / Task 2.3.
+    if (this.scheduler) {
+      for (const st of this.scheduler.listTasks(hostname)) {
+        merged.set(st.id, this.schedulerTaskToExecTask(st))
+      }
+    }
+
     const storageDir = getTaskStorageDir()
 
     if (existsSync(storageDir)) {
@@ -532,6 +559,15 @@ export class ExecTaskManager {
   }
 
   getOutput(id: string): { stdout: string; stderr: string } | null {
+    // Scheduler delegation first.
+    if (this.scheduler) {
+      const st = this.scheduler.getTask(id)
+      if (st) {
+        const out = this.scheduler.getTaskOutput(id, "full")
+        return { stdout: out.stdout, stderr: out.stderr }
+      }
+    }
+
     const entry = this.tasks.get(id)
     if (entry) {
       // Return live output from chunks while task is running
@@ -568,6 +604,41 @@ export class ExecTaskManager {
     const deleted = this.tasks.delete(id)
     this.deleteTaskFile(id)
     return deleted
+  }
+
+  /**
+   * Convert a scheduler-owned ScheduledTask into the legacy ExecTask shape
+   * so existing consumers (CLI status, MCP list, etc.) keep working.
+   * Stage 2 / Task 2.3.
+   */
+  private schedulerTaskToExecTask(st: import("./scheduler/types.js").ScheduledTask): ExecTask {
+    return {
+      id: st.id,
+      type: "exec",
+      command: st.command,
+      status: st.status === "running"
+        ? "running"
+        : st.status === "completed"
+          ? "completed"
+          : st.status === "queued"
+            ? "running" // legacy "queued" maps to "running" so the CLI can show progress
+            : st.status === "failed"
+              ? "failed"
+              : "completed",
+      exitCode: st.exitCode ?? null,
+      signal: st.signal ?? null,
+      stdout: "", // legacy callers use getOutput(id) for output
+      stderr: "",
+      startedAt: st.startedAt ?? st.updatedAt,
+      finishedAt: st.finishedAt ?? null,
+      pid: st.pid ?? null,
+      hostname: st.hostId,
+      createdAt: st.updatedAt,
+      updatedAt: st.updatedAt,
+      profileKey: undefined,
+      sessionId: st.sessionId,
+      cwd: st.effectiveCwd ?? undefined,
+    }
   }
 }
 

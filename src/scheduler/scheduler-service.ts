@@ -38,6 +38,17 @@ export interface SchedulerServiceOptions {
   maxTotalRunning?: number
   maxLargeRunning?: number
   outputCleanupThrottleMs?: number
+  /**
+   * Lifecycle hooks for cross-system integration (e.g. the legacy
+   * ExecTaskManager facade listens to these so its read paths can
+   * surface tasks that were created via the scheduler). All hooks
+   * are best-effort and exceptions are swallowed.
+   */
+  hooks?: {
+    onTaskCreated?: (task: ScheduledTask) => void
+    onTaskStarted?: (task: ScheduledTask) => void
+    onTaskFinished?: (task: ScheduledTask) => void
+  }
 }
 
 export class SchedulerService {
@@ -47,6 +58,7 @@ export class SchedulerService {
   private eventLog: EventLog
   private lockManager: LockManager
   private runner: TaskRunner
+  private hooks: SchedulerServiceOptions["hooks"]
 
   private maxQueueSize: number
   private maxTotalRunning: number
@@ -74,6 +86,7 @@ export class SchedulerService {
       start: async () => ({ code: 0, stdout: "", stderr: "" }),
       startBackground: () => {},
     }
+    this.hooks = opts?.hooks
     this.maxQueueSize = opts?.maxQueueSize ?? 50
     this.maxTotalRunning = opts?.maxTotalRunning ?? 4
     this.maxLargeRunning = opts?.maxLargeRunning ?? 1
@@ -112,6 +125,21 @@ export class SchedulerService {
     // so no data is lost on shutdown.
     this.eventLog.flushSync()
     if (typeof this.persistence.flushSync === "function") this.persistence.flushSync()
+  }
+
+  /**
+   * Best-effort hook invocation. Hooks are an integration surface for the
+   * legacy ExecTaskManager facade and similar cross-system bridges; we
+   * never let a throwing hook break the scheduler's own flow.
+   */
+  private invokeHook(name: "onTaskCreated" | "onTaskStarted" | "onTaskFinished", task: ScheduledTask): void {
+    const fn = this.hooks?.[name]
+    if (typeof fn !== "function") return
+    try {
+      fn(task)
+    } catch {
+      // hook errors are non-fatal; swallow to keep scheduler healthy
+    }
   }
 
   private restore(): void {
@@ -176,6 +204,7 @@ export class SchedulerService {
     this.persistence.saveTask(task)
     this.outputStore.create(task.id)
     this.eventLog.log("task_created", { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { command: task.command } })
+    this.invokeHook("onTaskCreated", task)
 
     if (req.scheduler === "bypass") {
       this.startTask(task)
@@ -432,6 +461,16 @@ export class SchedulerService {
     return this.tasks.get(taskId)
   }
 
+  /**
+   * List in-memory tasks, optionally filtered by hostname. Stage 2 / Task 2.2
+   * surfaces this for the legacy ExecTaskManager facade.
+   */
+  listTasks(hostname?: string): ScheduledTask[] {
+    const all = Array.from(this.tasks.values())
+    if (!hostname) return all
+    return all.filter((t) => t.hostId === hostname)
+  }
+
   getRunner(): TaskRunner {
     return this.runner
   }
@@ -497,6 +536,7 @@ export class SchedulerService {
     this.addToIndex(task)
     this.persistence.saveTask(task)
     this.eventLog.log("task_started", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
+    this.invokeHook("onTaskStarted", task)
 
     if (task.background && this.runner.startBackground) {
       this.runner.startBackground(task,
@@ -566,6 +606,7 @@ export class SchedulerService {
     this.pumpQueue(task.hostId)
     this.cleanupOutputsThrottled()
     this.evictOldTasks()
+    this.invokeHook("onTaskFinished", task)
   }
 
   private findBlockers(task: ScheduledTask): ScheduledTaskSummary[] {
