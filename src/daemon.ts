@@ -38,8 +38,16 @@ import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/t
 interface BackgroundTaskHandle {
   stream: any
   stop: () => void
+  /** Whether the stream has already emitted close/error. Used to keep stop()
+   *  idempotent and prevent double onClose callbacks when the OS delivers both. */
+  closed: boolean
+  /** 5-min hard timeout. Background tasks that never emit close/error
+   *  (orphaned streams after a network partition) get force-stopped and
+   *  the handle is removed so the daemon can shut down cleanly. */
+  timeoutId: NodeJS.Timeout | null
 }
 const backgroundTaskHandles = new Map<string, BackgroundTaskHandle>()
+const BACKGROUND_HANDLE_TIMEOUT_MS = 5 * 60 * 1000
 
 interface DaemonSession {
   sessionId: string
@@ -209,14 +217,29 @@ export class SSHDaemon {
             
             const handle: BackgroundTaskHandle = {
               stream,
+              closed: false,
+              timeoutId: null,
               stop: () => {
+                if (handle.closed) return
                 if (currentPid) {
                   const killCmd = `kill -TERM -${currentPid} 2>/dev/null || kill -TERM ${currentPid} 2>/dev/null; sleep 0.5; kill -9 -${currentPid} 2>/dev/null || kill -9 ${currentPid} 2>/dev/null; true`
                   client.exec(killCmd, () => {})
                 }
                 try { stream.close() } catch {}
-              }
+              },
             }
+            // Hard timeout: if the SSH stream never emits close/error for
+            // 5 minutes (e.g. partition), force-stop and remove the handle
+            // so daemon shutdown isn't blocked forever.
+            handle.timeoutId = setTimeout(() => {
+              if (handle.closed) return
+              log("daemon", `Background task ${task.id} orphaned, force-stopping after ${BACKGROUND_HANDLE_TIMEOUT_MS}ms`)
+              handle.stop()
+              handle.closed = true
+              if (handle.timeoutId) { clearTimeout(handle.timeoutId); handle.timeoutId = null }
+              backgroundTaskHandles.delete(task.id)
+              onClose(1, "SIGKILL")
+            }, BACKGROUND_HANDLE_TIMEOUT_MS)
             backgroundTaskHandles.set(task.id, handle)
             
             stream.on("data", (data: Buffer) => {
@@ -259,15 +282,20 @@ export class SSHDaemon {
               }
             })
             
-            stream.on("close", (code?: number, signal?: string) => {
+            const finalize = (code: number, signal?: string) => {
+              if (handle.closed) return
+              handle.closed = true
+              if (handle.timeoutId) { clearTimeout(handle.timeoutId); handle.timeoutId = null }
               backgroundTaskHandles.delete(task.id)
-              onClose(code ?? 1, signal)
+              onClose(code, signal)
+            }
+            stream.on("close", (code?: number, signal?: string) => {
+              finalize(code ?? 1, signal)
             })
             
             stream.on("error", (streamErr: Error) => {
-              backgroundTaskHandles.delete(task.id)
               onOutput("", streamErr.message)
-              onClose(1)
+              finalize(1)
             })
           })
           
@@ -348,6 +376,14 @@ export class SSHDaemon {
     }
     if (this.idleSweeper) clearInterval(this.idleSweeper)
     this.idleSweeper = null
+    // Stop any background-task handles still in flight. Each handle clears
+    // its own timeout and is removed from the map. The map itself is also
+    // cleared so a future start() in the same process can't see stale ids.
+    for (const [id, handle] of backgroundTaskHandles) {
+      if (handle.timeoutId) { clearTimeout(handle.timeoutId); handle.timeoutId = null }
+      try { handle.stop() } catch (e) { log("daemon", `Background handle ${id} stop() threw: ${(e as Error).message}`) }
+    }
+    backgroundTaskHandles.clear()
     this.scheduler.dispose()
     await this.gateway.disconnectAll()
     this.forwardManagers.clear()
