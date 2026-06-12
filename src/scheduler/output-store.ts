@@ -141,6 +141,9 @@ export class OutputStore {
   getOutput(taskId: string, mode: "tail" | "full" = "tail", returnLimit = DEFAULT_OUTPUT_RETURN_LIMIT): TaskOutputResult {
     const entry = this.get(taskId)
     const paths = this.getPaths(taskId)
+    // Use the in-memory entry's byte counters when available to avoid
+    // redundant statSync() calls. Fall back to disk only if the entry is
+    // missing (e.g. daemon restart with no in-memory state).
     const stdoutBytes = entry?.stdoutBytes ?? this.sizeOf(paths.stdout)
     const stderrBytes = entry?.stderrBytes ?? this.sizeOf(paths.stderr)
     const stdoutFileTruncated = entry?.stdoutFileTruncated ?? false

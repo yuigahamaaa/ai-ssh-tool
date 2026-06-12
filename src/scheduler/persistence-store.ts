@@ -64,7 +64,6 @@ export class PersistenceStore {
     const taskPath = join(this.tasksDir, `${task.id}.json`)
     atomicWrite(taskPath, JSON.stringify(task, null, 2))
   }
-
   loadTask(taskId: string): ScheduledTask | null {
     const taskPath = join(this.tasksDir, `${taskId}.json`)
     if (!existsSync(taskPath)) return null
@@ -132,6 +131,69 @@ export class PersistenceStore {
       return JSON.parse(readFileSync(filePath, "utf8"))
     } catch {
       return {}
+    }
+  }
+}
+
+/**
+ * Coalesces multiple `saveTask` calls in a short window into a single batched
+ * flush. Each `saveTask` overwrites the latest in-memory snapshot keyed by
+ * `task.id`; the flush timer fires after `flushIntervalMs` of quiet (default
+ * 100ms) and writes all pending tasks in one synchronous sweep — but each
+ * write is still atomic via `PersistenceStore.saveTask`, so individual files
+ * are never observed in a partial state.
+ *
+ * `flushSync()` (callable from `dispose()`) drains the queue immediately so
+ * no data is lost when the scheduler shuts down.
+ */
+export class BatchedPersistenceStore {
+  private inner: PersistenceStore
+  private pending = new Map<string, ScheduledTask>()
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
+  private flushIntervalMs: number
+
+  constructor(inner: PersistenceStore, flushIntervalMs = 100) {
+    this.inner = inner
+    this.flushIntervalMs = flushIntervalMs
+  }
+
+  /** Queue a task for the next batched flush. Idempotent for the same id. */
+  saveTask(task: ScheduledTask): void {
+    this.pending.set(task.id, task)
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null
+      this.flush()
+    }, this.flushIntervalMs)
+  }
+
+  /** Force an immediate flush of all pending tasks. */
+  flushSync(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    this.flush()
+  }
+
+  /** Pending task count, useful for tests and metrics. */
+  get pendingCount(): number {
+    return this.pending.size
+  }
+
+  private flush(): void {
+    if (this.pending.size === 0) return
+    // Snapshot then clear so a re-entrant saveTask during flush is re-queued.
+    const batch = Array.from(this.pending.values())
+    this.pending.clear()
+    for (const task of batch) {
+      try {
+        this.inner.saveTask(task)
+      } catch (err) {
+        // Re-queue on failure so the next flush retries. Don't block the rest
+        // of the batch.
+        this.pending.set(task.id, task)
+      }
     }
   }
 }

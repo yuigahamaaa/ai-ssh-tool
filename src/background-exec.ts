@@ -7,6 +7,7 @@
  */
 
 import type { Client } from "ssh2"
+import { EventEmitter } from "events"
 import { getGlobalTaskManager, type ExecTask, type TaskType } from "./exec-task-manager.js"
 import { log } from "./logger.js"
 
@@ -22,6 +23,29 @@ export interface BackgroundTaskOptions {
   lineEnding?: "auto" | "lf" | "crlf" | "binary"
   encoding?: "auto" | "utf8" | "gbk" | "latin1"
   cancelSignal?: "TERM" | "HUP"
+}
+
+/**
+ * Singleton EventEmitter that ExecTaskManager integrates with: when a task's
+ * status transitions to a terminal state (completed/failed/cancelled/timeout),
+ * BackgroundExecManager emits on this emitter so that `wait()` can resolve
+ * immediately instead of polling. Each emit carries the final task snapshot.
+ *
+ * Falls back to polling when no emitter is wired (e.g. legacy callers that
+ * don't register a listener), preserving the old behavior.
+ */
+const taskEvents = new EventEmitter()
+taskEvents.setMaxListeners(0) // bounded by the number of unique waiters
+
+export function emitBackgroundTaskEvent(task: ExecTask): void {
+  taskEvents.emit("done", task.id, task)
+}
+
+// Register a global hook so exec-task-manager.ts can notify us without
+// creating a circular module dependency. The function is called from
+// finishTask() with a shallow snapshot of the task at terminal status.
+;(globalThis as { __bgExecEmit?: (t: ExecTask) => void }).__bgExecEmit = (task) => {
+  emitBackgroundTaskEvent(task)
 }
 
 export class BackgroundExecManager {
@@ -92,24 +116,47 @@ export class BackgroundExecManager {
   async wait(taskId: string, timeoutMs?: number): Promise<BackgroundTask> {
     const taskManager = getGlobalTaskManager()
     const checkTask = () => taskManager.getStatus(taskId)
-    let entry = checkTask()
-    if (!entry) throw new Error(`Task ${taskId} not found`)
-    if (entry.status !== "running") return entry as BackgroundTask
+    const initial = checkTask()
+    if (!initial) throw new Error(`Task ${taskId} not found`)
+    if (initial.status !== "running") return initial as BackgroundTask
 
+    // Event-driven path: subscribe for the terminal transition and resolve as
+    // soon as the emitter fires. A single setTimeout handles the timeout case
+    // (no setInterval, so no steady-state CPU burn).
     return new Promise((resolve, reject) => {
-      const check = setInterval(() => {
-        const e = checkTask()
-        if (!e || e.status !== "running") {
-          clearInterval(check)
-          if (timer) clearTimeout(timer)
-          resolve(e as BackgroundTask)
-        }
-      }, 500)
-
+      let settled = false
+      let pollTimer: ReturnType<typeof setInterval> | null = null
       let timer: ReturnType<typeof setTimeout> | null = null
+
+      const cleanup = () => {
+        taskEvents.off("done", onDone)
+        if (timer) { clearTimeout(timer); timer = null }
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+      }
+      const finish = (task: ExecTask | null | undefined) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (task) resolve(task as BackgroundTask)
+        else resolve(checkTask() as BackgroundTask)
+      }
+      const onDone = (id: string, task: ExecTask) => {
+        if (id === taskId) finish(task)
+      }
+      taskEvents.on("done", onDone)
+
+      // Defensive polling fallback: if the emitter is never wired (legacy
+      // mode), the wait would hang. A 1s poll covers that edge case.
+      pollTimer = setInterval(() => {
+        const e = checkTask()
+        if (e && e.status !== "running") finish(e)
+      }, 1000)
+
       if (timeoutMs) {
         timer = setTimeout(() => {
-          clearInterval(check)
+          if (settled) return
+          settled = true
+          cleanup()
           reject(new Error(`Wait timed out after ${timeoutMs}ms`))
         }, timeoutMs)
       }

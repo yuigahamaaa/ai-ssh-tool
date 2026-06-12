@@ -427,6 +427,19 @@ export class ExecTaskManager {
     entry.client = null as any
     this.tasks.delete(id)
     log("exec-task", `Task ${id} finished and evicted from memory: ${status}, code=${exitCode}, signal=${signal}`)
+
+    // Notify background-exec waiters. Imported lazily to avoid a circular
+    // dep with background-exec.ts (which imports from this module).
+    try {
+      const snapshot = { ...entry.task } as ExecTask
+      // Dynamic import shape: synchronously call the named export via the
+      // module's side-effect-free accessor. We use a function reference to
+      // avoid a hard import cycle; set up by background-exec.ts at load time.
+      const emit = (globalThis as { __bgExecEmit?: (t: ExecTask) => void }).__bgExecEmit
+      if (typeof emit === "function") emit(snapshot)
+    } catch {
+      // best-effort notification, never block finish
+    }
   }
 
   cancel(id: string, client: Client, signal: "TERM" | "HUP" = "TERM"): boolean {

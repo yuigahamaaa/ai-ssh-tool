@@ -19,7 +19,7 @@ import type {
 } from "./types.js"
 import { toSummary } from "./types.js"
 import { classifyCommand } from "./command-classifier.js"
-import { PersistenceStore } from "./persistence-store.js"
+import { PersistenceStore, BatchedPersistenceStore } from "./persistence-store.js"
 import { VirtualCwdStore } from "./virtual-cwd-store.js"
 import { OutputStore } from "./output-store.js"
 import { EventLog } from "./event-log.js"
@@ -61,6 +61,10 @@ export class SchedulerService {
 
   private runningByHost = new Map<string, Set<string>>()
   private queuedByHost = new Map<string, Set<string>>()
+  // Sorted index of finished tasks by finishedAt (ascending). Insertion is
+  // O(log n) via binary search; eviction scans the head of the array for
+  // expired entries only — no need to walk the full `tasks` Map.
+  private finishedByTime: ScheduledTask[] = []
   private lastEvictAt = 0
   private idleEvictTimer: ReturnType<typeof setInterval> | null = null
 
@@ -92,15 +96,21 @@ export class SchedulerService {
   }
 
   /**
-   * Release scheduler-owned resources (idle eviction timer). Safe to call multiple
-   * times; subsequent calls are no-ops. After dispose(), the scheduler should not be
-   * expected to process new tasks (callers should treat it as terminated).
+   * Release scheduler-owned resources (idle eviction timer, debounced virtual
+   * CWD writes). Safe to call multiple times; subsequent calls are no-ops.
+   * After dispose(), the scheduler should not be expected to process new
+   * tasks (callers should treat it as terminated).
    */
   dispose(): void {
     if (this.idleEvictTimer) {
       clearInterval(this.idleEvictTimer)
       this.idleEvictTimer = null
     }
+    this.virtualCwdStore.dispose()
+    // If a BatchedPersistenceStore is in use, drain any pending task writes
+    // synchronously so no data is lost on shutdown.
+    const p = this.persistence as unknown as { flushSync?: () => void }
+    if (typeof p.flushSync === "function") p.flushSync()
   }
 
   private restore(): void {
@@ -341,6 +351,7 @@ export class SchedulerService {
     this.removeFromIndex(task)
     task.status = "cancelled"
     task.updatedAt = Date.now()
+    task.finishedAt = task.updatedAt
     task.decisionReason = "Cancelled by cancel request."
 
     if (wasRunning && this.runner.cancel) {
@@ -349,11 +360,13 @@ export class SchedulerService {
         // runner refused; restore the previous status/index so the task keeps
         // running as if cancel was never called.
         task.status = "running"
+        task.finishedAt = undefined
         this.addToIndex(task)
         return false
       }
     }
 
+    this.addToFinishedIndex(task)
     this.lockManager.releaseForTask(taskId)
     this.persistence.saveTask(task)
     this.eventLog.log("task_cancelled", { taskId, hostId, agentId: task.agentId })
@@ -522,6 +535,7 @@ export class SchedulerService {
     task.signal = signal ?? null
     task.finishedAt = Date.now()
     task.updatedAt = Date.now()
+    this.addToFinishedIndex(task)
 
     const alreadyStreamed = this.streamedOutputTasks.get(taskId)
     this.streamedOutputTasks.delete(taskId)
@@ -682,8 +696,16 @@ export class SchedulerService {
 
   private recomputeQueuePositions(hostId: string): void {
     const queued = this.getQueuedTasks(hostId)
+    // Fast path: no queued tasks on this host → no work, no allocations.
+    if (queued.length === 0) return
     queued.forEach((task, index) => {
-      task.queuePosition = index + 1
+      const next = index + 1
+      // Only write if the position actually changed; this keeps the task
+      // object's reference stable for any downstream subscribers and avoids
+      // spurious updates that would otherwise dirty cache layers.
+      if (task.queuePosition !== next) {
+        task.queuePosition = next
+      }
     })
   }
 
@@ -715,21 +737,55 @@ export class SchedulerService {
     }
   }
 
+  /**
+   * Insert `task` into `finishedByTime` keeping the array sorted by
+   * `finishedAt` ascending. We use a binary search to find the insertion
+   * point in O(log n), then `splice` to insert in O(n) — total O(n) per
+   * finish, but eviction becomes O(k) where k is the number of expired
+   * tasks, not O(total tasks).
+   */
+  private addToFinishedIndex(task: ScheduledTask): void {
+    const ts = task.finishedAt ?? task.updatedAt ?? Date.now()
+    let lo = 0
+    let hi = this.finishedByTime.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      const midTs = this.finishedByTime[mid].finishedAt ?? this.finishedByTime[mid].updatedAt ?? 0
+      if (midTs <= ts) lo = mid + 1
+      else hi = mid
+    }
+    this.finishedByTime.splice(lo, 0, task)
+  }
+
+  private removeFromFinishedIndex(task: ScheduledTask): void {
+    // Linear scan is acceptable because evictOldTasks is the only caller and
+    // it removes a small batch in order. If the array grows very large,
+    // upgrade to an id→index Map alongside the sorted array.
+    const idx = this.finishedByTime.indexOf(task)
+    if (idx >= 0) this.finishedByTime.splice(idx, 1)
+  }
+
   private evictOldTasks(): void {
     const now = Date.now()
     if (now - this.lastEvictAt < 60_000) return
     this.lastEvictAt = now
 
+    // Walk the head of the sorted index — no need to scan the full Map.
+    // Skip tasks that are still running/queued (defensive: the index should
+    // only contain finished tasks, but be safe).
     let evicted = 0
-    for (const [id, task] of this.tasks) {
-      if (evicted >= EVICT_BATCH_SIZE) break
-      if (task.status === "running" || task.status === "queued") continue
-      const finishedAt = task.finishedAt ?? task.updatedAt ?? 0
-      if (now - finishedAt > FINISHED_TASK_TTL_MS) {
-        this.tasks.delete(id)
-        this.streamedOutputTasks.delete(id)
-        evicted++
-      }
+    while (evicted < EVICT_BATCH_SIZE && this.finishedByTime.length > 0) {
+      const head = this.finishedByTime[0]
+      const finishedAt = head.finishedAt ?? head.updatedAt ?? 0
+      if (now - finishedAt <= FINISHED_TASK_TTL_MS) break
+      this.finishedByTime.shift()
+      // Only drop from the main map if no one is still referencing it via
+      // a long-lived waiter or queue-status snapshot. In practice the
+      // `waitTask` API returns a snapshot of the task; subsequent reads
+      // (queueStatus, getTask) will return undefined and callers handle it.
+      this.tasks.delete(head.id)
+      this.streamedOutputTasks.delete(head.id)
+      evicted++
     }
   }
 

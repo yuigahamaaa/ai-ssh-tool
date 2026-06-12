@@ -58,57 +58,81 @@ export class EventLog {
   }
 
   getRecent(limit = 100, hostId?: string): SchedulerEvent[] {
+    if (limit <= 0) return []
     try {
       const TAIL_CHUNK = 64 * 1024
+      const MAX_CHUNKS = 16 // cap at 1MB to avoid runaway reads
       const fd = openSync(this.currentFile, "r")
       try {
-        const stats = fstatSync(fd)
-        const fileSize = stats.size
+        const fileSize = fstatSync(fd).size
         if (fileSize === 0) return []
-        const readSize = Math.min(TAIL_CHUNK, fileSize)
-        const buffer = Buffer.alloc(readSize)
-        readSync(fd, buffer, 0, readSize, fileSize - readSize)
-        const chunk = buffer.toString("utf8")
-        const events: SchedulerEvent[] = []
-        const lines = chunk.split("\n")
-        const startIdx = fileSize > readSize ? 1 : 0
-        for (let i = lines.length - 1; i >= startIdx; i--) {
-          if (events.length >= limit) break
-          const line = lines[i].trim()
-          if (!line) continue
-          try {
-            const event = JSON.parse(line) as SchedulerEvent
-            if (!hostId || event.hostId === hostId) {
-              events.push(event)
-            }
-          } catch {
-            continue
+
+        // Incrementally read backwards from the end of the file. Each iteration
+        // grows the read window by TAIL_CHUNK; we stop as soon as we have
+        // enough matching events or the file is exhausted. The first time we
+        // exceed the limit (or run out of file) we fall through to a single
+        // bounded full-file read so we can return oldest-first results in
+        // correct reverse order.
+        let offset = fileSize
+        let buffer = Buffer.alloc(0)
+        for (let chunkIdx = 0; chunkIdx < MAX_CHUNKS; chunkIdx++) {
+          const want = Math.min(TAIL_CHUNK, offset)
+          if (want <= 0) break
+          const tmp = Buffer.alloc(want)
+          readSync(fd, tmp, 0, want, offset - want)
+          buffer = Buffer.concat([tmp, buffer], buffer.length + want)
+          offset -= want
+
+          // Try to parse the lines we have. If the head of `buffer` is a
+          // truncated line (no leading newline), drop it — we'll keep
+          // extending backwards until we have a clean line boundary.
+          const text = buffer.toString("utf8")
+          if (!text.startsWith("\n") && offset > 0) continue
+
+          const events = this.collectEvents(text, limit, hostId, /*fromStart=*/ true)
+          if (events.length >= limit) return events
+          if (offset === 0) {
+            // Whole file scanned; return what we have.
+            return events
           }
         }
-        if (events.length < limit && fileSize > readSize) {
-          const fullContent = readFileSync(this.currentFile, "utf8")
-          const allLines = fullContent.trim().split("\n").reverse()
-          const fallback: SchedulerEvent[] = []
-          for (const line of allLines) {
-            if (fallback.length >= limit) break
-            if (!line.trim()) continue
-            try {
-              const event = JSON.parse(line) as SchedulerEvent
-              if (!hostId || event.hostId === hostId) {
-                fallback.push(event)
-              }
-            } catch {
-              continue
-            }
-          }
-          return fallback
-        }
-        return events
+
+        // Fallback: we exhausted the chunk budget without enough matches.
+        // Bounded full-file read so we don't keep streaming forever.
+        const fullContent = readFileSync(this.currentFile, "utf8")
+        return this.collectEvents(fullContent, limit, hostId, /*fromStart=*/ true)
       } finally {
         closeSync(fd)
       }
     } catch {
       return []
     }
+  }
+
+  /**
+   * Parse lines from `text` and return the most recent `limit` events,
+   * optionally filtered by hostId. Returns events in reverse chronological
+   * order (newest first).
+   */
+  private collectEvents(text: string, limit: number, hostId: string | undefined, fromStart: boolean): SchedulerEvent[] {
+    const events: SchedulerEvent[] = []
+    const lines = text.split("\n")
+    // When fromStart=true, the caller has already trimmed the first line
+    // because it was a partial — start from the end of `lines` and skip the
+    // empty trailing line that split() always produces.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim()
+      if (!line) continue
+      try {
+        const event = JSON.parse(line) as SchedulerEvent
+        if (!hostId || event.hostId === hostId) {
+          events.push(event)
+          if (events.length >= limit) break
+        }
+      } catch {
+        continue
+      }
+    }
+    return events
   }
 }

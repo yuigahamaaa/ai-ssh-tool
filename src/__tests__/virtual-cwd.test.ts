@@ -48,10 +48,39 @@ describe("VirtualCwdStore", () => {
 
   it("persists to disk and reloads", () => {
     store.set("agentA", "host1", "/repo-a")
+    // Debounced write must be flushed before constructing a fresh store to
+    // simulate a daemon restart.
+    store.flushNow()
 
     const freshPersistence = new PersistenceStore(tmpDir)
     const freshStore = new VirtualCwdStore(freshPersistence)
 
     assert.equal(freshStore.resolve("agentA", "host1"), "/repo-a")
+  })
+
+  it("dispose() flushes pending writes synchronously", () => {
+    store.set("agentA", "host1", "/repo-a")
+    // Don't call flushNow() — dispose() must drain the debounce timer.
+    store.dispose()
+
+    const freshPersistence = new PersistenceStore(tmpDir)
+    const freshStore = new VirtualCwdStore(freshPersistence)
+    assert.equal(freshStore.resolve("agentA", "host1"), "/repo-a")
+  })
+
+  it("coalesces multiple sets in the debounce window into one disk write", () => {
+    // Spy on saveVirtualCwdMap to count writes; it should be 1, not N.
+    let writes = 0
+    const originalSave = persistence.saveVirtualCwdMap.bind(persistence)
+    persistence.saveVirtualCwdMap = (map) => {
+      writes++
+      return originalSave(map)
+    }
+    store.set("agentA", "host1", "/a")
+    store.set("agentA", "host1", "/b")
+    store.set("agentA", "host1", "/c")
+    assert.equal(writes, 0, "no writes should happen before debounce timer fires")
+    store.flushNow()
+    assert.equal(writes, 1, "all three sets should coalesce into a single write")
   })
 })
