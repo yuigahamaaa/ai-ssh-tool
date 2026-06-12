@@ -73,6 +73,10 @@ function getTaskFilePath(taskId: string): string {
 }
 
 function getHostIdentifier(client: Client): string {
+  // Reflection on ssh2 internals (`_client._config.host`) is fragile across
+  // ssh2 versions. Callers SHOULD pass an explicit `host` in the options
+  // bag — this fallback only exists for the cases that haven't been
+  // migrated yet (legacy BackgroundExecManager path, tests).
   const clientObj = client as unknown as Record<string, unknown>
   const innerClient = clientObj._client as Record<string, unknown> | undefined
   const config = innerClient?._config as Record<string, unknown> | undefined
@@ -209,6 +213,9 @@ export class ExecTaskManager {
       detached?: boolean
       profileKey?: string
       sessionId?: string
+      /** Explicit host name. Preferred over the ssh2-reflection fallback
+       *  in getHostIdentifier. New callers should always pass this. */
+      host?: string
     }
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
@@ -228,7 +235,9 @@ export class ExecTaskManager {
       fullCommand = `${envPrefix}; ${fullCommand}`
     }
 
-    const hostname = getHostIdentifier(client)
+    // Explicit host from caller takes priority; only fall back to the
+    // (ssh2-internals) reflection if the caller didn't supply one.
+    const hostname = options?.host ?? getHostIdentifier(client)
     const task: ExecTask = {
       id,
       type: taskType,

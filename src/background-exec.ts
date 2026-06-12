@@ -59,13 +59,18 @@ export class BackgroundExecManager {
 
   async start(client: Client, command: string, options?: BackgroundTaskOptions): Promise<BackgroundTask> {
     const taskManager = getGlobalTaskManager()
-    const hostname = this.hostnameOverride || this.getHostIdentifier(client)
+    // Pass the explicit hostname into start() when available so we never
+    // have to reach into ssh2's private fields. The override comes from
+    // the BackgroundExecManager constructor; the reflection fallback is
+    // now only used by unmigrated callers.
+    const host = this.hostnameOverride || this.getHostIdentifier(client)
 
     const { id, promise } = taskManager.start(client, command, {
       type: "background",
       cwd: options?.cwd,
       env: options?.env,
       detached: options?.detached ?? true,
+      host,
     })
 
     const task = taskManager.getStatus(id)
