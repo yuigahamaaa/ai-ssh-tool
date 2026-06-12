@@ -549,9 +549,9 @@ export class SchedulerService {
     }
     const output = this.outputStore.get(taskId)
     if (output) {
-      task.stdoutTail = output.stdoutTail
+      task.stdoutTail = output.stdoutTail.toString("utf8")
       task.stdoutBytes = output.stdoutBytes
-      task.stderrTail = output.stderrTail
+      task.stderrTail = output.stderrTail.toString("utf8")
       task.stderrBytes = output.stderrBytes
     }
 

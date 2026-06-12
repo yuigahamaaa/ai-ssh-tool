@@ -24,9 +24,13 @@ const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 const DEFAULT_KEEP_RECENT_TASKS = 200
 
 export interface OutputEntry {
-  stdoutTail: string
-  stderrTail: string
+  /** Last OUTPUT_TAIL_LIMIT bytes of stdout, used for fast tail queries. */
+  stdoutTail: Buffer
+  /** Last OUTPUT_TAIL_LIMIT bytes of stderr. */
+  stderrTail: Buffer
+  /** True logical byte count of stdout (file = tail after truncation). */
   stdoutBytes: number
+  /** True logical byte count of stderr. */
   stderrBytes: number
   stdoutPath: string
   stderrPath: string
@@ -61,10 +65,23 @@ function safeTaskId(taskId: string): string {
   return taskId
 }
 
-function appendTail(current: string, data: string): string {
-  const next = current + data
+function appendTail(current: Buffer, data: string | Buffer): Buffer {
+  const buf = typeof data === "string" ? Buffer.from(data, "utf8") : data
+  if (buf.length === 0) return current
+  const next = current.length === 0 ? buf : Buffer.concat([current, buf])
   if (next.length <= OUTPUT_TAIL_LIMIT) return next
-  return next.slice(-OUTPUT_TAIL_LIMIT)
+  return next.subarray(next.length - OUTPUT_TAIL_LIMIT)
+}
+
+/**
+ * Decode a Buffer to UTF-8 string. The tail is sliced at a byte boundary,
+ * so the last few bytes may be an incomplete UTF-8 sequence when the
+ * producing process emitted a partial code point; Buffer.toString replaces
+ * these with U+FFFD rather than throwing, which is the same behaviour
+ * callers used to get from the old string-based path.
+ */
+function bufferToString(buf: Buffer): string {
+  return buf.toString("utf8")
 }
 
 export class OutputStore {
@@ -100,8 +117,8 @@ export class OutputStore {
     // creation skips that work and shrinks cleanup/retention churn.
     const paths = this.getPaths(taskId)
     this.inMemory.set(taskId, {
-      stdoutTail: "",
-      stderrTail: "",
+      stdoutTail: Buffer.alloc(0),
+      stderrTail: Buffer.alloc(0),
       stdoutBytes: 0,
       stderrBytes: 0,
       stdoutPath: paths.stdout,
@@ -152,8 +169,12 @@ export class OutputStore {
     const stdoutFileTruncated = entry?.stdoutFileTruncated ?? false
     const stderrFileTruncated = entry?.stderrFileTruncated ?? false
 
-    let stdout = mode === "full" ? this.getFullStdout(taskId) : (entry?.stdoutTail ?? this.readFileTail(paths.stdout, returnLimit))
-    let stderr = mode === "full" ? this.getFullStderr(taskId) : (entry?.stderrTail ?? this.readFileTail(paths.stderr, returnLimit))
+    let stdout = mode === "full"
+      ? this.getFullStdout(taskId)
+      : (entry ? bufferToString(entry.stdoutTail) : this.readFileTail(paths.stdout, returnLimit))
+    let stderr = mode === "full"
+      ? this.getFullStderr(taskId)
+      : (entry ? bufferToString(entry.stderrTail) : this.readFileTail(paths.stderr, returnLimit))
     let stdoutTruncated = stdoutBytes > Buffer.byteLength(stdout) || stdoutFileTruncated
     let stderrTruncated = stderrBytes > Buffer.byteLength(stderr) || stderrFileTruncated
 
@@ -295,8 +316,8 @@ export class OutputStore {
       return undefined
     }
     if (!existsSync(paths.stdout) && !existsSync(paths.stderr)) return undefined
-    const stdout = this.readFileTail(paths.stdout)
-    const stderr = this.readFileTail(paths.stderr)
+    const stdout = this.readFileTailBuffer(paths.stdout)
+    const stderr = this.readFileTailBuffer(paths.stderr)
     const entry: OutputEntry = {
       stdoutTail: stdout,
       stderrTail: stderr,
@@ -321,10 +342,14 @@ export class OutputStore {
   }
 
   private readFileTail(path: string, maxBytes = OUTPUT_TAIL_LIMIT): string {
+    return this.readFileTailBuffer(path, maxBytes).toString("utf8")
+  }
+
+  private readFileTailBuffer(path: string, maxBytes = OUTPUT_TAIL_LIMIT): Buffer {
     try {
-      if (!this.isSafeRegularFile(path)) return ""
+      if (!this.isSafeRegularFile(path)) return Buffer.alloc(0)
       const size = statSync(path).size
-      if (size === 0) return ""
+      if (size === 0) return Buffer.alloc(0)
       const bytesToRead = Math.min(size, maxBytes)
       const buffer = Buffer.allocUnsafe(bytesToRead)
       const fd = openSync(path, "r")
@@ -333,9 +358,9 @@ export class OutputStore {
       } finally {
         closeSync(fd)
       }
-      return buffer.toString("utf8")
+      return buffer
     } catch {
-      return ""
+      return Buffer.alloc(0)
     }
   }
 
