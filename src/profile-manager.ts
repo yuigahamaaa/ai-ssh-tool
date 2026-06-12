@@ -9,7 +9,7 @@
  * - Profile files are saved with 600 permissions (owner-only read/write) to limit exposure.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync } from "fs"
 import { dirname, join } from "path"
 import { randomUUID } from "crypto"
 import { homedir } from "os"
@@ -31,6 +31,55 @@ const DEFAULT_PROFILES_DIR = join(
   ".opencode",
   "ssh",
 )
+
+/**
+ * LRU cache for loadFromFile().
+ *
+ * loadFromFile() is called on every MCP tool invocation (profile lookup,
+ * ssh_exec, ssh_upload, ssh_list_tasks, ...). Each call walks 4 search
+ * paths and readFileSync + JSON.parse's the first hit. The cache is keyed
+ * by the resolved file path and invalidated when the file's mtime changes,
+ * so editor workflows ("edit JSON, save, retry") get fresh content while
+ * hot paths skip the disk entirely.
+ */
+type CacheEntry = { profile: SSHProfile; mtimeMs: number }
+const fileCache: Map<string, CacheEntry> = new Map()
+const CACHE_MAX = 32
+
+function cacheGet(path: string): SSHProfile | undefined {
+  const cached = fileCache.get(path)
+  if (!cached) return undefined
+  // mtime check: if file changed on disk, drop the entry
+  let stat: import("fs").Stats
+  try {
+    stat = statSync(path)
+  } catch {
+    fileCache.delete(path)
+    return undefined
+  }
+  if (stat.mtimeMs !== cached.mtimeMs) {
+    fileCache.delete(path)
+    return undefined
+  }
+  // LRU touch: re-insert so the entry moves to the tail of the iteration order
+  fileCache.delete(path)
+  fileCache.set(path, cached)
+  return cached.profile
+}
+
+function cachePut(path: string, profile: SSHProfile, mtimeMs: number): void {
+  fileCache.set(path, { profile, mtimeMs })
+  if (fileCache.size > CACHE_MAX) {
+    // Map iteration order is insertion order; the first key is the oldest.
+    const oldest = fileCache.keys().next().value
+    if (oldest !== undefined) fileCache.delete(oldest)
+  }
+}
+
+/** Clear the LRU cache. Exposed for tests and explicit invalidation. */
+export function clearProfileCache(): void {
+  fileCache.clear()
+}
 
 export class ProfileManager {
   private profilesPath: string
@@ -148,6 +197,9 @@ export class ProfileManager {
    * 2. 当前目录下的 profiles/ 文件夹
    * 3. 项目根目录（ssh-tool 上一级）的 profiles/ 文件夹
    * 4. 用户主目录的 .ssh-tool/profiles/
+   *
+   * 命中后按文件路径 mtime 做 LRU 缓存：MCP 每个工具调用都会走这里，
+   * 同样的 profileName 反复加载时跳过 readFileSync + JSON.parse。
    */
   loadFromFile(profileFile: string): SSHProfile | undefined {
     const searchPaths = [
@@ -158,10 +210,18 @@ export class ProfileManager {
     ]
 
     for (const searchPath of searchPaths) {
-      if (existsSync(searchPath)) {
-        const raw = readFileSync(searchPath, "utf-8")
-        return ProfileManager.normalizeProfile(JSON.parse(raw))
-      }
+      if (!existsSync(searchPath)) continue
+
+      // Cache hit: same path, same mtime → return cached profile.
+      const cached = cacheGet(searchPath)
+      if (cached) return cached
+
+      // Cache miss: read, parse, normalize, store.
+      const raw = readFileSync(searchPath, "utf-8")
+      const profile = ProfileManager.normalizeProfile(JSON.parse(raw))
+      const mtimeMs = statSync(searchPath).mtimeMs
+      cachePut(searchPath, profile, mtimeMs)
+      return profile
     }
 
     return undefined
