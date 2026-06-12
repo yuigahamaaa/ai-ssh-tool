@@ -102,8 +102,15 @@ export function parseMessages(
  * Incremental newline-delimited JSON parser for socket streams.
  * Keeps the partial trailing line as a string to avoid Buffer.concat on every chunk.
  */
+const DEFAULT_MAX_REMAINDER_BYTES = 16 * 1024 * 1024 // 16MB
+
 export class IPCMessageParser {
   private remainder = ""
+  private maxRemainderBytes: number
+
+  constructor(maxRemainderBytes?: number) {
+    this.maxRemainderBytes = maxRemainderBytes ?? DEFAULT_MAX_REMAINDER_BYTES
+  }
 
   get remainderLength(): number {
     return Buffer.byteLength(this.remainder, "utf8")
@@ -114,6 +121,11 @@ export class IPCMessageParser {
     onMessage: (msg: IPCRequest | IPCResponse) => void,
   ): void {
     const text = this.remainder + chunk.toString()
+    const textSize = Buffer.byteLength(text, "utf8")
+    if (textSize > this.maxRemainderBytes) {
+      this.remainder = ""
+      throw new Error(`IPC frame exceeded max size: ${textSize} bytes > ${this.maxRemainderBytes} bytes limit. Connection may be sending invalid data.`)
+    }
     const lines = text.split("\n")
     this.remainder = lines.pop() ?? ""
 

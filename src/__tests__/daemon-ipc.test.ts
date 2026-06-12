@@ -159,6 +159,140 @@ describe("Daemon IPC Tests", () => {
       assert.equal((received[0] as IPCRequest).id, "partial-parser");
       assert.equal(parser.remainderLength, 0);
     });
+
+    it("throws when remainder exceeds maxRemainderBytes limit", () => {
+      const parser = new IPCMessageParser(100);
+      const bigData = Buffer.from("x".repeat(150));
+      assert.throws(
+        () => parser.push(bigData, () => {}),
+        (err: Error) => {
+          assert.ok(err.message.includes("max size"));
+          return true;
+        },
+      );
+    });
+
+    it("recovers after maxRemainderBytes error", () => {
+      const parser = new IPCMessageParser(100);
+      const bigData = Buffer.from("x".repeat(150));
+      try { parser.push(bigData, () => {}); } catch {}
+      // remainder should be reset
+      assert.equal(parser.remainderLength, 0);
+      // normal messages should still work
+      const received: any[] = [];
+      const raw = encodeMessage({ id: "recovery", action: "ping" });
+      parser.push(Buffer.from(raw), (m) => received.push(m));
+      assert.equal(received.length, 1);
+      assert.equal((received[0] as any).id, "recovery");
+    });
+
+    it("error message reports the actual size and configured limit", () => {
+      const parser = new IPCMessageParser(512);
+      const big = "y".repeat(1024);
+      let caught: Error | null = null;
+      try {
+        parser.push(Buffer.from(big), () => {});
+      } catch (err) {
+        caught = err as Error;
+      }
+      assert.ok(caught, "expected throw");
+      assert.ok(caught!.message.includes("1024 bytes"), "should report actual size");
+      assert.ok(caught!.message.includes("512 bytes limit"), "should report configured limit");
+    });
+
+    it("throws when default 16MB limit is exceeded", () => {
+      const parser = new IPCMessageParser();
+      // 17MB of data without any newlines pushes remainder over the default
+      // limit. The push itself is what throws; the buffer is sized so the
+      // test runs in reasonable time on a developer machine.
+      const oversize = "z".repeat(17 * 1024 * 1024);
+      let caught: Error | null = null;
+      try {
+        parser.push(Buffer.from(oversize), () => {});
+      } catch (err) {
+        caught = err as Error;
+      }
+      assert.ok(caught, "default limit should throw on >16MB");
+      assert.ok(caught!.message.includes("16MB") || caught!.message.includes("16777216"), "should mention the default 16MB cap");
+    });
+
+    it("throws when incremental pushes accumulate past the limit", () => {
+      // Split a 250-byte payload across two pushes. After the first push the
+      // remainder is 100 bytes (under the 200-byte limit). The second push
+      // brings the cumulative remainder to 250 bytes, which trips the
+      // limit. The error must be thrown on the second push, not deferred.
+      const parser = new IPCMessageParser(200);
+      const part1 = "a".repeat(100);
+      const part2 = "b".repeat(150);
+      parser.push(Buffer.from(part1), () => {});
+      assert.equal(parser.remainderLength, 100);
+      assert.throws(
+        () => parser.push(Buffer.from(part2), () => {}),
+        (err: Error) => {
+          assert.ok(err.message.includes("max size"));
+          return true;
+        },
+      );
+    });
+
+    it("does not throw when pushes stay at or just under the limit", () => {
+      const parser = new IPCMessageParser(200);
+      // 200 bytes of data with no newline fits exactly at the cap
+      parser.push(Buffer.from("a".repeat(200)), () => {});
+      assert.equal(parser.remainderLength, 200);
+      // 199 more bytes brings us to 399 — well over the cap and must throw
+      assert.throws(() => parser.push(Buffer.from("b".repeat(199)), () => {}));
+    });
+
+    it("reusable after a limit error: multiple recovers in sequence", () => {
+      const parser = new IPCMessageParser(100);
+      const oversize = Buffer.from("x".repeat(150));
+      try { parser.push(oversize, () => {}); } catch {}
+      assert.equal(parser.remainderLength, 0);
+
+      const ok1 = encodeMessage({ id: "ok-1", action: "ping" });
+      const received1: any[] = [];
+      parser.push(Buffer.from(ok1), (m) => received1.push(m));
+      assert.equal(received1.length, 1);
+
+      // Trigger another over-limit push and recover again
+      try { parser.push(Buffer.from("y".repeat(150)), () => {}); } catch {}
+      assert.equal(parser.remainderLength, 0);
+      const ok2 = encodeMessage({ id: "ok-2", action: "list" });
+      const received2: any[] = [];
+      parser.push(Buffer.from(ok2), (m) => received2.push(m));
+      assert.equal(received2.length, 1);
+      assert.equal(received2[0].id, "ok-2");
+    });
+
+    it("emits no messages for an over-limit push", () => {
+      const parser = new IPCMessageParser(100);
+      const received: any[] = [];
+      let caught: Error | null = null;
+      try {
+        parser.push(Buffer.from("not-json-at-all-" + "x".repeat(200)), (m) => received.push(m));
+      } catch (err) {
+        caught = err as Error;
+      }
+      assert.ok(caught);
+      assert.equal(received.length, 0, "no partial messages should be emitted on limit error");
+      assert.equal(parser.remainderLength, 0, "remainder must be reset so garbage doesn't linger");
+    });
+
+    it("partial message inside an oversize remainder is discarded on reset", () => {
+      const parser = new IPCMessageParser(100);
+      // Stuff the buffer with an incomplete frame (no newline) that exceeds
+      // the limit. The pending partial message should be discarded — not
+      // resurrected on the next valid push.
+      const partial = `{ "id": "never-emitted", "action": "ping", "junk": "${"x".repeat(120)}"`
+      assert.ok(partial.length > 100)
+      try { parser.push(Buffer.from(partial), () => {}); } catch {}
+      const next = encodeMessage({ id: "fresh", action: "list" })
+      const received: any[] = []
+      parser.push(Buffer.from(next), (m) => received.push(m))
+      assert.equal(received.length, 1)
+      assert.equal(received[0].id, "fresh")
+    })
   });
 
   describe("normalizeConfig", () => {

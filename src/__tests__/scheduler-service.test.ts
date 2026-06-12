@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test"
+import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
@@ -542,5 +542,117 @@ describe("SchedulerService", () => {
     assert.equal(a.action, 'run_now')
     assert.equal(b.action, 'queued')
     assert.equal(c.action, 'queued')
+  })
+
+  it('cancelTask wins when runner.cancel synchronously resolves the start promise (stream close race)', async () => {
+    // Simulates the production race in daemon startBackground: the runner's
+    // cancel() invokes stream.close() which synchronously fires the
+    // 'close' handler → onClose → finishTask. The scheduler must keep the
+    // task in 'cancelled' state even though finishTask would otherwise
+    // observe status='running' and overwrite it.
+    class SyncCloseRunner implements TaskRunner {
+      startedTasks: ScheduledTask[] = []
+      private resolvers = new Map<string, (result: { code: number; stdout: string; stderr: string; signal?: string }) => void>()
+
+      async start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
+        this.startedTasks.push(task)
+        return new Promise((resolve) => {
+          this.resolvers.set(task.id, resolve)
+        })
+      }
+
+      startBackground(): void {
+        // not used
+      }
+
+      cancel(task: ScheduledTask): boolean {
+        // Synchronously close the stream: resolves the start promise, which
+        // schedules finishTask via the .then microtask. With the old code,
+        // finishTask would race with the cancelTask status update.
+        const resolve = this.resolvers.get(task.id)
+        if (resolve) {
+          this.resolvers.delete(task.id)
+          resolve({ code: 0, stdout: 'late-output\n', stderr: '' })
+        }
+        return true
+      }
+    }
+
+    const syncRunner = new SyncCloseRunner()
+    const s = new SchedulerService({
+      persistence,
+      runner: syncRunner,
+      outputStore: new OutputStore(join(tmpDir, 'sync-close-outputs')),
+      eventLog: new EventLog(join(tmpDir, 'events-sync-close')),
+    })
+
+    const d = s.schedule(makeRequest({ command: 'npm test', cost: 'large' }))
+    assert.equal(d.action, 'run_now')
+    assert.equal(s.getTask(d.taskId!)?.status, 'running')
+
+    const cancelled = s.cancelTask(d.taskId!)
+    assert.equal(cancelled, true)
+
+    // Let the .then microtask from the sync resolve run
+    await new Promise(r => setImmediate(r))
+
+    const task = s.getTask(d.taskId!)
+    assert.equal(task?.status, 'cancelled', 'cancel must not be overwritten by sync stream-close finishTask')
+    assert.equal(task?.exitCode, undefined)
+    assert.equal(task?.decisionReason, 'Cancelled by cancel request.')
+  })
+
+  it('cancelTask restores running state when runner.cancel returns false', async () => {
+    class CancelRefusedRunner implements TaskRunner {
+      private resolvers = new Map<string, (result: { code: number; stdout: string; stderr: string; signal?: string }) => void>()
+
+      async start(task: ScheduledTask): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
+        return new Promise((resolve) => {
+          this.resolvers.set(task.id, resolve)
+        })
+      }
+
+      startBackground(): void {}
+
+      cancel(_task: ScheduledTask): boolean {
+        return false
+      }
+
+      finish(taskId: string, result: { code: number; stdout: string; stderr: string }) {
+        const fn = this.resolvers.get(taskId)
+        if (fn) {
+          this.resolvers.delete(taskId)
+          fn(result)
+        }
+      }
+    }
+
+    const runner2 = new CancelRefusedRunner()
+    const s = new SchedulerService({
+      persistence,
+      runner: runner2,
+      outputStore: new OutputStore(join(tmpDir, 'cancel-refused-outputs')),
+      eventLog: new EventLog(join(tmpDir, 'events-cancel-refused')),
+    })
+
+    const d = s.schedule(makeRequest({ command: 'sleep 999', cost: 'large' }))
+    const cancelled = s.cancelTask(d.taskId!)
+    assert.equal(cancelled, false)
+    assert.equal(s.getTask(d.taskId!)?.status, 'running')
+
+    // Late completion should be allowed to finish the still-running task
+    runner2.finish(d.taskId!, { code: 0, stdout: '', stderr: '' })
+    await new Promise(r => setImmediate(r))
+    assert.equal(s.getTask(d.taskId!)?.status, 'completed')
+  })
+
+  it('dispose clears the idle eviction timer and is idempotent', () => {
+    const t = scheduler as unknown as { idleEvictTimer: ReturnType<typeof setInterval> | null }
+    assert.ok(t.idleEvictTimer, 'constructor should have started the idle eviction timer')
+    scheduler.dispose()
+    assert.equal(t.idleEvictTimer, null, 'dispose should null out the timer handle')
+    // Second call must be a no-op (must not throw).
+    scheduler.dispose()
+    assert.equal(t.idleEvictTimer, null)
   })
 })

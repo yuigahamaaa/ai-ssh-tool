@@ -238,4 +238,70 @@ describe("SSHDaemon", () => {
       client.disconnect()
     })
   })
+
+  describe("session bookkeeping cleanup", () => {
+    it("cleanupSession removes the sessionMap entry and the forwardManager for that session", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      const d = daemon as unknown as {
+        sessionMap: Map<string, { sessionId: string; configHash: string }>
+        forwardManagers: Map<string, unknown>
+        cleanupSession: (sessionId: string) => void
+      }
+
+      // Pre-populate bookkeeping for two sessions.
+      d.sessionMap.set("hash-a", { sessionId: "sess-a", configHash: "hash-a" })
+      d.sessionMap.set("hash-b", { sessionId: "sess-b", configHash: "hash-b" })
+      d.forwardManagers.set("sess-a", { marker: true })
+      d.forwardManagers.set("sess-b", { marker: true })
+      // Unrelated session with a manager but no sessionMap entry (e.g. created
+      // before being recorded) — its forwardManager must be cleared too.
+      d.forwardManagers.set("sess-c", { marker: true })
+
+      assert.equal(d.sessionMap.size, 2)
+      assert.equal(d.forwardManagers.size, 3)
+
+      d.cleanupSession("sess-a")
+
+      assert.equal(d.sessionMap.size, 1)
+      assert.ok(!d.sessionMap.has("hash-a"))
+      assert.ok(d.sessionMap.has("hash-b"))
+      assert.ok(!d.forwardManagers.has("sess-a"))
+      assert.ok(d.forwardManagers.has("sess-b"))
+      assert.ok(d.forwardManagers.has("sess-c"))
+
+      // cleanupSession on a session with no sessionMap entry should still drop
+      // its forwardManager (covers the "freshly created then disconnected"
+      // path in handleConnect error blocks).
+      d.cleanupSession("sess-c")
+      assert.equal(d.forwardManagers.size, 1)
+      assert.ok(d.forwardManagers.has("sess-b"))
+    })
+
+    it("shutdown clears all forwardManagers and disposes the scheduler", async () => {
+      const scheduler = new SchedulerService({
+        persistence: new PersistenceStore(join(tmpDir, "shutdown-scheduler")),
+        runner: new FakeSchedulerRunner(),
+        outputStore: new OutputStore(join(tmpDir, "shutdown-outputs")),
+        eventLog: new EventLog(join(tmpDir, "shutdown-events")),
+        maxLargeRunning: 1,
+      })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler })
+      await daemon.start()
+
+      const d = daemon as unknown as {
+        forwardManagers: Map<string, unknown>
+        scheduler: { idleEvictTimer: ReturnType<typeof setInterval> | null }
+      }
+      d.forwardManagers.set("sess-x", { marker: true })
+      assert.equal(d.forwardManagers.size, 1)
+      assert.ok(d.scheduler.idleEvictTimer, "scheduler must have started its timer")
+
+      await daemon.shutdown()
+
+      assert.equal(d.forwardManagers.size, 0)
+      assert.equal(d.scheduler.idleEvictTimer, null, "scheduler.dispose() should clear the timer")
+    })
+  })
 })

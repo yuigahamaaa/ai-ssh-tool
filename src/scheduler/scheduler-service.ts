@@ -62,6 +62,7 @@ export class SchedulerService {
   private runningByHost = new Map<string, Set<string>>()
   private queuedByHost = new Map<string, Set<string>>()
   private lastEvictAt = 0
+  private idleEvictTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(opts?: SchedulerServiceOptions) {
     this.persistence = opts?.persistence ?? new PersistenceStore()
@@ -82,10 +83,24 @@ export class SchedulerService {
     this.restore()
     this.cleanupOutputs()
 
-    // Idle eviction: periodically clean up finished tasks even when scheduler is idle
-    setInterval(() => {
+    // Idle eviction: periodically clean up finished tasks even when scheduler is idle.
+    // The handle is stored so dispose() can clear the timer and prevent the timer
+    // from keeping the process alive in tests and short-lived callers.
+    this.idleEvictTimer = setInterval(() => {
       this.evictOldTasks()
     }, IDLE_EVICT_INTERVAL_MS)
+  }
+
+  /**
+   * Release scheduler-owned resources (idle eviction timer). Safe to call multiple
+   * times; subsequent calls are no-ops. After dispose(), the scheduler should not be
+   * expected to process new tasks (callers should treat it as terminated).
+   */
+  dispose(): void {
+    if (this.idleEvictTimer) {
+      clearInterval(this.idleEvictTimer)
+      this.idleEvictTimer = null
+    }
   }
 
   private restore(): void {
@@ -312,20 +327,33 @@ export class SchedulerService {
   cancelTask(taskId: string): boolean {
     const task = this.tasks.get(taskId)
     if (!task) return false
+    if (task.status !== "running" && task.status !== "queued") return false
 
-    if (task.status === "running" && this.runner.cancel) {
-      const cancelled = this.runner.cancel(task)
-      if (!cancelled) return false
-    } else if (task.status !== "queued") {
-      return false
-    }
-
+    const wasRunning = task.status === "running"
     const hostId = task.hostId
 
+    // Mark as cancelled BEFORE invoking runner.cancel. The runner's cancel()
+    // may synchronously trigger stream.close(), which fires the stream's
+    // "close" handler → onClose callback → finishTask. Without this ordering,
+    // finishTask would observe status="running" and overwrite the cancel
+    // state with "completed"/"failed". See exec-task-manager.ts cancel() for
+    // the same pattern.
     this.removeFromIndex(task)
     task.status = "cancelled"
     task.updatedAt = Date.now()
     task.decisionReason = "Cancelled by cancel request."
+
+    if (wasRunning && this.runner.cancel) {
+      const cancelled = this.runner.cancel(task)
+      if (!cancelled) {
+        // runner refused; restore the previous status/index so the task keeps
+        // running as if cancel was never called.
+        task.status = "running"
+        this.addToIndex(task)
+        return false
+      }
+    }
+
     this.lockManager.releaseForTask(taskId)
     this.persistence.saveTask(task)
     this.eventLog.log("task_cancelled", { taskId, hostId, agentId: task.agentId })

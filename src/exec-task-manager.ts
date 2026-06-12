@@ -422,7 +422,11 @@ export class ExecTaskManager {
 
     this.saveTask(entry, true)
 
-    log("exec-task", `Task ${id} finished: ${status}, code=${exitCode}, signal=${signal}`)
+    // Release runtime resources to prevent memory growth in long-lived daemons
+    entry.stream = null as any
+    entry.client = null as any
+    this.tasks.delete(id)
+    log("exec-task", `Task ${id} finished and evicted from memory: ${status}, code=${exitCode}, signal=${signal}`)
   }
 
   cancel(id: string, client: Client, signal: "TERM" | "HUP" = "TERM"): boolean {
@@ -440,13 +444,16 @@ export class ExecTaskManager {
       client.exec(killCmd, () => {})
     }
 
+    // Mark cancelled BEFORE closing stream to prevent race with stream.on("close")
+    // callback which would overwrite status to "completed" via finishTask
+    this.finishTask(id, "cancelled", 130, signal)
+
     if (entry.stream) {
       try {
         entry.stream.close()
       } catch {}
     }
 
-    this.finishTask(id, "cancelled", 130, signal)
     return true
   }
 

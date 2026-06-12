@@ -281,7 +281,12 @@ export class SSHDaemon {
 
     this.server = createServer((socket) => this.handleConnection(socket))
 
-    // Clean up stale socket file on Unix
+    // Singleton check: prevent duplicate daemon instances
+    if (this.isExistingDaemonAlive()) {
+      throw new Error("Daemon already running. Use the existing daemon instead of starting a new one.")
+    }
+
+    // Clean up stale socket file on Unix (only if no live daemon owns it)
     if (process.platform !== "win32" && existsSync(this.pipePath)) {
       try {
         unlinkSync(this.pipePath)
@@ -335,7 +340,9 @@ export class SSHDaemon {
     }
     if (this.idleSweeper) clearInterval(this.idleSweeper)
     this.idleSweeper = null
+    this.scheduler.dispose()
     await this.gateway.disconnectAll()
+    this.forwardManagers.clear()
     for (const socket of this.sockets) {
       try { socket.end() } catch {}
       try { socket.destroy() } catch {}
@@ -546,6 +553,7 @@ export class SSHDaemon {
       this.sessionMap.delete(configHash)
       if (session) {
         this.gateway.disconnect(existing.sessionId).catch(() => {})
+        this.forwardManagers.delete(existing.sessionId)
       }
     }
 
@@ -582,12 +590,13 @@ export class SSHDaemon {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
           this.gateway.disconnect(entry.sessionId).catch(() => {})
-          this.sessionMap.delete(sid)
+          this.cleanupSession(entry.sessionId)
         }
       }
       // Also clean up error sessions not in sessionMap (freshly created ones)
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
         this.gateway.disconnect(s.id).catch(() => {})
+        this.forwardManagers.delete(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
     }
@@ -609,6 +618,7 @@ export class SSHDaemon {
       this.sessionMap.delete(configHash)
       if (session) {
         this.gateway.disconnect(existing.sessionId).catch(() => {})
+        this.forwardManagers.delete(existing.sessionId)
       }
     }
 
@@ -644,11 +654,12 @@ export class SSHDaemon {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
           this.gateway.disconnect(entry.sessionId).catch(() => {})
-          this.sessionMap.delete(sid)
+          this.cleanupSession(entry.sessionId)
         }
       }
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
         this.gateway.disconnect(s.id).catch(() => {})
+        this.forwardManagers.delete(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
     }
@@ -670,13 +681,7 @@ export class SSHDaemon {
       // Connection might be dead, clean up
       try {
         await this.gateway.disconnect(sessionId)
-        // Remove from sessionMap
-        for (const [hash, entry] of this.sessionMap) {
-          if (entry.sessionId === sessionId) {
-            this.sessionMap.delete(hash)
-            break
-          }
-        }
+        this.cleanupSession(sessionId)
       } catch {
         // ignore cleanup errors
       }
@@ -970,13 +975,40 @@ export class SSHDaemon {
       if (session.status === "connected" && now - session.lastActivity > this.idleTimeoutMs) {
         console.log(`[daemon] idle timeout: disconnecting ${session.name} (${session.id})`)
         this.gateway.disconnect(session.id).catch(() => {})
-        for (const [hash, entry] of this.sessionMap) {
-          if (entry.sessionId === session.id) {
-            this.sessionMap.delete(hash)
-            break
-          }
-        }
+        this.cleanupSession(session.id)
       }
+    }
+  }
+
+  /**
+   * Remove per-session bookkeeping (sessionMap entry + forwardManager). Called
+   * on every path that disconnects a session so the maps don't grow unbounded
+   * over the daemon's lifetime.
+   */
+  private cleanupSession(sessionId: string): void {
+    this.forwardManagers.delete(sessionId)
+    for (const [hash, entry] of this.sessionMap) {
+      if (entry.sessionId === sessionId) {
+        this.sessionMap.delete(hash)
+        break
+      }
+    }
+  }
+
+  private isExistingDaemonAlive(): boolean {
+    try {
+      const pidPath = getPidPath()
+      if (!existsSync(pidPath)) return false
+      const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10)
+      if (isNaN(pid) || pid <= 0) return false
+      // The current process may have just written its own PID via writePid().
+      // A daemon should never consider itself a duplicate of itself.
+      if (pid === process.pid) return false
+      // process.kill(pid, 0) checks if process is alive without sending a signal
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -991,7 +1023,13 @@ export class SSHDaemon {
   private removePid(): void {
     try {
       const pidPath = getPidPath()
-      if (existsSync(pidPath)) unlinkSync(pidPath)
+      if (!existsSync(pidPath)) return
+      const content = readFileSync(pidPath, "utf-8").trim()
+      const recordedPid = parseInt(content, 10)
+      // Only delete if PID matches current process to avoid removing another daemon's PID file
+      if (recordedPid === process.pid) {
+        unlinkSync(pidPath)
+      }
     } catch {
       // ignore
     }
