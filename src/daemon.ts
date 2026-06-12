@@ -547,21 +547,27 @@ export class SSHDaemon {
   private async handleConnect(req: IPCRequest & { action: "connect" }): Promise<IPCResponse> {
     const { configPath } = req.params
 
-    // Read config with mtime-based cache
+    // Read config with mtime-based cache. The cache stores both the raw
+    // content (for cache hits, to skip the readFileSync) and the parsed
+    // object (for the second `JSON.parse` in the hit path, so we go from
+    // 2-3 parses per connect to 1 only on the cold path).
     const stat = (await import("fs/promises")).stat
     const statResult = await stat(configPath)
     const cached = this.configCache.get(configPath)
     let configHash: string
-    let configContent: string
+    let config: any
 
     if (cached && cached.mtime === statResult.mtimeMs) {
+      // Hot path: zero reads, zero parses.
       configHash = cached.hash
-      configContent = cached.content
+      config = cached.parsed
     } else {
-      configContent = readFileSync(configPath, "utf-8")
-      const normalized = normalizeConfig(configContent)
-      configHash = createHash("md5").update(normalized).digest("hex")
+      const configContent = readFileSync(configPath, "utf-8")
+      // Parse exactly once, then feed the object to normalizeConfig.
       const parsed = JSON.parse(configContent)
+      const normalized = normalizeConfig(parsed)
+      configHash = createHash("md5").update(normalized).digest("hex")
+      config = parsed
       this.configCache.set(configPath, { hash: configHash, mtime: statResult.mtimeMs, content: configContent, parsed })
     }
 
@@ -579,9 +585,6 @@ export class SSHDaemon {
       }
     }
 
-    // Parse config and connect
-    const cachedEntry = this.configCache.get(configPath)
-    const config = cachedEntry?.parsed ?? JSON.parse(configContent)
     if (!config.target?.host || !config.target?.username) {
       return { id: req.id, ok: false, error: "Config must have target.host and target.username" }
     }

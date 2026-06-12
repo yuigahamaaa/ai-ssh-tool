@@ -295,33 +295,17 @@ export class ExecTaskManager {
         stream.on("data", (data: Buffer) => {
           const text = data.toString()
           if (!pidCaptured) {
+            // PID is always echoed to stderr (see the `echo "SSH_TOOL_PID:$$" >&2`
+            // prefix above) — it never appears on stdout. So we don't need to
+            // scan stdout for the PID marker, and we can short-circuit the
+            // detection as soon as the PID is parsed from stderr. Until then
+            // we just buffer into a bounded `firstLine` and flush to the
+            // normal chunk buffer once it exceeds the 4KB cap.
             firstLine += text
-            // Cap firstLine at 4KB — if PID hasn't appeared by then, the command
-            // likely doesn't echo PID to stdout (it's echoed to stderr via >&2).
             if (firstLine.length > 4096) {
               pidCaptured = true
               stdoutChunks.push(Buffer.from(firstLine))
               this.trimChunks(stdoutChunks)
-              firstLine = ""
-            } else
-            if (firstLine.includes("\n")) {
-              const pidStr = firstLine.split("\n")[0].trim()
-              const pid = parseInt(pidStr)
-              if (!isNaN(pid)) {
-                task.pid = pid
-                pidCaptured = true
-                task.updatedAt = Date.now()
-                if (persistImmediate) this.saveTask(entry, true)
-                const remaining = firstLine.slice(firstLine.indexOf("\n") + 1) + text.slice(firstLine.length)
-                if (remaining) {
-                  stdoutChunks.push(Buffer.from(remaining))
-                  this.trimChunks(stdoutChunks)
-                }
-              } else {
-                pidCaptured = true
-                stdoutChunks.push(Buffer.from(firstLine))
-                this.trimChunks(stdoutChunks)
-              }
               firstLine = ""
             }
           } else {

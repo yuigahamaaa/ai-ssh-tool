@@ -106,6 +106,12 @@ const DEFAULT_MAX_REMAINDER_BYTES = 16 * 1024 * 1024 // 16MB
 
 export class IPCMessageParser {
   private chunks: Buffer[] = []
+  // Offset into chunks[0] of the first byte not yet consumed. After a
+  // newline splits off a frame we advance this; once it reaches
+  // chunks[0].length we discard that buffer. The offset only ever moves
+  // forward and never wraps, so a long stream of small frames doesn't
+  // keep a 10MB+ buffer alive.
+  private firstChunkOffset = 0
   private totalBytes = 0
   private maxRemainderBytes: number
 
@@ -135,53 +141,117 @@ export class IPCMessageParser {
       )
     }
 
-    // Scan the new chunk for newline boundaries without full concat.
-    // Only Buffer.concat when we find at least one complete frame.
     this.chunks.push(buf)
 
-    let hasNewline = false
-    for (let i = buf.length - 1; i >= 0; i--) {
-      if (buf[i] === 10) { // '\n'
-        hasNewline = true
-        break
-      }
-    }
-    // If no newline in this chunk, just accumulate — don't concat yet.
-    if (!hasNewline) return
-
-    const combined = Buffer.concat(this.chunks)
-    this.chunks = []
-    this.totalBytes = 0
-
-    // Split on newline (byte 10)
-    let start = 0
-    for (let i = 0; i < combined.length; i++) {
-      if (combined[i] === 10) {
-        const lineBuf = combined.subarray(start, i)
-        start = i + 1
-        if (lineBuf.length > 0) {
-          const line = lineBuf.toString("utf8").trim()
-          if (line) {
-            try {
-              onMessage(JSON.parse(line))
-            } catch {
-              // skip malformed lines
-            }
+    // Scan the chunk list for newline boundaries and emit one frame per
+    // newline, **without ever re-copying bytes we have already passed**.
+    // The previous implementation called `Buffer.concat(this.chunks)` on
+    // every push that contained a newline, which turned large-frame
+    // streams (e.g. 10MB `getTaskOutput full` responses) into O(n²)
+    // copies: each new 64KB chunk triggered a reallocation of the entire
+    // growing remainder. Here we walk the chunks array with an offset
+    // cursor and only allocate the bytes of the frame itself, so the
+    // total per-frame allocation stays O(frame_size) regardless of how
+    // many chunks came before it.
+    while (this.chunks.length > 0) {
+      // Find the next newline across all chunks. A newline may be:
+      //  - inside chunks[0] at offset >= firstChunkOffset
+      //  - inside chunks[k] for k >= 1 at offset >= 0
+      // Returns (chunkIndex, byteIndex) of the newline byte, or null if
+      // none was found yet.
+      let newlineAt: { chunkIdx: number; byteIdx: number } | null = null
+      for (let ci = 0; ci < this.chunks.length; ci++) {
+        const c = this.chunks[ci]
+        const start = ci === 0 ? this.firstChunkOffset : 0
+        for (let i = start; i < c.length; i++) {
+          if (c[i] === 10) {
+            newlineAt = { chunkIdx: ci, byteIdx: i }
+            break
           }
         }
+        if (newlineAt) break
       }
+      if (!newlineAt) {
+        // No newline anywhere yet; keep accumulating.
+        break
+      }
+
+      // Slice out the frame bytes. The frame starts at `firstChunkOffset`
+      // in chunks[0] and ends at the byte before the newline.
+      const { chunkIdx: nlChunk, byteIdx: nlByte } = newlineAt
+      const frameEndExclusive = nlByte + 1 // skip the newline byte
+
+      if (nlChunk === 0 && this.firstChunkOffset === 0 && frameEndExclusive === this.chunks[0].length) {
+        // Single-chunk frame, fits entirely inside chunks[0]. Fast path:
+        // take a subarray view, then drop chunks[0] entirely.
+        const lineBuf = this.chunks[0]
+        this.chunks.shift()
+        this.firstChunkOffset = 0
+        this.emitLine(lineBuf, onMessage)
+        continue
+      }
+
+      if (nlChunk === 0 && frameEndExclusive <= this.chunks[0].length) {
+        // Frame is contained in chunks[0] but the chunk has more bytes
+        // after the newline.
+        const lineBuf = this.chunks[0].subarray(this.firstChunkOffset, nlByte)
+        this.firstChunkOffset = frameEndExclusive
+        this.emitLine(lineBuf, onMessage)
+        continue
+      }
+
+      // Frame spans multiple chunks. Walk chunks and accumulate only the
+      // frame bytes; the remainder after the newline stays in chunks[0]
+      // (a subarray view) so no re-allocation happens.
+      const parts: Buffer[] = []
+      let totalLen = 0
+      for (let ci = 0; ci <= nlChunk; ci++) {
+        const c = this.chunks[ci]
+        const startInChunk = ci === 0 ? this.firstChunkOffset : 0
+        if (ci === nlChunk) {
+          parts.push(c.subarray(startInChunk, frameEndExclusive))
+          totalLen += frameEndExclusive - startInChunk
+        } else {
+          parts.push(c.subarray(startInChunk))
+          totalLen += c.length - startInChunk
+        }
+      }
+      // Replace chunks[0] with the leftover bytes (everything after the
+      // newline in the newline's chunk), and drop everything up to and
+      // including that chunk.
+      this.chunks[0] = this.chunks[nlChunk].subarray(frameEndExclusive)
+      // Drop chunks[1..nlChunk] since their bytes are now in `parts`.
+      this.chunks.splice(1, nlChunk)
+      this.firstChunkOffset = 0
+      const lineBuf = parts.length === 1 ? parts[0] : Buffer.concat(parts, totalLen)
+      this.emitLine(lineBuf, onMessage)
     }
 
-    // Remaining bytes after the last newline become the new accumulator
-    if (start < combined.length) {
-      const remainder = combined.subarray(start)
-      this.chunks.push(remainder)
-      this.totalBytes = remainder.length
+    // Recompute the cached byte count so `remainderLength` is accurate.
+    let total = 0
+    if (this.chunks.length > 0) {
+      total += this.chunks[0].length - this.firstChunkOffset
+      for (let i = 1; i < this.chunks.length; i++) total += this.chunks[i].length
+    }
+    this.totalBytes = total
+  }
+
+  private emitLine(
+    lineBuf: Buffer,
+    onMessage: (msg: IPCRequest | IPCResponse) => void,
+  ): void {
+    const line = lineBuf.toString("utf8").trim()
+    if (!line) return
+    try {
+      onMessage(JSON.parse(line))
+    } catch {
+      // skip malformed lines
     }
   }
 
   reset(): void {
     this.chunks = []
+    this.firstChunkOffset = 0
     this.totalBytes = 0
   }
 }
@@ -199,13 +269,18 @@ export function createRequest(
   return { id, action } as IPCRequest
 }
 
-/** Deep-sort JSON keys to produce a canonical hash regardless of key order */
-export function normalizeConfig(jsonStr: string): string {
-  const parsed = JSON.parse(jsonStr)
+/**
+ * Deep-sort JSON keys to produce a canonical hash regardless of key order.
+ * Accepts either a JSON string (one parse) or an already-parsed object (no
+ * parse) so callers with a cached parsed tree can skip the second JSON.parse
+ * the daemon previously had to do per `connect` call.
+ */
+export function normalizeConfig(input: string | unknown): string {
+  const parsed = typeof input === "string" ? JSON.parse(input) : input
   return JSON.stringify(parsed, (_key, value) => {
     if (value && typeof value === "object" && !Array.isArray(value)) {
-      return Object.keys(value).sort().reduce((sorted: Record<string, unknown>, key) => {
-        sorted[key] = value[key]
+      return Object.keys(value as Record<string, unknown>).sort().reduce((sorted: Record<string, unknown>, key) => {
+        sorted[key] = (value as Record<string, unknown>)[key]
         return sorted
       }, {})
     }

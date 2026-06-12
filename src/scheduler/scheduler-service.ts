@@ -627,17 +627,109 @@ export class SchedulerService {
   }
 
   private pumpQueue(hostId: string): void {
-    const queued = this.getQueuedTasks(hostId)
-    for (const task of queued) {
-      const blockers = this.findBlockers(task)
-      if (blockers.length === 0) {
-        this.startTask(task)
-        task.queuePosition = undefined
-        this.persistence.saveTask(task)
-        this.eventLog.log("task_dequeued", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
+    // The non-bypass running snapshot is O(r), so recomputing it per task
+    // would turn the queue drain into O(queued × running) — the very
+    // thing this refactor is meant to avoid. We recompute the snapshot
+    // and the per-cost counters only when a task actually starts, since
+    // `startTask` is the only event in the loop body that can grow the
+    // running set. Each pass of the loop consumes a known prefix of
+    // the queue, and tasks that would no longer fit are skipped on
+    // the next pumpQueue invocation (which is cheap — typically
+    // immediately, via `finishTask`).
+    while (true) {
+      const nonBypass = this.getNonBypassRunningTasks(hostId)
+      const queued = this.getQueuedTasks(hostId)
+      if (queued.length === 0) break
+
+      const nonBypassCount = nonBypass.length
+      const largeOrExclusiveCount = nonBypass.reduce(
+        (n, t) => (t.classification.cost === "large" || t.classification.cost === "exclusive" ? n + 1 : n),
+        0,
+      )
+      const exclusiveCount = nonBypass.reduce(
+        (n, t) => (t.classification.cost === "exclusive" ? n + 1 : n),
+        0,
+      )
+
+      let startedAny = false
+      for (const task of queued) {
+        if (this.findBlockersWithPrecomputed(task, nonBypass, nonBypassCount, largeOrExclusiveCount, exclusiveCount).length === 0) {
+          this.startTask(task)
+          task.queuePosition = undefined
+          this.persistence.saveTask(task)
+          this.eventLog.log("task_dequeued", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
+          startedAny = true
+          break // break so the next iteration re-snapshots `nonBypass` with the new running task included
+        }
       }
+      if (!startedAny) break
     }
     this.recomputeQueuePositions(hostId)
+  }
+
+  /**
+   * Snapshot the non-bypass running tasks for a host. Cheap O(r) walk that
+   * callers can pass into `findBlockersWithPrecomputed` to amortize across
+   * the queue drain.
+   */
+  private getNonBypassRunningTasks(hostId: string): ScheduledTask[] {
+    const runningIds = this.runningByHost.get(hostId)
+    if (!runningIds || runningIds.size === 0) return []
+    const out: ScheduledTask[] = []
+    for (const id of runningIds) {
+      const t = this.tasks.get(id)
+      if (!t || t.status !== "running") continue
+      if (t.scheduler !== "bypass") out.push(t)
+    }
+    return out
+  }
+
+  /**
+   * Same blocker check as `findBlockers`, but reuses pre-computed running
+   * sets and per-cost counters. Also folds the lock-conflict check (large
+   * / exclusive only) inline so the per-task fast path stays O(1) given
+   * the precomputed counts.
+   */
+  private findBlockersWithPrecomputed(
+    task: ScheduledTask,
+    nonBypass: ScheduledTask[],
+    nonBypassCount: number,
+    largeOrExclusiveCount: number,
+    exclusiveCount: number,
+  ): ScheduledTaskSummary[] {
+    if (nonBypassCount === 0) return []
+
+    if (task.classification.cost === "exclusive" || task.classification.cost === "large") {
+      if (task.effectiveCwd) {
+        const workdirConflicts = this.lockManager.getConflictingLocks("workdir", task.effectiveCwd, task.hostId)
+        if (workdirConflicts.length > 0) {
+          const blockingTaskIds = workdirConflicts.map((l) => l.ownerTaskId).filter(Boolean) as string[]
+          const blockingSummaries: ScheduledTaskSummary[] = []
+          for (const id of blockingTaskIds) {
+            const t = this.tasks.get(id)
+            if (t) blockingSummaries.push(toSummary(t))
+          }
+          if (blockingSummaries.length > 0) return blockingSummaries
+        }
+      }
+    }
+
+    switch (task.classification.cost) {
+      case "tiny":
+        return exclusiveCount > 0
+          ? nonBypass.filter((t) => t.classification.cost === "exclusive").map(toSummary)
+          : []
+      case "small":
+      case "medium":
+        return nonBypassCount >= this.maxTotalRunning ? nonBypass.map(toSummary) : []
+      case "large":
+        return largeOrExclusiveCount > 0
+          ? nonBypass.filter((t) => t.classification.cost === "large" || t.classification.cost === "exclusive").map(toSummary)
+          : []
+      case "exclusive":
+        return nonBypass.map(toSummary)
+    }
+    return []
   }
 
   private getRunningTasks(hostId?: string): ScheduledTask[] {
