@@ -222,6 +222,8 @@ export type EventType =
   | "lock_released"
   | "task_dequeued"
   | "cwd_changed"
+  | "task_created_external"
+  | "task_finished_external"
 
 export interface SchedulerEvent {
   id: string

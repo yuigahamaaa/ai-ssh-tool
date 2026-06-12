@@ -14,7 +14,8 @@ import { join } from "path"
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync } from "fs"
 import { homedir } from "os"
 import { log } from "./logger.js"
-import type { SchedulerService } from "./scheduler/scheduler-service.js"
+import { SchedulerService } from "./scheduler/scheduler-service.js"
+import type { ScheduleRequest, TaskRunner } from "./scheduler/types.js"
 
 /**
  * Get user data directory with cross-platform support.
@@ -96,11 +97,24 @@ export class ExecTaskManager {
    * Optional scheduler reference. When present, getStatus/getOutput/list
    * consult the scheduler first so the legacy facade stays in sync with
    * tasks created via the modern scheduler path. Stage 2 / Task 2.3.
+   *
+   * start() also delegates to the scheduler: it calls
+   * registerExternal() to publish the task, then finishExternalTask()
+   * when the legacy exec path completes. The runner is a no-op because
+   * the actual execution happens on the raw ssh2 Client the caller
+   * provided. Stage 2 / Task 2.1.
    */
-  private scheduler: SchedulerService | null = null
+  private scheduler: SchedulerService
 
   constructor(opts?: { scheduler?: SchedulerService }) {
-    this.scheduler = opts?.scheduler ?? null
+    this.scheduler =
+      opts?.scheduler ??
+      new SchedulerService({
+        runner: {
+          start: async () => ({ code: 0, stdout: "", stderr: "" }),
+          startBackground: () => {},
+        } satisfies TaskRunner,
+      })
     this.loadTasksFromDisk()
     this.cleanupOldTasks()
   }
@@ -283,6 +297,24 @@ export class ExecTaskManager {
     this.tasks.set(id, entry)
     this.saveTask(entry, true)
 
+    // Stage 2 / Task 2.1: publish the task to the scheduler so it shows
+    // up in the unified state. The scheduler's runner is a no-op — the
+    // real work happens below on the raw ssh2 Client.
+    try {
+      this.scheduler.registerExternal({
+        agent: { id: "exec-task-manager", name: "exec-task-manager", clientType: "internal" as const },
+        host: { id: hostname, profileKey: options?.profileKey ?? "", targetHost: hostname, targetUser: "", displayName: hostname },
+        sessionId: options?.sessionId ?? id,
+        command,
+        ...(options?.cwd ? { cwd: options.cwd } : {}),
+        ...(options?.profileKey ? { profileKey: options.profileKey } : {}),
+        scheduler: "bypass",
+        reason: "exec-task-manager legacy path",
+      } as unknown as ScheduleRequest)
+    } catch (err) {
+      log("exec-task", `scheduler.registerExternal failed for ${id}: ${(err as Error).message}`)
+    }
+
 
     const flushChunks = () => {
       if (entry.chunksFlushed) return
@@ -365,6 +397,17 @@ export class ExecTaskManager {
           flushChunks()
           const status = code === 0 ? "completed" : "failed"
           this.finishTask(id, status, code ?? 0, signal ?? undefined)
+          // Stage 2 / Task 2.1: notify the scheduler of completion
+          try {
+            this.scheduler.finishExternalTask(id, {
+              code: code ?? 0,
+              stdout: task.stdout,
+              stderr: task.stderr,
+              ...(signal ? { signal } : {}),
+            })
+          } catch (err) {
+            log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
+          }
           resolve({
             stdout: task.stdout,
             stderr: task.stderr,
@@ -395,6 +438,17 @@ export class ExecTaskManager {
               }
               flushChunks()
               this.finishTask(id, "timeout", 124, "TERM")
+              // Stage 2 / Task 2.1: notify the scheduler of timeout completion
+              try {
+                this.scheduler.finishExternalTask(id, {
+                  code: 124,
+                  stdout: task.stdout,
+                  stderr: task.stderr,
+                  signal: "TERM",
+                })
+              } catch (err) {
+                log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
+              }
               reject(new Error(`Command timed out after ${options.timeout}ms`))
             }
           }, options.timeout)

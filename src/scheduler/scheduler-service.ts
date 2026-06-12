@@ -172,6 +172,66 @@ export class SchedulerService {
     return record
   }
 
+  /**
+   * Register a task that is being executed outside the scheduler's
+   * TaskRunner (e.g. by the legacy ExecTaskManager that holds a raw
+   * ssh2 Client). The task is added to the in-memory map and the
+   * onTaskCreated hook fires, but no runner is invoked. The caller is
+   * responsible for calling finishExternalTask() when the work is
+   * done. Stage 2 / Task 2.1 — bridge path for the dual-track merge.
+   */
+  registerExternal(req: ScheduleRequest): ScheduledTask {
+    this.registerAgent(req.agent)
+    const effectiveCwd = this.virtualCwdStore.resolve(req.agent.id, req.host.id, req.cwd)
+    const classification = classifyCommand(req.command, {
+      intent: req.intent,
+      cost: req.cost,
+      force: req.force,
+    })
+    const task = this.createTask(req, effectiveCwd, classification)
+    task.status = "running"
+    task.startedAt = Date.now()
+    task.updatedAt = Date.now()
+    this.tasks.set(task.id, task)
+    this.persistence.saveTask(task)
+    this.outputStore.create(task.id)
+    this.eventLog.log("task_created_external", {
+      taskId: task.id,
+      hostId: task.hostId,
+      agentId: task.agentId,
+      data: { command: task.command },
+    })
+    this.invokeHook("onTaskCreated", task)
+    return task
+  }
+
+  /**
+   * Mark an externally-driven task as finished. Stage 2 / Task 2.1.
+   */
+  finishExternalTask(
+    taskId: string,
+    result: { code: number; stdout: string; stderr: string; signal?: string },
+  ): void {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    task.exitCode = result.code
+    task.signal = result.signal ?? null
+    task.status = "completed"
+    task.finishedAt = Date.now()
+    task.updatedAt = Date.now()
+    // Stream the captured output into OutputStore so getTaskOutput works
+    if (result.stdout) this.outputStore.appendStdout(taskId, result.stdout)
+    if (result.stderr) this.outputStore.appendStderr(taskId, result.stderr)
+    this.persistence.saveTask(task)
+    this.eventLog.log("task_finished_external", {
+      taskId: task.id,
+      hostId: task.hostId,
+      agentId: task.agentId,
+      data: { code: result.code, signal: result.signal ?? null },
+    })
+    this.invokeHook("onTaskFinished", task)
+  }
+
   heartbeat(agentId: string): void {
     const agent = this.agents.get(agentId)
     if (agent) {

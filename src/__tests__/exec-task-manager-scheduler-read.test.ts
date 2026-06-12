@@ -48,26 +48,33 @@ function makeReq(): ScheduleRequest {
 describe("ExecTaskManager read paths consult scheduler", () => {
   let tmpDir: string
   let ExecTaskManager: typeof import("../exec-task-manager.js").ExecTaskManager
+  const schedulers: SchedulerService[] = []
 
-  beforeEach(async () => {
-    tmpDir = mkdtempSync(join(tmpdir(), "etm-read-"))
-    mkdirSync(join(tmpDir, "outputs"), { recursive: true })
-    // Re-import so the module-level getTaskStorageDir() picks up our HOME.
-    const mod = await import(`../exec-task-manager.js?t=${Date.now()}`)
-    ExecTaskManager = mod.ExecTaskManager
-  })
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true })
-  })
-
-  it("getStatus returns a task that was created via the scheduler", () => {
-    const scheduler = new SchedulerService({
+  function makeTrackedScheduler(): SchedulerService {
+    const s = new SchedulerService({
       persistence: new PersistenceStore(tmpDir),
       runner: instantRunner(),
       outputStore: new OutputStore(join(tmpDir, "outputs")),
       eventLog: new EventLog(join(tmpDir, "events")),
     })
+    schedulers.push(s)
+    return s
+  }
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "etm-read-"))
+    mkdirSync(join(tmpDir, "outputs"), { recursive: true })
+    const mod = await import(`../exec-task-manager.js?t=${Date.now()}`)
+    ExecTaskManager = mod.ExecTaskManager
+  })
+
+  afterEach(() => {
+    for (const s of schedulers.splice(0)) s.dispose()
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it("getStatus returns a task that was created via the scheduler", () => {
+    const scheduler = makeTrackedScheduler()
     const mgr = new ExecTaskManager({ scheduler })
     try {
       const decision = scheduler.schedule(makeReq())
@@ -83,17 +90,11 @@ describe("ExecTaskManager read paths consult scheduler", () => {
   })
 
   it("getOutput returns scheduler output for scheduler-created tasks", () => {
-    const scheduler = new SchedulerService({
-      persistence: new PersistenceStore(tmpDir),
-      runner: instantRunner(),
-      outputStore: new OutputStore(join(tmpDir, "outputs")),
-      eventLog: new EventLog(join(tmpDir, "events")),
-    })
+    const scheduler = makeTrackedScheduler()
     const mgr = new ExecTaskManager({ scheduler })
     try {
       const decision = scheduler.schedule(makeReq())
       const taskId = decision.taskId!
-      // The runner is fire-and-forget; allow microtask queue to drain
       return new Promise<void>((resolve) => {
         setImmediate(() => {
           const out = mgr.getOutput(taskId)
@@ -108,12 +109,7 @@ describe("ExecTaskManager read paths consult scheduler", () => {
   })
 
   it("list() returns scheduler tasks (no local tasks yet)", () => {
-    const scheduler = new SchedulerService({
-      persistence: new PersistenceStore(tmpDir),
-      runner: instantRunner(),
-      outputStore: new OutputStore(join(tmpDir, "outputs")),
-      eventLog: new EventLog(join(tmpDir, "events")),
-    })
+    const scheduler = makeTrackedScheduler()
     const mgr = new ExecTaskManager({ scheduler })
     try {
       scheduler.schedule(makeReq())
@@ -131,12 +127,7 @@ describe("ExecTaskManager read paths consult scheduler", () => {
   })
 
   it("list(hostname) filters scheduler tasks by hostname", () => {
-    const scheduler = new SchedulerService({
-      persistence: new PersistenceStore(tmpDir),
-      runner: instantRunner(),
-      outputStore: new OutputStore(join(tmpDir, "outputs")),
-      eventLog: new EventLog(join(tmpDir, "events")),
-    })
+    const scheduler = makeTrackedScheduler()
     const mgr = new ExecTaskManager({ scheduler })
     try {
       scheduler.schedule(makeReq())
@@ -161,12 +152,7 @@ describe("ExecTaskManager read paths consult scheduler", () => {
   })
 
   it("returns null for unknown task ids", () => {
-    const scheduler = new SchedulerService({
-      persistence: new PersistenceStore(tmpDir),
-      runner: instantRunner(),
-      outputStore: new OutputStore(join(tmpDir, "outputs")),
-      eventLog: new EventLog(join(tmpDir, "events")),
-    })
+    const scheduler = makeTrackedScheduler()
     const mgr = new ExecTaskManager({ scheduler })
     try {
       assert.equal(mgr.getStatus("never-created"), null)
