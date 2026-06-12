@@ -855,11 +855,30 @@ export class SchedulerService {
   }
 
   private removeFromFinishedIndex(task: ScheduledTask): void {
-    // Linear scan is acceptable because evictOldTasks is the only caller and
-    // it removes a small batch in order. If the array grows very large,
-    // upgrade to an id→index Map alongside the sorted array.
-    const idx = this.finishedByTime.indexOf(task)
-    if (idx >= 0) this.finishedByTime.splice(idx, 1)
+    // Binary search by finishedAt (the same key used for the sort order
+    // in addToFinishedIndex). We do NOT rely on the timestamp being unique —
+    // duplicates are resolved with a linear scan over the equal-key range.
+    const targetTs = task.finishedAt ?? task.updatedAt ?? 0
+    let lo = 0
+    let hi = this.finishedByTime.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      const midTs = this.finishedByTime[mid].finishedAt ?? this.finishedByTime[mid].updatedAt ?? 0
+      if (midTs < targetTs) lo = mid + 1
+      else hi = mid
+    }
+    // Linear scan over the equal-key range to find the exact task object.
+    // The range is bounded by FINISHED_TASK_TTL_MS clustering, so this is
+    // typically O(1) — only O(n) in adversarial cases.
+    for (let i = lo; i < this.finishedByTime.length; i++) {
+      const candidate = this.finishedByTime[i]
+      const candidateTs = candidate.finishedAt ?? candidate.updatedAt ?? 0
+      if (candidateTs > targetTs) break
+      if (candidate === task) {
+        this.finishedByTime.splice(i, 1)
+        return
+      }
+    }
   }
 
   private evictOldTasks(): void {

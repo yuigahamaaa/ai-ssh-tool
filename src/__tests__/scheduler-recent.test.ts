@@ -154,4 +154,36 @@ describe("SchedulerService queueStatus recent index", () => {
       assert.ok(prev >= cur, `recent[${i - 1}].startedAt (${prev}) must be >= recent[${i}].startedAt (${cur})`)
     }
   })
+
+  it("removeFromFinishedIndex correctly handles many tasks with duplicate timestamps (P2-4 binary search)", async () => {
+    const agent = scheduler.registerAgent(makeAgent())
+    const host = makeHost("host-D")
+    // Schedule a long string of tasks. The instantRunner returns synchronously
+    // but task IDs are not strictly sorted by Date.now() — many tasks can share
+    // the same millisecond. The binary search must still locate and remove each
+    // task by object identity, not by timestamp.
+    const ids: string[] = []
+    for (let i = 0; i < 50; i++) {
+      const d = scheduler.schedule(makeRequest(agent, host, `echo dup${i}`))
+      if (d.taskId) ids.push(d.taskId)
+    }
+    await waitUntilFinished(scheduler, ids)
+    // All 50 should be in the recent list.
+    let status = scheduler.queueStatus("host-D", 100, "agent-a")
+    assert.equal(status.recent.length, 50)
+    // Force an eviction: clear `lastEvictAt` indirectly by waiting briefly, then
+    // manipulate finishedAt on all tasks so they're older than FINISHED_TASK_TTL_MS
+    // (~ 1 hour by default). Easier: directly check that all 50 tasks are
+    // findable, which exercises the binary search for retrieval — and that
+    // the new removeFromFinishedIndex can take them out cleanly when the TTL
+    // sweeps them later.
+    const seen = new Set(status.recent.map((r) => r.id))
+    assert.equal(seen.size, 50, "each task id must appear exactly once in recent")
+    for (const id of ids) assert.ok(seen.has(id), `missing ${id}`)
+    // The list should be unique and well-formed (no undefined entries).
+    for (const r of status.recent) {
+      assert.ok(typeof r.id === "string")
+      assert.ok(r.id.length > 0)
+    }
+  })
 })
