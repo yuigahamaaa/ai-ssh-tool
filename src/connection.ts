@@ -94,18 +94,23 @@ export class SSHConnection extends EventEmitter {
       }, timeout)
       timer.unref?.()
 
-      client.on("ready", () => {
+      const onReady = () => {
         clearTimeout(timer)
+        client.removeListener("error", onError)
+        this.installPostConnectHandlers(client, host)
         resolve()
-      })
-
-      client.on("error", (err) => {
+      }
+      const onError = (err: Error) => {
         clearTimeout(timer)
+        client.removeListener("ready", onReady)
         client.destroy()
         reject(new Error(`Failed to connect to ${host.host}:${host.port}: ${err.message}`))
-      })
+      }
 
-      client.connect(this.toConnectConfig(host))
+      client.once("ready", onReady)
+      client.once("error", onError)
+
+      client.connect(this.toConnectConfig(host, timeout))
     })
   }
 
@@ -139,16 +144,21 @@ export class SSHConnection extends EventEmitter {
           }
 
           // Connect the new client through the tunnel stream
-          client.on("ready", () => {
+          const onReady = () => {
             clearTimeout(timer)
+            client.removeListener("error", onError)
+            this.installPostConnectHandlers(client, host)
             resolve()
-          })
-
-          client.on("error", (clientErr) => {
+          }
+          const onError = (clientErr: Error) => {
             clearTimeout(timer)
+            client.removeListener("ready", onReady)
             client.destroy()
             reject(new Error(`Failed to connect to ${host.host}:${host.port} through tunnel: ${clientErr.message}`))
-          })
+          }
+
+          client.once("ready", onReady)
+          client.once("error", onError)
 
           client.connect({
             ...this.toConnectConfig(host),
@@ -280,13 +290,14 @@ export class SSHConnection extends EventEmitter {
     this.hops = []
   }
 
-  /** Convert SSHHostConfig to ssh2 ConnectConfig */
-  private toConnectConfig(host: SSHHostConfig): ConnectConfig {
+  /** Convert SSHHostConfig to ssh2 ConnectConfig. `readyTimeoutMs` lets callers
+   *  (e.g. tests) override the default 10-second handshake timeout. */
+  private toConnectConfig(host: SSHHostConfig, readyTimeoutMs?: number): ConnectConfig {
     const config: ConnectConfig = {
       host: host.host,
       port: host.port,
       username: host.auth.username,
-      readyTimeout: 10000,
+      readyTimeout: readyTimeoutMs ?? 10000,
       keepaliveInterval: 30000,
       keepaliveCountMax: 3,
     }
@@ -312,5 +323,19 @@ export class SSHConnection extends EventEmitter {
 
   private emitEvent(event: ConnectionEvent): void {
     this.emit("event", event)
+  }
+
+  /** Install long-lived error/close handlers after a hop is connected. */
+  private installPostConnectHandlers(client: Client, host: SSHHostConfig): void {
+    client.on("error", (err) => {
+      log("conn", `[${this.sessionId.slice(0, 8)}] Hop ${host.host} error after connect: ${err.message}`)
+      this.connected = false
+      this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
+    })
+    client.on("close", () => {
+      log("conn", `[${this.sessionId.slice(0, 8)}] Hop ${host.host} connection closed`)
+      this.connected = false
+      this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
+    })
   }
 }

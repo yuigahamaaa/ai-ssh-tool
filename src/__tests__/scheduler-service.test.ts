@@ -101,13 +101,27 @@ describe("SchedulerService", () => {
   let persistence: PersistenceStore
   let runner: FakeRunner
   let scheduler: SchedulerService
+  let schedulers: SchedulerService[]
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sched-test-"))
     persistence = new PersistenceStore(tmpDir)
     runner = new FakeRunner()
-    scheduler = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "outputs")), eventLog: new EventLog(join(tmpDir, "events")), maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 })
+    schedulers = []
+    scheduler = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "outputs")), eventLog: new EventLog(join(tmpDir, "events")), maxQueueSize: 50, maxTotalRunning: 4, maxLargeRunning: 1 }))
   })
+
+  afterEach(() => {
+    for (const instance of schedulers) {
+      instance.dispose()
+    }
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  function trackScheduler(instance: SchedulerService): SchedulerService {
+    schedulers.push(instance)
+    return instance
+  }
 
   it("large blocks large", () => {
     const a = scheduler.schedule(makeRequest({ command: "npm test", intent: "test", cost: "large" }))
@@ -168,7 +182,7 @@ describe("SchedulerService", () => {
     const sTmpDir = mkdtempSync(join(tmpdir(), "sched-maxq-"))
     const sPersistence = new PersistenceStore(sTmpDir)
     const sRunner = new FakeRunner()
-    const s = new SchedulerService({ persistence: sPersistence, runner: sRunner, outputStore: new OutputStore(join(sTmpDir, "outputs")), eventLog: new EventLog(join(sTmpDir, "events")), maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 })
+    const s = trackScheduler(new SchedulerService({ persistence: sPersistence, runner: sRunner, outputStore: new OutputStore(join(sTmpDir, "outputs")), eventLog: new EventLog(join(sTmpDir, "events")), maxQueueSize: 2, maxTotalRunning: 4, maxLargeRunning: 1 }))
 
     s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
@@ -292,7 +306,7 @@ describe("SchedulerService", () => {
 
   it("foreground-style output includes truncation metadata", async () => {
     const outputStore = new OutputStore(join(tmpDir, "outputs"))
-    const s = new SchedulerService({ persistence, runner, outputStore, eventLog: new EventLog(join(tmpDir, "events-truncation")), outputCleanupThrottleMs: 0 })
+    const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore, eventLog: new EventLog(join(tmpDir, "events-truncation")), outputCleanupThrottleMs: 0 }))
     const d = s.schedule(makeRequest({ command: "echo lots" }))
     runner.finish(d.taskId!, { code: 0, stdout: "x".repeat(40 * 1024), stderr: "" })
     await new Promise(r => setTimeout(r, 10))
@@ -307,7 +321,7 @@ describe("SchedulerService", () => {
   it("foreground streaming output is not duplicated by aggregated runner result", async () => {
     const streamingRunner = new StreamingRunner()
     const outputStore = new OutputStore(join(tmpDir, "streaming-outputs"))
-    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-streaming")) })
+    const s = trackScheduler(new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-streaming")) }))
     const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     assert.equal(d.action, "run_now")
 
@@ -328,7 +342,7 @@ describe("SchedulerService", () => {
   it("foreground streaming only suppresses the streams that were actually streamed", async () => {
     const streamingRunner = new StreamingRunner([{ stdout: "streamed-stdout\n", stderr: "" }])
     const outputStore = new OutputStore(join(tmpDir, "partial-streaming-outputs"))
-    const s = new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-partial-streaming")) })
+    const s = trackScheduler(new SchedulerService({ persistence, runner: streamingRunner, outputStore, eventLog: new EventLog(join(tmpDir, "events-partial-streaming")) }))
     const d = s.schedule(makeRequest({ command: "npm test", cost: "large" }))
     assert.equal(d.action, "run_now")
 
@@ -579,12 +593,12 @@ describe("SchedulerService", () => {
     }
 
     const syncRunner = new SyncCloseRunner()
-    const s = new SchedulerService({
+    const s = trackScheduler(new SchedulerService({
       persistence,
       runner: syncRunner,
       outputStore: new OutputStore(join(tmpDir, 'sync-close-outputs')),
       eventLog: new EventLog(join(tmpDir, 'events-sync-close')),
-    })
+    }))
 
     const d = s.schedule(makeRequest({ command: 'npm test', cost: 'large' }))
     assert.equal(d.action, 'run_now')
@@ -628,12 +642,12 @@ describe("SchedulerService", () => {
     }
 
     const runner2 = new CancelRefusedRunner()
-    const s = new SchedulerService({
+    const s = trackScheduler(new SchedulerService({
       persistence,
       runner: runner2,
       outputStore: new OutputStore(join(tmpDir, 'cancel-refused-outputs')),
       eventLog: new EventLog(join(tmpDir, 'events-cancel-refused')),
-    })
+    }))
 
     const d = s.schedule(makeRequest({ command: 'sleep 999', cost: 'large' }))
     const cancelled = s.cancelTask(d.taskId!)

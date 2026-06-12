@@ -93,6 +93,11 @@ export class OutputStore {
   }
 
   create(taskId: string): void {
+    // Register the in-memory entry only. The actual on-disk stdout/stderr
+    // files are created lazily on the first append*() call. Tasks that
+    // produce no output (common for `--command` that just exits cleanly
+    // with code 0) used to create two empty files for nothing; lazy
+    // creation skips that work and shrinks cleanup/retention churn.
     const paths = this.getPaths(taskId)
     this.inMemory.set(taskId, {
       stdoutTail: "",
@@ -104,8 +109,6 @@ export class OutputStore {
       stdoutFileTruncated: false,
       stderrFileTruncated: false,
     })
-    writeFileSync(paths.stdout, "", { mode: 0o600 })
-    writeFileSync(paths.stderr, "", { mode: 0o600 })
   }
 
   appendStdout(taskId: string, data: string): void {
@@ -259,7 +262,14 @@ export class OutputStore {
 
   private appendWithinLimit(path: string, data: string, logicalBytes: number, setTruncated: (value: boolean) => void): void {
     if (logicalBytes <= this.maxOutputFileSize) {
-      appendFileSync(path, data)
+      // Lazy-create the file on the first append. After that, appendFileSync
+      // is the cheap path. Doing a stat here is far cheaper than always
+      // pre-creating an empty file for tasks that never produce output.
+      if (existsSync(path)) {
+        appendFileSync(path, data)
+      } else {
+        writeFileSync(path, data, { mode: 0o600 })
+      }
       return
     }
 
@@ -267,7 +277,11 @@ export class OutputStore {
     if (previousBytes < this.maxOutputFileSize) {
       const remaining = this.maxOutputFileSize - previousBytes
       if (remaining > 0) {
-        appendFileSync(path, Buffer.from(data).subarray(0, remaining))
+        if (existsSync(path)) {
+          appendFileSync(path, Buffer.from(data).subarray(0, remaining))
+        } else {
+          writeFileSync(path, Buffer.from(data).subarray(0, remaining), { mode: 0o600 })
+        }
       }
     }
     setTruncated(true)

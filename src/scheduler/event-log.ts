@@ -6,6 +6,7 @@ import { homedir } from "os"
 import type { SchedulerEvent, EventType } from "./types.js"
 
 const MAX_EVENTS_PER_FILE = 1000
+const FLUSH_INTERVAL_MS = 200
 
 /**
  * Get user data directory with cross-platform support.
@@ -22,6 +23,12 @@ export class EventLog {
   private baseDir: string
   private currentFile = ""
   private eventCount = 0
+  // Batched-write buffer. Multiple log() calls within FLUSH_INTERVAL_MS are
+  // coalesced into a single appendFileSync, eliminating the per-event disk
+  // stall that previously blocked the daemon event loop on every scheduler
+  // state transition (a single task lifecycle can produce 4-6 events).
+  private buffer: string[] = []
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(baseDir?: string) {
     this.baseDir = baseDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "events")
@@ -49,8 +56,45 @@ export class EventLog {
       ...params,
     }
 
-    appendFileSync(this.currentFile, JSON.stringify(event) + "\n", { mode: 0o600 })
-    this.eventCount++
+    this.buffer.push(JSON.stringify(event) + "\n")
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null
+      this.flush()
+    }, FLUSH_INTERVAL_MS)
+  }
+
+  /**
+   * Force an immediate flush of any pending events. Callers (notably
+   * `SchedulerService.dispose()` and the auto-flush in `getRecent`) use this
+   * to make sure no event is lost on shutdown or stays invisible to a
+   * subsequent read.
+   */
+  flushSync(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    this.flush()
+  }
+
+  private flush(): void {
+    if (this.buffer.length === 0) return
+    // Snapshot then clear so a re-entrant log() during flush is re-buffered
+    // for the next round instead of being lost.
+    const batch = this.buffer
+    this.buffer = []
+    const payload = batch.join("")
+    try {
+      appendFileSync(this.currentFile, payload, { mode: 0o600 })
+      this.eventCount += batch.length
+    } catch (err) {
+      // Re-buffer the batch on failure so the next flush retries. Avoid
+      // throwing from log() — a failed event write must never crash the
+      // scheduler.
+      this.buffer.unshift(...batch)
+      return
+    }
 
     if (this.eventCount >= MAX_EVENTS_PER_FILE) {
       this.rotateFile()
@@ -58,6 +102,10 @@ export class EventLog {
   }
 
   getRecent(limit = 100, hostId?: string): SchedulerEvent[] {
+    // Auto-flush before reading so callers always see the most recent events,
+    // not whatever the 200ms debounce hasn't drained yet. This preserves
+    // the original "log + getRecent sees the event immediately" contract.
+    this.flushSync()
     if (limit <= 0) return []
     try {
       const TAIL_CHUNK = 64 * 1024

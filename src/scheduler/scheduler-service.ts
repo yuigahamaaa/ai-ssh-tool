@@ -107,10 +107,11 @@ export class SchedulerService {
       this.idleEvictTimer = null
     }
     this.virtualCwdStore.dispose()
-    // If a BatchedPersistenceStore is in use, drain any pending task writes
-    // synchronously so no data is lost on shutdown.
-    const p = this.persistence as unknown as { flushSync?: () => void }
-    if (typeof p.flushSync === "function") p.flushSync()
+    // Drain any pending scheduler-event writes (EventLog uses 200ms debounce)
+    // and pending task writes (BatchedPersistenceStore uses 100ms debounce)
+    // so no data is lost on shutdown.
+    this.eventLog.flushSync()
+    if (typeof this.persistence.flushSync === "function") this.persistence.flushSync()
   }
 
   private restore(): void {
@@ -682,16 +683,20 @@ export class SchedulerService {
   }
 
   private getFinishedTasks(hostId?: string, limit = 20): ScheduledTaskSummary[] {
-    const recent: ScheduledTask[] = []
-    for (const task of this.tasks.values()) {
-      if (hostId && task.hostId !== hostId) continue
-      if (!["completed", "failed", "cancelled", "timeout", "stale"].includes(task.status)) continue
-      recent.push(task)
+    // Walk `finishedByTime` from newest to oldest and stop as soon as we
+    // collected `limit` matches. The array is already kept in ascending
+    // `finishedAt` order by `addToFinishedIndex`, so a reverse scan gives
+    // newest-first without a sort, and we never need to walk the full
+    // `tasks` Map.
+    const FINISHED_STATUSES = new Set<string>(["completed", "failed", "cancelled", "timeout", "stale"])
+    const out: ScheduledTaskSummary[] = []
+    for (let i = this.finishedByTime.length - 1; i >= 0 && out.length < limit; i--) {
+      const t = this.finishedByTime[i]
+      if (hostId && t.hostId !== hostId) continue
+      if (!FINISHED_STATUSES.has(t.status)) continue
+      out.push(toSummary(t))
     }
-    return recent
-      .sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))
-      .slice(0, limit)
-      .map(toSummary)
+    return out
   }
 
   private recomputeQueuePositions(hostId: string): void {

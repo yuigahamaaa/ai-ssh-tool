@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test"
+import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
@@ -70,16 +70,29 @@ class TrackRunner implements TaskRunner {
 
 describe("Concurrency Tests", () => {
   let tmpDir: string
+  let schedulers: SchedulerService[]
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "concurrency-test-"))
+    schedulers = []
   })
+
+  afterEach(() => {
+    for (const scheduler of schedulers) {
+      scheduler.dispose()
+    }
+  })
+
+  function trackScheduler(scheduler: SchedulerService): SchedulerService {
+    schedulers.push(scheduler)
+    return scheduler
+  }
 
   describe("concurrent schedule calls from same host", () => {
     it("multiple tiny tasks from different agents all run_now concurrently", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p1"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")), eventLog: new EventLog(join(tmpDir, "events-o1")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o1")), eventLog: new EventLog(join(tmpDir, "events-o1")) }))
 
       const results: { action: string }[] = []
       for (let i = 0; i < 20; i++) {
@@ -97,7 +110,7 @@ describe("Concurrency Tests", () => {
     it("multiple large tasks serialize correctly with concurrent calls", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p2"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxLargeRunning: 1, maxTotalRunning: 4 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o2")), eventLog: new EventLog(join(tmpDir, "events-o2")), maxLargeRunning: 1, maxTotalRunning: 4 }))
 
       const results: { action: string; taskId?: string }[] = []
       for (let i = 0; i < 10; i++) {
@@ -120,7 +133,7 @@ describe("Concurrency Tests", () => {
     it("mixed cost tasks from multiple agents maintain correct admission", () => {
       const persistence = new PersistenceStore(join(tmpDir, "p3"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), maxLargeRunning: 1, maxTotalRunning: 4 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "o3")), maxLargeRunning: 1, maxTotalRunning: 4 }))
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       s.schedule(makeRequest({ command: "rg foo", cost: "tiny", agent: makeAgent("a2") }))
@@ -204,7 +217,7 @@ describe("Concurrency Tests", () => {
     it("multiple waiters on same task all resolve when task finishes", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "w1"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo1")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo1")) }))
 
       const d = s.schedule(makeRequest({ command: "echo done" }))
       assert.equal(d.action, "run_now")
@@ -230,7 +243,7 @@ describe("Concurrency Tests", () => {
     it("waitTask timeout returns current task state", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "w2"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo2")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo2")) }))
 
       const d = s.schedule(makeRequest({ command: "sleep 999" }))
       assert.equal(d.action, "run_now")
@@ -244,7 +257,7 @@ describe("Concurrency Tests", () => {
     it("waitTask on queued task returns running state on timeout after promotion", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "w3"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo3")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo3")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -261,7 +274,7 @@ describe("Concurrency Tests", () => {
     it("cancelTask resolves all waiters", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "w4"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo4")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo4")), maxLargeRunning: 1 }))
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -288,7 +301,7 @@ describe("Concurrency Tests", () => {
     it("dequeueTask resolves queued task waiters immediately", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "w5"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo5")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "wo5")), maxLargeRunning: 1 }))
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -307,7 +320,7 @@ describe("Concurrency Tests", () => {
     it("dequeue while another task finishes promotes correctly", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "q1"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo1")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo1")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -326,7 +339,7 @@ describe("Concurrency Tests", () => {
     it("cancelTask on running task frees slot for queued", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "q2"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo2")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo2")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -344,7 +357,7 @@ describe("Concurrency Tests", () => {
     it("late runner completion does not overwrite cancelled running task", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "q2-late"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo2-late")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo2-late")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -365,7 +378,7 @@ describe("Concurrency Tests", () => {
     it("queueStatus reflects concurrent state correctly", () => {
       const persistence = new PersistenceStore(join(tmpDir, "q3"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo3")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "qo3")), maxLargeRunning: 1 }))
 
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a2") }))
@@ -424,7 +437,7 @@ describe("Concurrency Tests", () => {
     it("exclusive task blocks all subsequent tiny tasks", () => {
       const persistence = new PersistenceStore(join(tmpDir, "ex1"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo1")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo1")) }))
 
       s.schedule(makeRequest({
         command: "kubectl apply -f deploy.yaml",
@@ -449,7 +462,7 @@ describe("Concurrency Tests", () => {
     it("after exclusive finishes, queued tasks are pumped", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "ex2"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo2")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo2")) }))
 
       const d = s.schedule(makeRequest({
         command: "kubectl apply -f deploy.yaml",
@@ -476,7 +489,7 @@ describe("Concurrency Tests", () => {
     it("cancelling exclusive task releases host lock and pumps queued tiny task", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "ex-cancel"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo-cancel")) })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "exo-cancel")) }))
 
       const exclusive = s.schedule(makeRequest({
         command: "kubectl apply -f deploy.yaml",
@@ -507,7 +520,7 @@ describe("Concurrency Tests", () => {
     it("multiple queued tasks promoted in FIFO order", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "fifo"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "fifo-o")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "fifo-o")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
@@ -537,7 +550,7 @@ describe("Concurrency Tests", () => {
     it("failed task does not block queue pump", async () => {
       const persistence = new PersistenceStore(join(tmpDir, "fail"))
       const runner = new TrackRunner()
-      const s = new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "fail-o")), maxLargeRunning: 1 })
+      const s = trackScheduler(new SchedulerService({ persistence, runner, outputStore: new OutputStore(join(tmpDir, "fail-o")), maxLargeRunning: 1 }))
 
       const a = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("a1") }))
       const b = s.schedule(makeRequest({ command: "npm test", cost: "large", agent: makeAgent("b") }))
