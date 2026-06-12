@@ -215,6 +215,32 @@ async function main() {
 
   const daemonClient = new DaemonClient()
   let handlingFatal = false
+  // P2-8: wrapTool converts uncaught handler errors into a structured MCP
+  // error envelope so the agent sees a real error response (not a hung
+  // request) and the daemon logs the stack for post-mortem debugging.
+  // Tools that already return a friendly error text don't need changes
+  // — wrapTool only fires when the handler *throws*.
+  const wrapTool = <Args, Ret extends { content: Array<{ type: "text"; text: string }> }>(
+    name: string,
+    fn: (args: Args) => Promise<Ret>,
+  ) => {
+    return async (args: Args): Promise<Ret | (Ret & { isError: true })> => {
+      try {
+        return await fn(args)
+      } catch (e) {
+        const err = e as Error
+        const detail = (err.stack ?? err.message).split("\n").slice(0, 4).join("\n")
+        log("mcp", `Tool ${name} threw: ${err.message}\n${detail}`)
+        return {
+          isError: true,
+          content: [{
+            type: "text" as const,
+            text: `[${name}] ${err.message}`,
+          }],
+        } as Ret & { isError: true }
+      }
+    }
+  }
   const handleFatal = (err: Error) => {
     if (handlingFatal) {
       console.error(`[ssh-mcp] Fatal during fatal handling: ${err.message}`)
@@ -366,7 +392,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile (alternative to profile_name)"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile (alternative to profile_name/profile_json)"),
     },
-    async (params) => {
+    wrapTool("ssh_exec", async (params) => {
       const decision = await scheduleCommand({
         command: params.command,
         cwd: params.cwd,
@@ -389,7 +415,7 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   // --- File operations ---
   server.tool(
@@ -403,7 +429,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await remoteExec(client, `cat ${JSON.stringify(path)}`, { timeout: 30000 })
       if (result.code !== 0) {
@@ -416,7 +442,7 @@ async function main() {
       const output = selected.map((line, i) => `${start + i + 1}\t${line}`).join("\n")
       return { content: [{ type: "text" as const, text: output }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_write_file",
@@ -429,7 +455,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, content, mode, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_write_file", async ({ path, content, mode, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const dirCmd = `mkdir -p ${JSON.stringify(path.replace(/\/[^\/]*$/, ""))}`
       await remoteExec(client, dirCmd, { timeout: 10000 })
@@ -443,7 +469,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: `Written ${content.length} bytes to ${path}` }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_list_dir",
@@ -455,7 +481,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const flag = show_hidden ? "-la" : "-l"
       const result = await remoteExec(client, `ls ${flag} ${JSON.stringify(path)}`, { timeout: 15000 })
@@ -464,7 +490,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: result.stdout }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_exists",
@@ -475,12 +501,12 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await remoteExec(client, `test -e ${JSON.stringify(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
       return { content: [{ type: "text" as const, text: result.stdout.trim() }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_stat",
@@ -491,7 +517,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await remoteExec(client, `stat ${JSON.stringify(path)}`, { timeout: 10000 })
       if (result.code !== 0) {
@@ -499,7 +525,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: result.stdout }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_grep",
@@ -513,7 +539,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_grep", async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       let cmd = "grep -rn"
       if (case_insensitive) cmd += "i"
@@ -522,7 +548,7 @@ async function main() {
       const result = await remoteExec(client, cmd, { timeout: 15000 })
       return { content: [{ type: "text" as const, text: result.stdout || result.stderr || "(no matches)" }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_find",
@@ -536,7 +562,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       let cmd = `find ${JSON.stringify(path)}`
       if (max_depth) cmd += ` -maxdepth ${max_depth}`
@@ -545,7 +571,7 @@ async function main() {
       const result = await remoteExec(client, cmd, { timeout: 15000 })
       return { content: [{ type: "text" as const, text: result.stdout || result.stderr || "(no results)" }] }
     },
-  )
+  ))
 
   // --- File transfer ---
   server.tool(
@@ -563,7 +589,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await upload(client, local_path, remote_path, {
         compressionLevel: compression_level,
@@ -574,7 +600,7 @@ async function main() {
       })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_download",
@@ -591,7 +617,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const result = await download(client, remote_path, local_path, {
         compressionLevel: compression_level,
@@ -602,7 +628,7 @@ async function main() {
       })
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
     },
-  )
+  ))
 
   // --- Background execution ---
   server.tool(
@@ -615,7 +641,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ command, cwd, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_exec_background", async ({ command, cwd, profile_name, profile_json, profile_file }) => {
       const decision = await scheduleCommand({
         command,
         cwd,
@@ -627,7 +653,7 @@ async function main() {
       })
       return { content: [{ type: "text" as const, text: formatScheduleDecisionForAgent(decision) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_exec_status",
@@ -636,7 +662,7 @@ async function main() {
       task_id: z.string().describe("Task ID from exec_background"),
       mode: z.enum(["tail", "full"]).optional().describe("Output mode: tail (default) or full"),
     },
-    async ({ task_id, mode }) => {
+    wrapTool("ssh_exec_status", async ({ task_id, mode }) => {
       await daemonClient.ensureDaemon()
       const statusResp = await daemonClient.getTaskStatus(task_id)
       if (!statusResp.ok) {
@@ -659,7 +685,7 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_exec_cancel",
@@ -667,7 +693,7 @@ async function main() {
     {
       task_id: z.string().describe("Task ID to cancel"),
     },
-    async ({ task_id }) => {
+    wrapTool("ssh_exec_cancel", async ({ task_id }) => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.cancelTask(task_id)
       if (!resp.ok) {
@@ -687,13 +713,13 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_cleanup_outputs",
     "Clean old scheduler output files. Running and queued task outputs are protected.",
     {},
-    async () => {
+    wrapTool("ssh_cleanup_outputs", async () => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.cleanupOutputs()
       if (!resp.ok) {
@@ -701,7 +727,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("cleanup_result", resp.data)) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_list_tasks",
@@ -709,7 +735,7 @@ async function main() {
     {
       hostname: z.string().optional().describe("Filter tasks by remote hostname"),
     },
-    async ({ hostname }) => {
+    wrapTool("ssh_list_tasks", async ({ hostname }) => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.queueStatus({ hostId: hostname })
       if (!resp.ok) {
@@ -717,7 +743,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("queue_status", resp.data)) }] }
     },
-  )
+  ))
 
   // --- Host load monitoring ---
   server.tool(
@@ -728,7 +754,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_get_host_load", async ({ profile_name, profile_json, profile_file }) => {
       const entry = await getClientForProfile(profile_name, profile_json, profile_file)
       const clientObj = entry.client as Record<string, unknown>
       const innerClient = clientObj._client as Record<string, unknown> | undefined
@@ -748,7 +774,7 @@ async function main() {
       }
       return { content: [{ type: "text", text: jsonText(mcpEnvelope("host_load", loadInfo)) }] }
     },
-  )
+  ))
 
   // --- Port forwarding ---
   server.tool(
@@ -763,12 +789,12 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ local_port, remote_host, remote_port, local_addr, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_local_forward", async ({ local_port, remote_host, remote_port, local_addr, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const forward = await forwardManager.localForward(local_addr ?? "127.0.0.1", local_port, remote_host, remote_port)
       return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_remote_forward",
@@ -782,12 +808,12 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ remote_port, local_host, local_port, remote_addr, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_remote_forward", async ({ remote_port, local_host, local_port, remote_addr, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const forward = await forwardManager.remoteForward(remote_addr ?? "127.0.0.1", remote_port, local_host, local_port)
       return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_stop_forward",
@@ -798,12 +824,12 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ forward_id, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_stop_forward", async ({ forward_id, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const stopped = await forwardManager.stop(forward_id)
       return { content: [{ type: "text" as const, text: stopped ? `Forward ${forward_id} stopped` : `Forward ${forward_id} not found` }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_list_forwards",
@@ -813,23 +839,23 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_list_forwards", async ({ profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const forwards = forwardManager.list()
       return { content: [{ type: "text" as const, text: JSON.stringify(forwards) }] }
     },
-  )
+  ))
 
   // --- Profile management ---
   server.tool(
     "ssh_list_profiles",
     "List all available SSH profiles.",
     {},
-    async () => {
+    wrapTool("ssh_list_profiles", async () => {
       const profiles = profileManager.list()
       return { content: [{ type: "text" as const, text: JSON.stringify(profiles) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_add_profile",
@@ -840,7 +866,7 @@ async function main() {
       chain: z.string().describe("JSON string of SSH connection chain. Example: [{\"host\":\"gateway.example.com\",\"port\":22,\"username\":\"user\",\"privateKey\":\"...\"},{\"host\":\"target.example.com\",\"port\":22,\"username\":\"deploy\",\"privateKey\":\"...\"}]"),
       tags: z.array(z.string()).optional().describe("Array of tags for organization"),
     },
-    async ({ name, alias, chain, tags }) => {
+    wrapTool("ssh_add_profile", async ({ name, alias, chain, tags }) => {
       try {
         const chainArray = JSON.parse(chain) as Omit<SSHHostConfig, "id">[]
         const profile = profileManager.add({
@@ -854,7 +880,7 @@ async function main() {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (err as Error).message }) }] }
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_remove_profile",
@@ -863,7 +889,7 @@ async function main() {
       profile_id: z.string().optional().describe("Profile ID to remove"),
       profile_name: z.string().optional().describe("Profile name to remove (alternative to profile_id)"),
     },
-    async ({ profile_id, profile_name }) => {
+    wrapTool("ssh_remove_profile", async ({ profile_id, profile_name }) => {
       if (!profile_id && !profile_name) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Must provide profile_id or profile_name" }) }] }
       }
@@ -884,7 +910,7 @@ async function main() {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_get_profile",
@@ -894,7 +920,7 @@ async function main() {
       profile_name: z.string().optional().describe("Profile name"),
       profile_alias: z.string().optional().describe("Profile alias"),
     },
-    async ({ profile_id, profile_name, profile_alias }) => {
+    wrapTool("ssh_get_profile", async ({ profile_id, profile_name, profile_alias }) => {
       let profile: SSHProfile | undefined
 
       if (profile_id) {
@@ -911,14 +937,14 @@ async function main() {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
       }
     },
-  )
+  ))
 
   // --- Session management ---
   server.tool(
     "ssh_list_sessions",
     "List all active SSH sessions managed by this MCP server. Shows session ID, name, status, hops, and idle time.",
     {},
-    async () => {
+    wrapTool("ssh_list_sessions", async () => {
       const sessions = gw.sessions.listSessions()
       const sessionList = sessions.map((s: any) => ({
         id: s.id,
@@ -932,7 +958,7 @@ async function main() {
       }))
       return { content: [{ type: "text" as const, text: JSON.stringify(sessionList, null, 2) }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_disconnect",
@@ -940,7 +966,7 @@ async function main() {
     {
       session_id: z.string().describe("Session ID to disconnect"),
     },
-    async ({ session_id }) => {
+    wrapTool("ssh_disconnect", async ({ session_id }) => {
       const session = gw.sessions.getSession(session_id)
       if (!session) {
         return { content: [{ type: "text" as const, text: `Session ${session_id} not found` }] }
@@ -948,7 +974,7 @@ async function main() {
       await gw.sessions.disconnect(session_id)
       return { content: [{ type: "text" as const, text: `Session ${session_id} disconnected` }] }
     },
-  )
+  ))
 
   server.tool(
     "ssh_cd",
@@ -959,7 +985,7 @@ async function main() {
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    async ({ path, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_cd", async ({ path, profile_name, profile_json, profile_file }) => {
       const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
       await daemonClient.ensureDaemon()
       const configJson = profileToLegacyConfigJson(profile)
@@ -992,7 +1018,7 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   // --- Scheduler tools ---
   server.tool(
@@ -1012,7 +1038,7 @@ async function main() {
       profile_json: z.string().optional().describe("Profile JSON"),
       profile_file: z.string().optional().describe("Profile file path"),
     },
-    async (params) => {
+    wrapTool("ssh_schedule", async (params) => {
       const decision = await scheduleCommand({
         command: params.command,
         cwd: params.cwd,
@@ -1032,7 +1058,7 @@ async function main() {
         content: [{ type: "text" as const, text: formatScheduleDecisionForAgent(decision) }],
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_queue_status",
@@ -1041,7 +1067,7 @@ async function main() {
       host_id: z.string().optional().describe("Filter by host ID"),
       limit: z.number().optional().describe("Max results (default 20)"),
     },
-    async ({ host_id, limit }) => {
+    wrapTool("ssh_queue_status", async ({ host_id, limit }) => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.queueStatus({ agent: { id: MCP_AGENT_ID, clientType: "mcp" }, hostId: host_id, limit })
       if (!resp.ok) {
@@ -1056,7 +1082,7 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_wait_task",
@@ -1065,7 +1091,7 @@ async function main() {
       task_id: z.string().describe("Task ID to wait for"),
       timeout: z.number().optional().describe("Timeout in ms (default 30000)"),
     },
-    async ({ task_id, timeout }) => {
+    wrapTool("ssh_wait_task", async ({ task_id, timeout }) => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.waitTask(task_id, timeout)
       if (!resp.ok) {
@@ -1086,7 +1112,7 @@ async function main() {
         }],
       }
     },
-  )
+  ))
 
   server.tool(
     "ssh_dequeue_task",
@@ -1094,7 +1120,7 @@ async function main() {
     {
       task_id: z.string().describe("Task ID to dequeue"),
     },
-    async ({ task_id }) => {
+    wrapTool("ssh_dequeue_task", async ({ task_id }) => {
       await daemonClient.ensureDaemon()
       const resp = await daemonClient.dequeueTask(task_id, { id: MCP_AGENT_ID, clientType: "mcp" })
       if (!resp.ok) {
@@ -1102,7 +1128,7 @@ async function main() {
       }
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("dequeue_result", resp.data)) }] }
     },
-  )
+  ))
 
   // Start MCP server via stdio
   const transport = new StdioServerTransport()
