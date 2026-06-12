@@ -124,7 +124,12 @@ export class IPCMessageParser {
     const textSize = Buffer.byteLength(text, "utf8")
     if (textSize > this.maxRemainderBytes) {
       this.remainder = ""
-      throw new Error(`IPC frame exceeded max size: ${textSize} bytes > ${this.maxRemainderBytes} bytes limit. Connection may be sending invalid data.`)
+      throw new Error(
+        `IPC frame exceeded max size: ${textSize} bytes > ${this.maxRemainderBytes} bytes limit. ` +
+        `The remote peer is sending malformed data or an oversized message without a newline terminator. ` +
+        `Suggestion: reconnect to the daemon and resend the request. ` +
+        `If this recurs, check for corrupt JSON or extremely large command output that should be transferred via SFTP instead.`,
+      )
     }
     const lines = text.split("\n")
     this.remainder = lines.pop() ?? ""
