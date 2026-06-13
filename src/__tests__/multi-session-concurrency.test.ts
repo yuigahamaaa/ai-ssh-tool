@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
-import { PersistenceStore } from "../scheduler/persistence-store.js"
+import { PersistenceStore, BatchedPersistenceStore } from "../scheduler/persistence-store.js"
 import { OutputStore } from "../scheduler/output-store.js"
 import { EventLog } from "../scheduler/event-log.js"
 import { SSHDaemon } from "../daemon.js"
@@ -300,14 +300,24 @@ describe("Multi-Session Concurrency Tests", () => {
   describe("daemon IPC concurrent requests", () => {
     let daemon: SSHDaemon
     let tmpPipeDir: string
+    let tmpDataDir: string
     let pipePath: string
 
     beforeEach(() => {
       tmpPipeDir = mkdtempSync(join(tmpDir, "daemon-ipc-"))
+      tmpDataDir = mkdtempSync(join(tmpDir, "daemon-data-"))
       pipePath = process.platform === "win32"
         ? `\\\\.\\pipe\\ssh-daemon-multi-${Date.now()}`
         : join(tmpPipeDir, "daemon.sock")
     })
+
+    function makeTempScheduler(): SchedulerService {
+      return new SchedulerService({
+        persistence: new BatchedPersistenceStore(new PersistenceStore(join(tmpDataDir, "scheduler"))),
+        outputStore: new OutputStore(join(tmpDataDir, "scheduler", "outputs")),
+        eventLog: new EventLog(join(tmpDataDir, "scheduler", "events")),
+      })
+    }
 
     afterEach(async () => {
       if (daemon) {
@@ -316,7 +326,7 @@ describe("Multi-Session Concurrency Tests", () => {
     })
 
     it("multiple clients send ping concurrently", async () => {
-      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler: makeTempScheduler() })
       await daemon.start()
 
       const clients = Array.from({ length: 5 }, () => new DaemonClient(pipePath))
@@ -329,7 +339,7 @@ describe("Multi-Session Concurrency Tests", () => {
     })
 
     it("multiple clients send schedule concurrently", async () => {
-      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler: makeTempScheduler() })
       await daemon.start()
 
       const clients = Array.from({ length: 3 }, () => new DaemonClient(pipePath))
@@ -350,7 +360,7 @@ describe("Multi-Session Concurrency Tests", () => {
     })
 
     it("concurrent setCwd from different agents via IPC", async () => {
-      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler: makeTempScheduler() })
       await daemon.start()
 
       const clients = Array.from({ length: 3 }, () => new DaemonClient(pipePath))
@@ -365,7 +375,7 @@ describe("Multi-Session Concurrency Tests", () => {
     })
 
     it("concurrent list sessions from multiple clients", async () => {
-      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler: makeTempScheduler() })
       await daemon.start()
 
       const clients = Array.from({ length: 5 }, () => new DaemonClient(pipePath))
@@ -378,7 +388,7 @@ describe("Multi-Session Concurrency Tests", () => {
     })
 
     it("rapid connect-disconnect cycles from same client", async () => {
-      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000, scheduler: makeTempScheduler() })
       await daemon.start()
 
       const client = new DaemonClient(pipePath)

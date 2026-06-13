@@ -30,6 +30,9 @@ export class LockManager {
 
     const existing = this.locks.get(lockKey)
     if (existing) {
+      if (existing.ownerTaskId && taskId && existing.ownerTaskId !== taskId) {
+        return null
+      }
       if (existing.ownerAgentId === agentId) {
         existing.renewedAt = Date.now()
         existing.expiresAt = existing.renewedAt + this.ttl
@@ -53,6 +56,22 @@ export class LockManager {
     this.locks.set(lockKey, lock)
     this.lockIdToKey.set(lock.id, lockKey)
     return lock
+  }
+
+  canAcquire(
+    scope: LockScope,
+    key: string,
+    hostId: string,
+    agentId: string,
+  ): boolean {
+    this.cleanExpired()
+    const existing = this.locks.get(this.lockKey(scope, key, hostId))
+    if (!existing) return true
+    return existing.ownerAgentId === agentId
+  }
+
+  getLocksForTask(taskId: string): SchedulerLock[] {
+    return Array.from(this.locks.values()).filter(l => l.ownerTaskId === taskId)
   }
 
   release(lockId: string): boolean {
@@ -110,10 +129,10 @@ export class LockManager {
         }
       }
     } else if (scope === "workdir") {
-      checkKey("host", key.split(":")[0])
+      checkKey("host", hostId)
       checkKey("workdir", key)
     } else {
-      checkKey("host", key.split(":")[0])
+      checkKey("host", hostId)
       checkKey(scope, key)
     }
 

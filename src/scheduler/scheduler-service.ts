@@ -73,6 +73,12 @@ export class SchedulerService {
 
   private runningByHost = new Map<string, Set<string>>()
   private queuedByHost = new Map<string, Set<string>>()
+  // Map from running taskId -> lockIds the task owns. Used for periodic
+  // lock renewal (see #1: long-running tasks would otherwise lose their
+  // locks when DEFAULT_TTL expires). Entries are added on task start and
+  // removed on task finish.
+  private taskLockIds = new Map<string, string[]>()
+  private lockRenewTimer: ReturnType<typeof setInterval> | null = null
   // Sorted index of finished tasks by finishedAt (ascending). Insertion is
   // O(log n) via binary search; eviction scans the head of the array for
   // expired entries only — no need to walk the full `tasks` Map.
@@ -106,6 +112,16 @@ export class SchedulerService {
     this.idleEvictTimer = setInterval(() => {
       this.evictOldTasks()
     }, IDLE_EVICT_INTERVAL_MS)
+    // Periodic lock renewal (#1): long-running tasks renew their locks every
+    // 10 minutes (DEFAULT_TTL is 30 minutes) so they don't expire while running.
+    const LOCK_RENEW_INTERVAL_MS = 10 * 60 * 1000
+    this.lockRenewTimer = setInterval(() => {
+      for (const [taskId, lockIds] of this.taskLockIds.entries()) {
+        for (const lockId of lockIds) {
+          this.lockManager.renew(lockId)
+        }
+      }
+    }, LOCK_RENEW_INTERVAL_MS)
   }
 
   /**
@@ -118,6 +134,10 @@ export class SchedulerService {
     if (this.idleEvictTimer) {
       clearInterval(this.idleEvictTimer)
       this.idleEvictTimer = null
+    }
+    if (this.lockRenewTimer) {
+      clearInterval(this.lockRenewTimer)
+      this.lockRenewTimer = null
     }
     this.virtualCwdStore.dispose()
     // Drain any pending scheduler-event writes (EventLog uses 200ms debounce)
@@ -194,10 +214,16 @@ export class SchedulerService {
     task.updatedAt = Date.now()
     this.tasks.set(task.id, task)
     this.addToIndex(task)
+    const extLocks: string[] = []
     if (task.classification.cost === "exclusive") {
-      this.lockManager.acquire("host", task.hostId, task.hostId, task.agentId, task.id, "exclusive external task")
+      const hostLock = this.lockManager.acquire("host", task.hostId, task.hostId, task.agentId, task.id, "exclusive external task")
+      if (hostLock) extLocks.push(hostLock.id)
     } else if (task.classification.mutates && task.effectiveCwd) {
-      this.lockManager.acquire("workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating external task in workdir")
+      const workdirLock = this.lockManager.acquire("workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating external task in workdir")
+      if (workdirLock) extLocks.push(workdirLock.id)
+    }
+    if (extLocks.length > 0) {
+      this.taskLockIds.set(task.id, extLocks)
     }
     this.persistence.saveTask(task)
     this.outputStore.create(task.id)
@@ -230,6 +256,7 @@ export class SchedulerService {
     this.removeFromIndex(task)
     this.addToFinishedIndex(task)
     this.lockManager.releaseForTask(taskId)
+    this.clearTaskLocks(taskId)
     if (result.stdout) this.outputStore.appendStdout(taskId, result.stdout)
     if (result.stderr) this.outputStore.appendStderr(taskId, result.stderr)
     const output = this.outputStore.get(taskId)
@@ -288,25 +315,46 @@ export class SchedulerService {
     this.invokeHook("onTaskCreated", task)
 
     if (req.scheduler === "bypass") {
-      this.startTask(task)
+      const started = this.startTask(task)
+      if (started) {
+        return {
+          action: "run_now",
+          taskId: task.id,
+          effectiveCwd,
+          classification,
+          reason: "scheduler=bypass, skipped queue but task is still registered.",
+        }
+      }
+      // Lock acquisition failed (another task holds the lock). Task was
+      // re-enqueued by startTask; report queued status to caller.
       return {
-        action: "run_now",
+        action: "queued",
         taskId: task.id,
         effectiveCwd,
         classification,
-        reason: "scheduler=bypass, skipped queue but task is still registered.",
+        reason: "bypass requested but lock unavailable; task queued.",
       }
     }
 
     const blockers = this.findBlockers(task)
     if (blockers.length === 0) {
-      this.startTask(task)
+      const started = this.startTask(task)
+      if (started) {
+        return {
+          action: "run_now",
+          taskId: task.id,
+          effectiveCwd,
+          classification,
+          reason: "No conflicting tasks on this host; started execution.",
+        }
+      }
+      // Re-enqueued by startTask (lock race). Report queued status.
       return {
-        action: "run_now",
+        action: "queued",
         taskId: task.id,
         effectiveCwd,
         classification,
-        reason: "No conflicting tasks on this host; started execution.",
+        reason: "Lock unavailable after blocker check; task queued for retry.",
       }
     }
 
@@ -316,14 +364,24 @@ export class SchedulerService {
     const effectiveIfBusy = (ifBusy === "run_anyway" && hasExclusiveBlocker) ? "queue" : ifBusy
 
     if (effectiveIfBusy === "run_anyway") {
-      this.startTask(task)
+      const started = this.startTask(task)
+      if (started) {
+        return {
+          action: "run_now",
+          taskId: task.id,
+          effectiveCwd,
+          classification,
+          blockers,
+          reason: "if_busy=run_anyway, executing despite conflicts.",
+        }
+      }
       return {
-        action: "run_now",
+        action: "queued",
         taskId: task.id,
         effectiveCwd,
         classification,
         blockers,
-        reason: "if_busy=run_anyway, executing despite conflicts.",
+        reason: "run_anyway requested but lock unavailable; task queued.",
       }
     }
 
@@ -479,6 +537,7 @@ export class SchedulerService {
 
     this.addToFinishedIndex(task)
     this.lockManager.releaseForTask(taskId)
+    this.clearTaskLocks(taskId)
     this.persistence.saveTask(task)
     this.eventLog.log("task_cancelled", { taskId, hostId, agentId: task.agentId })
 
@@ -565,6 +624,11 @@ export class SchedulerService {
     reason?: string
   ): SchedulerLock | null {
     const lock = this.lockManager.acquire(scope, key, hostId, agentId, taskId, reason)
+    if (lock && taskId) {
+      const existing = this.taskLockIds.get(taskId) ?? []
+      existing.push(lock.id)
+      this.taskLockIds.set(taskId, existing)
+    }
     if (lock) {
       this.eventLog.log("lock_acquired", { hostId, agentId, data: { lockId: lock.id, scope, key } })
     }
@@ -603,11 +667,42 @@ export class SchedulerService {
     }
   }
 
-  private startTask(task: ScheduledTask): void {
+  /**
+   * Try to start a task. Acquires the appropriate lock first (exclusive → host
+   * lock; large mutating → workdir lock), then invokes the runner. Returns
+   * `true` if the task was actually started (lock acquired + runner invoked),
+   * `false` if the lock could not be acquired and the task was re-enqueued.
+   * Callers use the return value to decide whether to run post-start cleanup
+   * (e.g. clearing `queuePosition` in pumpQueue) or adjust their decision
+   * (e.g. `schedule()` returning "queued" instead of "run_now").
+   */
+  private startTask(task: ScheduledTask): boolean {
+    const acquiredLocks: string[] = []
     if (task.classification.cost === "exclusive") {
-      this.lockManager.acquire("host", task.hostId, task.hostId, task.agentId, task.id, "exclusive task")
+      const hostLock = this.lockManager.acquire(
+        "host", task.hostId, task.hostId, task.agentId, task.id, "exclusive task"
+      )
+      if (!hostLock) {
+        // Another task or bypass/external task holds this host lock.
+        // Re-enqueue so a later pumpQueue can retry.
+        this.addToIndex(task)
+        this.enqueue(task)
+        return false
+      }
+      acquiredLocks.push(hostLock.id)
     } else if (task.classification.mutates && task.effectiveCwd) {
-      this.lockManager.acquire("workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating task in workdir")
+      const workdirLock = this.lockManager.acquire(
+        "workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating task in workdir"
+      )
+      if (!workdirLock) {
+        this.addToIndex(task)
+        this.enqueue(task)
+        return false
+      }
+      acquiredLocks.push(workdirLock.id)
+    }
+    if (acquiredLocks.length > 0) {
+      this.taskLockIds.set(task.id, acquiredLocks)
     }
 
     this.removeFromIndex(task)
@@ -619,31 +714,52 @@ export class SchedulerService {
     this.eventLog.log("task_started", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
     this.invokeHook("onTaskStarted", task)
 
-    if (task.background && this.runner.startBackground) {
-      this.runner.startBackground(task,
-        (stdout, stderr) => {
-          if (stdout) this.outputStore.appendStdout(task.id, stdout)
-          if (stderr) this.outputStore.appendStderr(task.id, stderr)
-        },
-        (code, signal) => {
-          this.finishTask(task.id, code === 0 ? "completed" : "failed", code, signal)
-        },
-      )
-    } else {
-      const onOutput = (stdout: string, stderr: string): void => {
-        if (stdout) {
-          this.markStreamedOutput(task.id, "stdout")
-          this.outputStore.appendStdout(task.id, stdout)
+    try {
+      if (task.background && this.runner.startBackground) {
+        this.runner.startBackground(task,
+          (stdout, stderr) => {
+            if (stdout) {
+              this.markStreamedOutput(task.id, "stdout")
+              this.outputStore.appendStdout(task.id, stdout)
+            }
+            if (stderr) {
+              this.markStreamedOutput(task.id, "stderr")
+              this.outputStore.appendStderr(task.id, stderr)
+            }
+          },
+          (code, signal) => {
+            this.finishTask(task.id, code === 0 ? "completed" : "failed", code, signal)
+          }
+        )
+      } else {
+        const onOutput = (stdout: string, stderr: string): void => {
+          if (stdout) {
+            this.markStreamedOutput(task.id, "stdout")
+            this.outputStore.appendStdout(task.id, stdout)
+          }
+          if (stderr) {
+            this.markStreamedOutput(task.id, "stderr")
+            this.outputStore.appendStderr(task.id, stderr)
+          }
         }
-        if (stderr) {
-          this.markStreamedOutput(task.id, "stderr")
-          this.outputStore.appendStderr(task.id, stderr)
-        }
+        // try/catch catches synchronous throws from runner.start.
+        // Async Promise rejections are handled by the .catch() on the promise.
+        this.runner.start(task, onOutput)
+          .then(result => this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
+          .catch(err => this.finishTask(task.id, "failed", 1, undefined, "", err instanceof Error ? err.message : String(err)))
       }
-      this.runner.start(task, onOutput)
-        .then(result => this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
-        .catch(err => this.finishTask(task.id, "failed", 1, undefined, "", err.message))
+    } catch (err) {
+      // Synchronous throw from startBackground or start before returning a Promise
+      this.finishTask(
+        task.id, "failed", 1, undefined, "",
+        err instanceof Error ? err.message : String(err)
+      )
     }
+    return true
+  }
+
+  private clearTaskLocks(taskId: string): void {
+    this.taskLockIds.delete(taskId)
   }
 
   private finishTask(taskId: string, status: ScheduledTaskStatus, exitCode: number, signal?: string, stdout?: string, stderr?: string): void {
@@ -662,25 +778,39 @@ export class SchedulerService {
     const alreadyStreamed = this.streamedOutputTasks.get(taskId)
     this.streamedOutputTasks.delete(taskId)
 
-    if (stdout && !alreadyStreamed?.stdout) {
-      this.outputStore.appendStdout(taskId, stdout)
-    }
-    if (stderr && !alreadyStreamed?.stderr) {
-      this.outputStore.appendStderr(taskId, stderr)
-    }
-    const output = this.outputStore.get(taskId)
-    if (output) {
-      task.stdoutTail = output.stdoutTail.toString("utf8")
-      task.stdoutBytes = output.stdoutBytes
-      task.stderrTail = output.stderrTail.toString("utf8")
-      task.stderrBytes = output.stderrBytes
+    try {
+      if (stdout && !alreadyStreamed?.stdout) {
+        this.outputStore.appendStdout(taskId, stdout)
+      }
+      if (stderr && !alreadyStreamed?.stderr) {
+        this.outputStore.appendStderr(taskId, stderr)
+      }
+      const output = this.outputStore.get(taskId)
+      if (output) {
+        task.stdoutTail = output.stdoutTail.toString("utf8")
+        task.stdoutBytes = output.stdoutBytes
+        task.stderrTail = output.stderrTail.toString("utf8")
+        task.stderrBytes = output.stderrBytes
+      }
+    } catch (_err) {
+      // Ignore output store errors - task state transitions are more important.
+      // The output will be unavailable for this task, but the task itself completes.
     }
 
     this.lockManager.releaseForTask(taskId)
+    this.clearTaskLocks(taskId)
 
-    this.persistence.saveTask(task)
-    const eventType = status === "completed" ? "task_completed" : status === "failed" ? "task_failed" : status === "cancelled" ? "task_cancelled" : "task_timed_out"
-    this.eventLog.log(eventType, { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { exitCode } })
+    try {
+      this.persistence.saveTask(task)
+    } catch (_err) {
+      // Persistence failure is non-fatal; in-memory state remains correct.
+    }
+    try {
+      const eventType = status === "completed" ? "task_completed" : status === "failed" ? "task_failed" : status === "cancelled" ? "task_cancelled" : "task_timed_out"
+      this.eventLog.log(eventType, { taskId: task.id, hostId: task.hostId, agentId: task.agentId, data: { exitCode } })
+    } catch (_err) {
+      // Event log failure is non-fatal.
+    }
 
     this.resolveWaiters(taskId, task)
 
@@ -776,12 +906,17 @@ export class SchedulerService {
       let startedAny = false
       for (const task of queued) {
         if (this.findBlockersWithPrecomputed(task, nonBypass, nonBypassCount, largeOrExclusiveCount, exclusiveCount).length === 0) {
-          this.startTask(task)
-          task.queuePosition = undefined
-          this.persistence.saveTask(task)
-          this.eventLog.log("task_dequeued", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
-          startedAny = true
-          break // break so the next iteration re-snapshots `nonBypass` with the new running task included
+          // startTask returns false if the lock couldn't be acquired (task
+          // was re-enqueued). In that case we skip cleanup and let the loop
+          // try the next queued task instead.
+          const started = this.startTask(task)
+          if (started) {
+            task.queuePosition = undefined
+            this.persistence.saveTask(task)
+            this.eventLog.log("task_dequeued", { taskId: task.id, hostId: task.hostId, agentId: task.agentId })
+            startedAny = true
+            break // break so the next iteration re-snapshots `nonBypass` with the new running task included
+          }
         }
       }
       if (!startedAny) break
@@ -819,8 +954,9 @@ export class SchedulerService {
     largeOrExclusiveCount: number,
     exclusiveCount: number,
   ): ScheduledTaskSummary[] {
-    if (nonBypassCount === 0) return []
-
+    // Lock conflict check FIRST — bypass/external tasks hold locks but are NOT
+    // counted in nonBypass. Without this, `nonBypassCount === 0` would let a
+    // queued task start while a bypass/external task holds a conflicting lock.
     if (task.classification.cost === "exclusive" || task.classification.cost === "large") {
       if (task.effectiveCwd) {
         const workdirConflicts = this.lockManager.getConflictingLocks("workdir", task.effectiveCwd, task.hostId)
@@ -835,6 +971,8 @@ export class SchedulerService {
         }
       }
     }
+
+    if (nonBypassCount === 0) return []
 
     switch (task.classification.cost) {
       case "tiny":
