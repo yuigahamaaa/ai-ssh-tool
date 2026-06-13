@@ -161,4 +161,9 @@ describe("ExecTaskManager read paths consult scheduler", () => {
       scheduler.dispose()
     }
   })
+
+  it("dispose() cleans up the default scheduler without throwing", () => {
+    const mgr = new ExecTaskManager()
+    mgr.dispose() // must not throw
+  })
 })

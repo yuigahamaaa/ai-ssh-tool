@@ -26,7 +26,7 @@ export type ScheduledTaskStatus =
 export interface AgentIdentity {
   id: string
   name?: string
-  clientType: "mcp" | "cli"
+  clientType: "mcp" | "cli" | "internal"
 }
 
 export interface HostIdentity {
@@ -238,7 +238,7 @@ export interface SchedulerEvent {
 export interface AgentRecord {
   id: string
   name?: string
-  clientType: "mcp" | "cli"
+  clientType: "mcp" | "cli" | "internal"
   startedAt: number
   lastSeenAt: number
   defaultProfile?: string

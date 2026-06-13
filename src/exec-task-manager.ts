@@ -119,6 +119,10 @@ export class ExecTaskManager {
     this.cleanupOldTasks()
   }
 
+  dispose(): void {
+    this.scheduler.dispose()
+  }
+
   private maybeCleanup(): void {
     const now = Date.now()
     if (now - this.lastCleanupAt > this.CLEANUP_INTERVAL) {
@@ -302,15 +306,14 @@ export class ExecTaskManager {
     // real work happens below on the raw ssh2 Client.
     try {
       this.scheduler.registerExternal({
-        agent: { id: "exec-task-manager", name: "exec-task-manager", clientType: "internal" as const },
+        agent: { id: "exec-task-manager", name: "exec-task-manager", clientType: "internal" },
         host: { id: hostname, profileKey: options?.profileKey ?? "", targetHost: hostname, targetUser: "", displayName: hostname },
         sessionId: options?.sessionId ?? id,
         command,
         ...(options?.cwd ? { cwd: options.cwd } : {}),
-        ...(options?.profileKey ? { profileKey: options.profileKey } : {}),
         scheduler: "bypass",
         reason: "exec-task-manager legacy path",
-      } as unknown as ScheduleRequest)
+      })
     } catch (err) {
       log("exec-task", `scheduler.registerExternal failed for ${id}: ${(err as Error).message}`)
     }
@@ -522,9 +525,24 @@ export class ExecTaskManager {
       client.exec(killCmd, () => {})
     }
 
-    // Mark cancelled BEFORE closing stream to prevent race with stream.on("close")
-    // callback which would overwrite status to "completed" via finishTask
+    if (!entry.chunksFlushed) {
+      entry.chunksFlushed = true
+      entry.task.stdout = Buffer.concat(entry.stdoutChunks).toString("utf8")
+      entry.task.stderr = Buffer.concat(entry.stderrChunks).toString("utf8")
+    }
+
     this.finishTask(id, "cancelled", 130, signal)
+    try {
+      this.scheduler.finishExternalTask(id, {
+        code: 130,
+        stdout: entry.task.stdout,
+        stderr: entry.task.stderr,
+        signal,
+        status: "cancelled",
+      })
+    } catch (err) {
+      log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
+    }
 
     if (entry.stream) {
       try {

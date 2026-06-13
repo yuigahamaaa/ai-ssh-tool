@@ -108,4 +108,107 @@ describe("ExecTaskManager.start() publishes to scheduler", () => {
     // Should not throw
     scheduler.finishExternalTask("does-not-exist", { code: 0, stdout: "", stderr: "" })
   })
+
+  it("registerExternal acquires workdir lock for mutating command", () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "npm install express",
+      cwd: "/tmp/my-project",
+      scheduler: "bypass",
+    } as any)
+    const locks = scheduler["lockManager"].getLocksForHost("h1")
+    assert.ok(locks.length > 0, "at least one lock acquired")
+    assert.equal(locks[0].scope, "workdir")
+    assert.equal(locks[0].key, "/tmp/my-project")
+    scheduler.dispose()
+  })
+
+  it("registerExternal acquires host lock for exclusive command", () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "dd if=/dev/zero of=/dev/null",
+      cost: "exclusive",
+      scheduler: "bypass",
+    } as any)
+    const locks = scheduler["lockManager"].getLocksForHost("h1")
+    assert.ok(locks.length > 0, "at least one lock acquired")
+    assert.equal(locks[0].scope, "host")
+    assert.equal(locks[0].key, "h1")
+    scheduler.dispose()
+  })
+
+  it("finishExternalTask releases locks and resolves waiters", async () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "echo done",
+      scheduler: "bypass",
+    } as any)
+
+    const waitPromise = scheduler.waitTask(t.id, 500)
+    scheduler.finishExternalTask(t.id, { code: 0, stdout: "ok", stderr: "" })
+    const resolvedTask = await waitPromise
+    assert.equal(resolvedTask.exitCode, 0)
+    const locks = scheduler["lockManager"].getLocksForHost("h1")
+    assert.equal(locks.length, 0, "locks released after finish")
+    scheduler.dispose()
+  })
+
+  it("finishExternalTask marks failed tasks correctly", () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "exit 1",
+      scheduler: "bypass",
+    } as any)
+    scheduler.finishExternalTask(t.id, { code: 1, stdout: "", stderr: "error" })
+    const after = scheduler.getTask(t.id)!
+    assert.equal(after.status, "failed")
+    assert.equal(after.exitCode, 1)
+    scheduler.dispose()
+  })
+
+  it("finishExternalTask marks cancelled tasks correctly", () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "echo test",
+      scheduler: "bypass",
+    } as any)
+    scheduler.finishExternalTask(t.id, { code: 130, stdout: "", stderr: "", signal: "TERM", status: "cancelled" })
+    const after = scheduler.getTask(t.id)!
+    assert.equal(after.status, "cancelled")
+    assert.equal(after.exitCode, 130)
+    assert.equal(after.signal, "TERM")
+    scheduler.dispose()
+  })
+
+  it("finishExternalTask is idempotent", () => {
+    const scheduler = makeTrackedScheduler()
+    const t = scheduler.registerExternal({
+      agent: { id: "etm", name: "etm", clientType: "internal" },
+      host: { id: "h1", profileKey: "k", targetHost: "h1", targetUser: "u", displayName: "h1" },
+      sessionId: "s1",
+      command: "echo test",
+      scheduler: "bypass",
+    } as any)
+    scheduler.finishExternalTask(t.id, { code: 0, stdout: "first", stderr: "" })
+    scheduler.finishExternalTask(t.id, { code: 1, stdout: "second", stderr: "" })
+    const after = scheduler.getTask(t.id)!
+    // second call is no-op because task is no longer running
+    assert.equal(after.exitCode, 0)
+    scheduler.dispose()
+  })
 })

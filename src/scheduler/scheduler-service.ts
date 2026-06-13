@@ -194,6 +194,11 @@ export class SchedulerService {
     task.updatedAt = Date.now()
     this.tasks.set(task.id, task)
     this.addToIndex(task)
+    if (task.classification.cost === "exclusive") {
+      this.lockManager.acquire("host", task.hostId, task.hostId, task.agentId, task.id, "exclusive external task")
+    } else if (task.classification.mutates && task.effectiveCwd) {
+      this.lockManager.acquire("workdir", task.effectiveCwd, task.hostId, task.agentId, task.id, "mutating external task in workdir")
+    }
     this.persistence.saveTask(task)
     this.outputStore.create(task.id)
     this.eventLog.log("task_created_external", {
@@ -224,6 +229,7 @@ export class SchedulerService {
     task.updatedAt = Date.now()
     this.removeFromIndex(task)
     this.addToFinishedIndex(task)
+    this.lockManager.releaseForTask(taskId)
     if (result.stdout) this.outputStore.appendStdout(taskId, result.stdout)
     if (result.stderr) this.outputStore.appendStderr(taskId, result.stderr)
     const output = this.outputStore.get(taskId)
@@ -240,6 +246,7 @@ export class SchedulerService {
       agentId: task.agentId,
       data: { code: result.code, signal: result.signal ?? null },
     })
+    this.resolveWaiters(taskId, task)
     this.pumpQueue(task.hostId)
     this.cleanupOutputsThrottled()
     this.evictOldTasks()
