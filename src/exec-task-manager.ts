@@ -315,6 +315,38 @@ export class ExecTaskManager {
       log("exec-task", `scheduler.registerExternal failed for ${id}: ${(err as Error).message}`)
     }
 
+    // single-finish guard prevents timeout/close/error from finishing twice
+    // (e.g. timeout kills the stream → close event fires again).
+    let finished = false
+    const finishOnce = (
+      legacyStatus: "completed" | "failed" | "timeout" | "cancelled",
+      code: number,
+      signal: string | undefined,
+    ): void => {
+      if (finished) return
+      finished = true
+      flushChunks()
+      this.finishTask(id, legacyStatus, code, signal)
+      // Translate legacy status to scheduler-completed status and notify
+      // the scheduler. finishExternalTask is now idempotent on its side
+      // too, but the flag here ensures we only call it once with the
+      // "winning" status (the first callback that fires).
+      const schedulerStatus = legacyStatus === "completed" ? "completed"
+        : legacyStatus === "failed" ? "failed"
+        : legacyStatus === "timeout" ? "failed"
+        : "failed"
+      try {
+        this.scheduler.finishExternalTask(id, {
+          code,
+          stdout: task.stdout,
+          stderr: task.stderr,
+          ...(signal ? { signal } : {}),
+          status: schedulerStatus,
+        })
+      } catch (err) {
+        log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
+      }
+    }
 
     const flushChunks = () => {
       if (entry.chunksFlushed) return
@@ -331,8 +363,7 @@ export class ExecTaskManager {
 
       client.exec(wrappedCommand, (err, stream) => {
         if (err) {
-          flushChunks()
-          this.finishTask(id, "failed", 1, undefined, err.message)
+          finishOnce("failed", 1, undefined)
           reject(new Error(`Failed to exec: ${err.message}`))
           return
         }
@@ -394,20 +425,8 @@ export class ExecTaskManager {
         })
 
         stream.on("close", (code?: number, signal?: string) => {
-          flushChunks()
-          const status = code === 0 ? "completed" : "failed"
-          this.finishTask(id, status, code ?? 0, signal ?? undefined)
-          // Stage 2 / Task 2.1: notify the scheduler of completion
-          try {
-            this.scheduler.finishExternalTask(id, {
-              code: code ?? 0,
-              stdout: task.stdout,
-              stderr: task.stderr,
-              ...(signal ? { signal } : {}),
-            })
-          } catch (err) {
-            log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
-          }
+          const legacyStatus = code === 0 ? "completed" : "failed"
+          finishOnce(legacyStatus, code ?? 0, signal ?? undefined)
           resolve({
             stdout: task.stdout,
             stderr: task.stderr,
@@ -417,8 +436,7 @@ export class ExecTaskManager {
         })
 
         stream.on("error", (streamErr: Error) => {
-          flushChunks()
-          this.finishTask(id, "failed", 1, undefined, streamErr.message)
+          finishOnce("failed", 1, undefined)
           reject(new Error(`Stream error: ${streamErr.message}`))
         })
 
@@ -436,19 +454,7 @@ export class ExecTaskManager {
                   currentTask.stream.close()
                 } catch {}
               }
-              flushChunks()
-              this.finishTask(id, "timeout", 124, "TERM")
-              // Stage 2 / Task 2.1: notify the scheduler of timeout completion
-              try {
-                this.scheduler.finishExternalTask(id, {
-                  code: 124,
-                  stdout: task.stdout,
-                  stderr: task.stderr,
-                  signal: "TERM",
-                })
-              } catch (err) {
-                log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
-              }
+              finishOnce("timeout", 124, "TERM")
               reject(new Error(`Command timed out after ${options.timeout}ms`))
             }
           }, options.timeout)

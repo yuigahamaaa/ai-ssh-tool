@@ -224,7 +224,7 @@ async function main() {
     name: string,
     fn: (args: Args) => Promise<Ret>,
   ) => {
-    return async (args: Args): Promise<Ret | (Ret & { isError: true })> => {
+    return async (args: Args): Promise<Ret> => {
       try {
         return await fn(args)
       } catch (e) {
@@ -232,12 +232,11 @@ async function main() {
         const detail = (err.stack ?? err.message).split("\n").slice(0, 4).join("\n")
         log("mcp", `Tool ${name} threw: ${err.message}\n${detail}`)
         return {
-          isError: true,
           content: [{
             type: "text" as const,
             text: `[${name}] ${err.message}`,
           }],
-        } as Ret & { isError: true }
+        } as Ret
       }
     }
   }

@@ -193,6 +193,7 @@ export class SchedulerService {
     task.startedAt = Date.now()
     task.updatedAt = Date.now()
     this.tasks.set(task.id, task)
+    this.addToIndex(task)
     this.persistence.saveTask(task)
     this.outputStore.create(task.id)
     this.eventLog.log("task_created_external", {
@@ -202,6 +203,7 @@ export class SchedulerService {
       data: { command: task.command },
     })
     this.invokeHook("onTaskCreated", task)
+    this.invokeHook("onTaskStarted", task)
     return task
   }
 
@@ -210,18 +212,27 @@ export class SchedulerService {
    */
   finishExternalTask(
     taskId: string,
-    result: { code: number; stdout: string; stderr: string; signal?: string },
+    result: { code: number; stdout: string; stderr: string; signal?: string; status?: string },
   ): void {
     const task = this.tasks.get(taskId)
     if (!task) return
+    if (task.status !== "running") return
     task.exitCode = result.code
     task.signal = result.signal ?? null
-    task.status = "completed"
+    task.status = (result.status as ScheduledTaskStatus | undefined) ?? (result.code === 0 ? "completed" : "failed")
     task.finishedAt = Date.now()
     task.updatedAt = Date.now()
-    // Stream the captured output into OutputStore so getTaskOutput works
+    this.removeFromIndex(task)
+    this.addToFinishedIndex(task)
     if (result.stdout) this.outputStore.appendStdout(taskId, result.stdout)
     if (result.stderr) this.outputStore.appendStderr(taskId, result.stderr)
+    const output = this.outputStore.get(taskId)
+    if (output) {
+      task.stdoutTail = output.stdoutTail.toString("utf8")
+      task.stderrTail = output.stderrTail.toString("utf8")
+      task.stdoutBytes = output.stdoutBytes
+      task.stderrBytes = output.stderrBytes
+    }
     this.persistence.saveTask(task)
     this.eventLog.log("task_finished_external", {
       taskId: task.id,
@@ -229,6 +240,9 @@ export class SchedulerService {
       agentId: task.agentId,
       data: { code: result.code, signal: result.signal ?? null },
     })
+    this.pumpQueue(task.hostId)
+    this.cleanupOutputsThrottled()
+    this.evictOldTasks()
     this.invokeHook("onTaskFinished", task)
   }
 
