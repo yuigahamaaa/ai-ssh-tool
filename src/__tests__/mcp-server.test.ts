@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import ssh2 from "ssh2"
 import { SSHConnection } from "../connection.js"
 import { remoteExec } from "../remote-shell.js"
-import { BackgroundExecManager } from "../background-exec.js"
+import { getGlobalTaskManager } from "../exec-task-manager.js"
 import { PortForwardManager } from "../port-forwarding.js"
 import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
@@ -168,16 +168,17 @@ describe("MCP Server Tool Integration", () => {
   })
 
   describe("background exec tools", () => {
-    it("BackgroundExecManager starts and tracks tasks", async () => {
-      const manager = new BackgroundExecManager()
-      const task = await manager.start(conn.getFinalClient(), "echo bg-mcp")
-      assert.ok(task.id)
+    it("ExecTaskManager starts and tracks tasks", async () => {
+      const manager = getGlobalTaskManager()
+      const { id } = manager.start(conn.getFinalClient(), "echo bg-mcp")
+      const task = manager.getStatus(id)
+      assert.ok(task)
       assert.equal(task.command, "echo bg-mcp")
 
       const list = manager.list()
       assert.ok(list.length >= 1)
 
-      const status = manager.getStatus(task.id)
+      const status = manager.getStatus(id)
       assert.ok(status)
     })
   })

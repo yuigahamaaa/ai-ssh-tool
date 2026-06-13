@@ -178,7 +178,7 @@ export interface TaskRunner {
     task: ScheduledTask,
     onOutput: (stdout: string, stderr: string) => void,
     onClose: (code: number, signal?: string) => void
-  ): void
+  ): { stop: () => void } | void
 }
 
 export interface SchedulerServiceInterface {

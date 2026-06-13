@@ -85,6 +85,11 @@ export class SchedulerService {
   private finishedByTime: ScheduledTask[] = []
   private lastEvictAt = 0
   private idleEvictTimer: ReturnType<typeof setInterval> | null = null
+  // Map from running background taskId -> stop() controller returned by
+  // runner.startBackground. Allows cancelTask and dispose() to stop
+  // background streams without the daemon maintaining its own parallel
+  // backgroundTaskHandles map.
+  private backgroundTaskControllers = new Map<string, { stop: () => void }>()
 
   constructor(opts?: SchedulerServiceOptions) {
     this.persistence = opts?.persistence ?? new PersistenceStore()
@@ -138,6 +143,14 @@ export class SchedulerService {
     if (this.lockRenewTimer) {
       clearInterval(this.lockRenewTimer)
       this.lockRenewTimer = null
+    }
+    // Stop any background streams that were started via
+    // runner.startBackground. Each controller.stop() is best-effort and must
+    // not throw — we loop through all of them and clear the map so dispose()
+    // is idempotent.
+    for (const [taskId, controller] of this.backgroundTaskControllers) {
+      try { controller.stop() } catch { /* best-effort */ }
+      this.backgroundTaskControllers.delete(taskId)
     }
     this.virtualCwdStore.dispose()
     // Drain any pending scheduler-event writes (EventLog uses 200ms debounce)
@@ -523,15 +536,24 @@ export class SchedulerService {
     task.finishedAt = task.updatedAt
     task.decisionReason = "Cancelled by cancel request."
 
-    if (wasRunning && this.runner.cancel) {
-      const cancelled = this.runner.cancel(task)
-      if (!cancelled) {
-        // runner refused; restore the previous status/index so the task keeps
-        // running as if cancel was never called.
-        task.status = "running"
-        task.finishedAt = undefined
-        this.addToIndex(task)
-        return false
+    if (wasRunning) {
+      const bgController = this.backgroundTaskControllers.get(task.id)
+      if (bgController) {
+        // Background task owned by this scheduler: stop its stream directly.
+        this.backgroundTaskControllers.delete(task.id)
+        try { bgController.stop() } catch { /* best-effort */ }
+      } else if (this.runner.cancel) {
+        // Non-background task or externally-managed runner: delegate to
+        // runner.cancel.
+        const cancelled = this.runner.cancel(task)
+        if (!cancelled) {
+          // runner refused; restore the previous status/index so the task keeps
+          // running as if cancel was never called.
+          task.status = "running"
+          task.finishedAt = undefined
+          this.addToIndex(task)
+          return false
+        }
       }
     }
 
@@ -716,7 +738,7 @@ export class SchedulerService {
 
     try {
       if (task.background && this.runner.startBackground) {
-        this.runner.startBackground(task,
+        const controller = this.runner.startBackground(task,
           (stdout, stderr) => {
             if (stdout) {
               this.markStreamedOutput(task.id, "stdout")
@@ -728,9 +750,13 @@ export class SchedulerService {
             }
           },
           (code, signal) => {
+            this.backgroundTaskControllers.delete(task.id)
             this.finishTask(task.id, code === 0 ? "completed" : "failed", code, signal)
           }
         )
+        if (controller && typeof controller.stop === "function") {
+          this.backgroundTaskControllers.set(task.id, controller)
+        }
       } else {
         const onOutput = (stdout: string, stderr: string): void => {
           if (stdout) {
