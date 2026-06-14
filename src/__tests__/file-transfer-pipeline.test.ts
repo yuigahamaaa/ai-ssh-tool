@@ -14,8 +14,19 @@ import { uploadFile, downloadFile } from "../file-transfer.js"
 import type { TransferResult } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+// Suppress ECONNRESET fired by ssh2's mock Server during teardown — SFTP
+// sessions can emit late socket errors after the test body has already
+// passed, and Node's test runner otherwise reports them as post-test async
+// failures. Other SFTP mock tests use the same guard.
+process.on("uncaughtException", (err: any) => {
+  if (err?.code === "ECONNRESET" || err?.code === "ERR_STREAM_PREMATURE_CLOSE") return
+  throw err
+})
+
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 const memFs = new Map<string, Buffer>()
 
 function createTestServer(): Promise<{
@@ -112,8 +123,9 @@ function createTestServer(): Promise<{
           memFs.clear()
           for (const client of clients) {
             try { client.end() } catch {}
+            try { (client as any)._sock?.destroy?.() } catch {}
           }
-          server.close(() => res())
+          server.close(() => setTimeout(res, 200))
         }),
       })
     })

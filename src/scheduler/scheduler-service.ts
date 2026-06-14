@@ -58,6 +58,7 @@ export class SchedulerService {
   private eventLog: EventLog
   private lockManager: LockManager
   private runner: TaskRunner
+  private taskRunners = new Map<string, TaskRunner>()
   private hooks: SchedulerServiceOptions["hooks"]
 
   private maxQueueSize: number
@@ -90,6 +91,10 @@ export class SchedulerService {
   // background streams without the daemon maintaining its own parallel
   // backgroundTaskHandles map.
   private backgroundTaskControllers = new Map<string, { stop: () => void }>()
+  // Map from running foreground taskId -> stop() controller returned by
+  // runner.start. This lets scheduler-owned cancellation stop foreground
+  // streams without relying on the older optional runner.cancel hook.
+  private foregroundTaskControllers = new Map<string, { stop: () => void }>()
 
   constructor(opts?: SchedulerServiceOptions) {
     this.persistence = opts?.persistence ?? new PersistenceStore()
@@ -144,10 +149,13 @@ export class SchedulerService {
       clearInterval(this.lockRenewTimer)
       this.lockRenewTimer = null
     }
-    // Stop any background streams that were started via
-    // runner.startBackground. Each controller.stop() is best-effort and must
-    // not throw — we loop through all of them and clear the map so dispose()
-    // is idempotent.
+    // Stop any foreground/background streams started by the runner. Each
+    // controller.stop() is best-effort and must not throw — we loop through
+    // all of them and clear the maps so dispose() is idempotent.
+    for (const [taskId, controller] of this.foregroundTaskControllers) {
+      try { controller.stop() } catch { /* best-effort */ }
+      this.foregroundTaskControllers.delete(taskId)
+    }
     for (const [taskId, controller] of this.backgroundTaskControllers) {
       try { controller.stop() } catch { /* best-effort */ }
       this.backgroundTaskControllers.delete(taskId)
@@ -293,11 +301,43 @@ export class SchedulerService {
     this.invokeHook("onTaskFinished", task)
   }
 
+  appendExternalOutput(taskId: string, stdout: string, stderr: string): void {
+    const task = this.tasks.get(taskId)
+    if (!task || task.status !== "running") return
+    if (stdout) this.outputStore.appendStdout(taskId, stdout)
+    if (stderr) this.outputStore.appendStderr(taskId, stderr)
+    const output = this.outputStore.get(taskId)
+    if (output) {
+      task.stdoutTail = output.stdoutTail.toString("utf8")
+      task.stderrTail = output.stderrTail.toString("utf8")
+      task.stdoutBytes = output.stdoutBytes
+      task.stderrBytes = output.stderrBytes
+      task.updatedAt = Date.now()
+      this.persistence.saveTask(task)
+    }
+  }
+
   heartbeat(agentId: string): void {
     const agent = this.agents.get(agentId)
     if (agent) {
       agent.lastSeenAt = Date.now()
     }
+  }
+
+  /**
+   * Schedule one task with a caller-provided runner while preserving all
+   * scheduler-owned lifecycle, output, locking, and persistence behavior.
+   * This is the narrow bridge used by compatibility facades that already
+   * hold execution resources (for example a raw ssh2 Client) but should not
+   * maintain a parallel task store.
+   */
+  runWithRunner(req: ScheduleRequest, runner: TaskRunner): ScheduleDecision {
+    const taskId = req.id ?? `t_${randomUUID().slice(0, 10)}`
+    req = { ...req, id: taskId }
+    this.taskRunners.set(taskId, runner)
+    const decision = this.schedule(req)
+    if (!decision.taskId) this.taskRunners.delete(taskId)
+    return decision
   }
 
   schedule(req: ScheduleRequest): ScheduleDecision {
@@ -537,27 +577,43 @@ export class SchedulerService {
     task.decisionReason = "Cancelled by cancel request."
 
     if (wasRunning) {
-      const bgController = this.backgroundTaskControllers.get(task.id)
-      if (bgController) {
+      const fgController = this.foregroundTaskControllers.get(task.id)
+      if (fgController) {
+        this.foregroundTaskControllers.delete(task.id)
+        try { fgController.stop() } catch { /* best-effort */ }
+      } else {
+        const bgController = this.backgroundTaskControllers.get(task.id)
+        if (bgController) {
         // Background task owned by this scheduler: stop its stream directly.
-        this.backgroundTaskControllers.delete(task.id)
-        try { bgController.stop() } catch { /* best-effort */ }
-      } else if (this.runner.cancel) {
-        // Non-background task or externally-managed runner: delegate to
-        // runner.cancel.
-        const cancelled = this.runner.cancel(task)
-        if (!cancelled) {
-          // runner refused; restore the previous status/index so the task keeps
-          // running as if cancel was never called.
-          task.status = "running"
-          task.finishedAt = undefined
-          this.addToIndex(task)
-          return false
+          this.backgroundTaskControllers.delete(task.id)
+          try { bgController.stop() } catch { /* best-effort */ }
+        } else {
+          const runner = this.taskRunners.get(task.id) ?? this.runner
+          if (!runner.cancel) {
+            // No cancellation hook/controller exists. Restore running state
+            // so callers know the task could not be cancelled.
+            task.status = "running"
+            task.finishedAt = undefined
+            this.addToIndex(task)
+            return false
+          }
+          // Non-background task or externally-managed runner: delegate to
+          // runner.cancel.
+          const cancelled = runner.cancel(task)
+          if (!cancelled) {
+            // runner refused; restore the previous status/index so the task keeps
+            // running as if cancel was never called.
+            task.status = "running"
+            task.finishedAt = undefined
+            this.addToIndex(task)
+            return false
+          }
         }
       }
     }
 
     this.addToFinishedIndex(task)
+    this.taskRunners.delete(taskId)
     this.lockManager.releaseForTask(taskId)
     this.clearTaskLocks(taskId)
     this.persistence.saveTask(task)
@@ -667,7 +723,7 @@ export class SchedulerService {
 
   private createTask(req: ScheduleRequest, effectiveCwd: string | undefined, classification: CommandClassification): ScheduledTask {
     return {
-      id: `t_${randomUUID().slice(0, 10)}`,
+      id: req.id ?? `t_${randomUUID().slice(0, 10)}`,
       agentId: req.agent.id,
       agentName: req.agent.name,
       hostId: req.host.id,
@@ -737,16 +793,19 @@ export class SchedulerService {
     this.invokeHook("onTaskStarted", task)
 
     try {
-      if (task.background && this.runner.startBackground) {
-        const controller = this.runner.startBackground(task,
+      const runner = this.taskRunners.get(task.id) ?? this.runner
+      if (task.background && runner.startBackground) {
+        const controller = runner.startBackground(task,
           (stdout, stderr) => {
             if (stdout) {
               this.markStreamedOutput(task.id, "stdout")
               this.outputStore.appendStdout(task.id, stdout)
+              this.syncTaskOutputSnapshot(task.id)
             }
             if (stderr) {
               this.markStreamedOutput(task.id, "stderr")
               this.outputStore.appendStderr(task.id, stderr)
+              this.syncTaskOutputSnapshot(task.id)
             }
           },
           (code, signal) => {
@@ -762,17 +821,25 @@ export class SchedulerService {
           if (stdout) {
             this.markStreamedOutput(task.id, "stdout")
             this.outputStore.appendStdout(task.id, stdout)
+            this.syncTaskOutputSnapshot(task.id)
           }
           if (stderr) {
             this.markStreamedOutput(task.id, "stderr")
             this.outputStore.appendStderr(task.id, stderr)
+            this.syncTaskOutputSnapshot(task.id)
           }
         }
         // try/catch catches synchronous throws from runner.start.
         // Async Promise rejections are handled by the .catch() on the promise.
-        this.runner.start(task, onOutput)
+        const run = runner.start(task, onOutput)
+        const runPromise = "promise" in run ? run.promise : run
+        if ("promise" in run && typeof run.stop === "function") {
+          this.foregroundTaskControllers.set(task.id, { stop: run.stop })
+        }
+        runPromise
           .then(result => this.finishTask(task.id, result.code === 0 ? "completed" : "failed", result.code, result.signal, result.stdout, result.stderr))
           .catch(err => this.finishTask(task.id, "failed", 1, undefined, "", err instanceof Error ? err.message : String(err)))
+          .finally(() => this.foregroundTaskControllers.delete(task.id))
       }
     } catch (err) {
       // Synchronous throw from startBackground or start before returning a Promise
@@ -793,6 +860,7 @@ export class SchedulerService {
     if (!task) return
     if (task.status === "cancelled") return
 
+    this.taskRunners.delete(taskId)
     this.removeFromIndex(task)
     task.status = status
     task.exitCode = exitCode
@@ -844,6 +912,18 @@ export class SchedulerService {
     this.cleanupOutputsThrottled()
     this.evictOldTasks()
     this.invokeHook("onTaskFinished", task)
+  }
+
+  private syncTaskOutputSnapshot(taskId: string): void {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    const output = this.outputStore.get(taskId)
+    if (!output) return
+    task.stdoutTail = output.stdoutTail.toString("utf8")
+    task.stdoutBytes = output.stdoutBytes
+    task.stderrTail = output.stderrTail.toString("utf8")
+    task.stderrBytes = output.stderrBytes
+    task.updatedAt = Date.now()
   }
 
   private findBlockers(task: ScheduledTask): ScheduledTaskSummary[] {

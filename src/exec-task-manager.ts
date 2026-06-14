@@ -1,11 +1,9 @@
 /**
- * Exec Task Manager - unified management for all SSH execution tasks
+ * Exec Task Manager - compatibility facade for SSH execution tasks
  *
- * Manages both regular exec() commands and background exec commands:
- * - All running tasks are tracked in memory
- * - Cross-process visibility via disk persistence
- * - Atomic writes to avoid corruption
- * - Automatic cleanup of old tasks
+ * New tasks are scheduled through SchedulerService and persisted in the
+ * scheduler store. The legacy exec-tasks directory remains readable only
+ * as a fallback for old snapshots that pre-date the scheduler migration.
  */
 
 import type { Client, ClientChannel } from "ssh2"
@@ -55,11 +53,12 @@ export interface RunningTaskEntry {
   stream: ClientChannel
   task: ExecTask
   client: Client
-  persistImmediate: boolean // true for background tasks, false for regular exec
-  stdoutChunks: Buffer[]    // live output buffers, promoted from closure for runtime reads
-  stderrChunks: Buffer[]    // live error buffers, promoted from closure for runtime reads
-  chunksFlushed: boolean    // prevents double-flush on close + timeout
-  lastPersistAt: number     // per-task throttle, prevents multi-task interference
+  persistImmediate: boolean // legacy disk fallback path only
+  stdoutChunks: Buffer[]    // legacy runtime fallback path only
+  stderrChunks: Buffer[]    // legacy runtime fallback path only
+  chunksFlushed: boolean    // legacy runtime fallback path only
+  finished: boolean         // legacy runtime fallback path only
+  lastPersistAt: number     // legacy disk fallback path only
 }
 
 function getTaskStorageDir(): string {
@@ -94,15 +93,11 @@ export class ExecTaskManager {
   private CLEANUP_INTERVAL = 5 * 60 * 1000
   private TASK_RETENTION_MS = 24 * 60 * 60 * 1000
   /**
-   * Optional scheduler reference. When present, getStatus/getOutput/list
-   * consult the scheduler first so the legacy facade stays in sync with
-   * tasks created via the modern scheduler path. Stage 2 / Task 2.3.
-   *
-   * start() also delegates to the scheduler: it calls
-   * registerExternal() to publish the task, then finishExternalTask()
-   * when the legacy exec path completes. The runner is a no-op because
-   * the actual execution happens on the raw ssh2 Client the caller
-   * provided. Stage 2 / Task 2.1.
+   * Scheduler-owned source of truth for new tasks. ExecTaskManager keeps
+   * the old public API, but start()/cancel()/read paths delegate lifecycle,
+   * output persistence, listing, and cancellation to SchedulerService.
+   * The local `tasks` map and `~/.ssh-tool/exec-tasks` readers remain only
+   * as fallback compatibility for old runtime/disk snapshots.
    */
   private scheduler: SchedulerService
 
@@ -246,9 +241,6 @@ export class ExecTaskManager {
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
     const taskType = options?.type ?? "exec"
-    const isBackground = taskType === "background" || options?.timeout === undefined
-    const persistImmediate = true
-    const useDetached = options?.detached || isBackground
 
     let fullCommand = command
     if (options?.cwd) {
@@ -264,208 +256,174 @@ export class ExecTaskManager {
     // Explicit host from caller takes priority; only fall back to the
     // (ssh2-internals) reflection if the caller didn't supply one.
     const hostname = options?.host ?? getHostIdentifier(client)
-    const task: ExecTask = {
-      id,
-      type: taskType,
-      command,
-      status: "running",
-      exitCode: null,
-      signal: null,
-      stdout: "",
-      stderr: "",
-      startedAt: Date.now(),
-      finishedAt: null,
-      pid: null,
-      hostname,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      profileKey: options?.profileKey,
-      sessionId: options?.sessionId,
-      cwd: options?.cwd,
-    }
-
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
-
-    const entry: RunningTaskEntry = {
-      stream: null as any,
-      task,
-      client,
-      persistImmediate,
-      stdoutChunks,
-      stderrChunks,
-      chunksFlushed: false,
-      lastPersistAt: 0,
+    let stream: ClientChannel | null = null
+    let pid: number | null = null
+    let settled = false
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null
+    const stopCurrent = (): void => {
+      if (pid) {
+        const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+        client.exec(killCmd, () => {})
+      }
+      if (stream) {
+        try { stream.close() } catch {}
+      }
     }
+    // Keep compatibility with the legacy promise result. Scheduler/OutputStore
+    // remain the authoritative task/output stores; these closure-local chunks
+    // are released when the task settles.
+    const resultPromise = new Promise<ExecResult>((resolve, reject) => {
+      const finish = (code: number, signal?: string): void => {
+        if (settled) return
+        settled = true
+        if (timeoutTimer) clearTimeout(timeoutTimer)
+        const result = {
+          stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+          code,
+          ...(signal ? { signal } : {}),
+        }
+        resolve(result)
+      }
 
-    this.tasks.set(id, entry)
-    this.saveTask(entry, true)
+      const fail = (err: Error): void => {
+        if (settled) return
+        settled = true
+        if (timeoutTimer) clearTimeout(timeoutTimer)
+        reject(err)
+      }
 
-    // Stage 2 / Task 2.1: publish the task to the scheduler so it shows
-    // up in the unified state. The scheduler's runner is a no-op — the
-    // real work happens below on the raw ssh2 Client.
-    try {
-      this.scheduler.registerExternal({
+      const openSshTask = (
+        onOutput: ((stdout: string, stderr: string) => void) | undefined,
+        onClose: (code: number, signal?: string) => void,
+        onError: (err: Error) => void,
+      ): void => {
+        const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
+        try {
+          client.exec(wrappedCommand, (err, openedStream) => {
+            if (err) {
+              onError(new Error(`Failed to exec: ${err.message}`))
+              return
+            }
+
+            stream = openedStream
+            let pidCaptured = false
+
+            openedStream.on("data", (data: Buffer) => {
+              stdoutChunks.push(data)
+              this.trimChunks(stdoutChunks)
+              onOutput?.(data.toString("utf8"), "")
+            })
+
+            openedStream.stderr.on("data", (data: Buffer) => {
+              const text = data.toString()
+              if (!pidCaptured) {
+                let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                if (!pidMatch) pidMatch = text.match(/SSH_TOOL_NOHUP_PID:(\d+)/)
+                if (pidMatch) {
+                  pid = parseInt(pidMatch[1])
+                  pidCaptured = true
+                  const remaining = text.replace(/SSH_TOOL_(NOHUP_)?PID:\d+\n?/g, "")
+                  if (remaining) {
+                    const remainingBuffer = Buffer.from(remaining)
+                    stderrChunks.push(remainingBuffer)
+                    this.trimChunks(stderrChunks)
+                    onOutput?.("", remaining)
+                  }
+                  return
+                }
+              }
+              stderrChunks.push(data)
+              this.trimChunks(stderrChunks)
+              onOutput?.("", data.toString("utf8"))
+            })
+
+            openedStream.on("close", (code?: number, signal?: string) => {
+              onClose(code ?? 0, signal ?? undefined)
+            })
+
+            openedStream.on("error", (streamErr: Error) => {
+              onError(new Error(`Stream error: ${streamErr.message}`))
+            })
+
+            if (options?.timeout && options.timeout > 0) {
+              timeoutTimer = setTimeout(() => {
+                stopCurrent()
+                onError(new Error(`Command timed out after ${options.timeout}ms`))
+              }, options.timeout)
+            }
+          })
+        } catch (err) {
+          onError(err instanceof Error ? err : new Error(String(err)))
+        }
+      }
+
+      const runner: TaskRunner = {
+        start: (_task, onOutput) => {
+          const promise = new Promise<ExecResult>((runResolve, runReject) => {
+            openSshTask(
+              onOutput,
+              (code, signal) => {
+                finish(code, signal)
+                runResolve({
+                  stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+                  stderr: Buffer.concat(stderrChunks).toString("utf8"),
+                  code,
+                  ...(signal ? { signal } : {}),
+                })
+              },
+              (err) => {
+                fail(err)
+                runReject(err)
+              },
+            )
+          })
+
+          return {
+            promise,
+            stop: stopCurrent,
+          }
+        },
+        cancel: () => {
+          stopCurrent()
+          return true
+        },
+        startBackground: (_task, onOutput, onClose) => {
+          openSshTask(
+            onOutput,
+            (code, signal) => {
+              finish(code, signal)
+              onClose(code, signal)
+            },
+            (err) => {
+              fail(err)
+              onClose(1)
+            },
+          )
+          return { stop: stopCurrent }
+        },
+      }
+
+      const decision = this.scheduler.runWithRunner({
+        id,
         agent: { id: "exec-task-manager", name: "exec-task-manager", clientType: "internal" },
         host: { id: hostname, profileKey: options?.profileKey ?? "", targetHost: hostname, targetUser: "", displayName: hostname },
         sessionId: options?.sessionId ?? id,
         command,
         ...(options?.cwd ? { cwd: options.cwd } : {}),
         scheduler: "bypass",
-        reason: "exec-task-manager legacy path",
-      })
-    } catch (err) {
-      log("exec-task", `scheduler.registerExternal failed for ${id}: ${(err as Error).message}`)
-    }
+        reason: "exec-task-manager facade",
+        background: taskType === "background",
+      }, runner)
 
-    // single-finish guard prevents timeout/close/error from finishing twice
-    // (e.g. timeout kills the stream → close event fires again).
-    let finished = false
-    const finishOnce = (
-      legacyStatus: "completed" | "failed" | "timeout" | "cancelled",
-      code: number,
-      signal: string | undefined,
-    ): void => {
-      if (finished) return
-      finished = true
-      flushChunks()
-      this.finishTask(id, legacyStatus, code, signal)
-      // Translate legacy status to scheduler-completed status and notify
-      // the scheduler. finishExternalTask is now idempotent on its side
-      // too, but the flag here ensures we only call it once with the
-      // "winning" status (the first callback that fires).
-      const schedulerStatus = legacyStatus === "completed" ? "completed"
-        : legacyStatus === "failed" ? "failed"
-        : legacyStatus === "timeout" ? "failed"
-        : "failed"
-      try {
-        this.scheduler.finishExternalTask(id, {
-          code,
-          stdout: task.stdout,
-          stderr: task.stderr,
-          ...(signal ? { signal } : {}),
-          status: schedulerStatus,
-        })
-      } catch (err) {
-        log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
+      if (decision.action !== "run_now" && decision.action !== "queued") {
+        reject(new Error(decision.reason))
       }
-    }
-
-    const flushChunks = () => {
-      if (entry.chunksFlushed) return
-      entry.chunksFlushed = true
-      task.stdout = Buffer.concat(stdoutChunks).toString("utf8")
-      task.stderr = Buffer.concat(stderrChunks).toString("utf8")
-    }
-
-    const promise = new Promise<ExecResult>((resolve, reject) => {
-      // 对于后台任务，先保持简单，我们先不用复杂的 nohup 包装，避免转义问题
-      // 保持原来的简单逻辑：echo SSH_TOOL_PID，然后执行命令
-      // 后续我们可以再改进，但先让代码能正常工作
-      let wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
-
-      client.exec(wrappedCommand, (err, stream) => {
-        if (err) {
-          finishOnce("failed", 1, undefined)
-          reject(new Error(`Failed to exec: ${err.message}`))
-          return
-        }
-
-        entry.stream = stream
-        let pidCaptured = false
-        let firstLine = ""
-
-        stream.on("data", (data: Buffer) => {
-          const text = data.toString()
-          if (!pidCaptured) {
-            // PID is always echoed to stderr (see the `echo "SSH_TOOL_PID:$$" >&2`
-            // prefix above) — it never appears on stdout. So we don't need to
-            // scan stdout for the PID marker, and we can short-circuit the
-            // detection as soon as the PID is parsed from stderr. Until then
-            // we just buffer into a bounded `firstLine` and flush to the
-            // normal chunk buffer once it exceeds the 4KB cap.
-            firstLine += text
-            if (firstLine.length > 4096) {
-              pidCaptured = true
-              stdoutChunks.push(Buffer.from(firstLine))
-              this.trimChunks(stdoutChunks)
-              firstLine = ""
-            }
-          } else {
-            stdoutChunks.push(data)
-            this.trimChunks(stdoutChunks)
-          }
-          task.updatedAt = Date.now()
-          this.saveTask(entry, false)
-        })
-
-        stream.stderr.on("data", (data: Buffer) => {
-          const text = data.toString()
-          if (!pidCaptured) {
-            // 尝试匹配 SSH_TOOL_PID
-            let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
-            if (!pidMatch) {
-              // 尝试匹配 SSH_TOOL_NOHUP_PID
-              pidMatch = text.match(/SSH_TOOL_NOHUP_PID:(\d+)/)
-            }
-            if (pidMatch) {
-              task.pid = parseInt(pidMatch[1])
-              pidCaptured = true
-              const remaining = text.replace(/SSH_TOOL_(NOHUP_)?PID:\d+\n?/g, "")
-              if (remaining) {
-                stderrChunks.push(Buffer.from(remaining))
-                this.trimChunks(stderrChunks)
-              }
-              task.updatedAt = Date.now()
-              if (persistImmediate) this.saveTask(entry, true)
-              return
-            }
-          }
-          stderrChunks.push(data)
-          this.trimChunks(stderrChunks)
-          task.updatedAt = Date.now()
-          this.saveTask(entry, false)
-        })
-
-        stream.on("close", (code?: number, signal?: string) => {
-          const legacyStatus = code === 0 ? "completed" : "failed"
-          finishOnce(legacyStatus, code ?? 0, signal ?? undefined)
-          resolve({
-            stdout: task.stdout,
-            stderr: task.stderr,
-            code: code ?? 0,
-            signal,
-          })
-        })
-
-        stream.on("error", (streamErr: Error) => {
-          finishOnce("failed", 1, undefined)
-          reject(new Error(`Stream error: ${streamErr.message}`))
-        })
-
-        if (options?.timeout && options.timeout > 0) {
-          setTimeout(() => {
-            const currentTask = this.tasks.get(id)
-            if (currentTask && currentTask.task.status === "running") {
-              const pid = currentTask.task.pid
-              if (pid && client) {
-                const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
-                client.exec(killCmd, () => {})
-              }
-              if (currentTask.stream) {
-                try {
-                  currentTask.stream.close()
-                } catch {}
-              }
-              finishOnce("timeout", 124, "TERM")
-              reject(new Error(`Command timed out after ${options.timeout}ms`))
-            }
-          }, options.timeout)
-        }
-      })
     })
 
-    return { id, promise }
+    return { id, promise: resultPromise }
   }
 
   private finishTask(
@@ -499,12 +457,18 @@ export class ExecTaskManager {
   }
 
   cancel(id: string, client: Client, signal: "TERM" | "HUP" = "TERM"): boolean {
+    const schedulerCancelled = this.scheduler.cancelTask(id)
+    if (schedulerCancelled) return true
+
     const entry = this.tasks.get(id)
     if (!entry) return false
 
     if (entry.task.status !== "running") {
       return false
     }
+
+    if (entry.finished) return false
+    entry.finished = true
 
     const pid = entry.task.pid
     if (pid && client) {
@@ -519,23 +483,23 @@ export class ExecTaskManager {
       entry.task.stderr = Buffer.concat(entry.stderrChunks).toString("utf8")
     }
 
+    if (entry.stream) {
+      try {
+        entry.stream.close()
+      } catch {}
+    }
+
     this.finishTask(id, "cancelled", 130, signal)
     try {
       this.scheduler.finishExternalTask(id, {
         code: 130,
-        stdout: entry.task.stdout,
-        stderr: entry.task.stderr,
+        stdout: "",
+        stderr: "",
         signal,
         status: "cancelled",
       })
     } catch (err) {
       log("exec-task", `scheduler.finishExternalTask failed for ${id}: ${(err as Error).message}`)
-    }
-
-    if (entry.stream) {
-      try {
-        entry.stream.close()
-      } catch {}
     }
 
     return true
@@ -680,7 +644,7 @@ export class ExecTaskManager {
   private schedulerTaskToExecTask(st: import("./scheduler/types.js").ScheduledTask): ExecTask {
     return {
       id: st.id,
-      type: "exec",
+      type: st.background ? "background" : "exec",
       command: st.command,
       status: st.status === "running"
         ? "running"
@@ -690,7 +654,11 @@ export class ExecTaskManager {
             ? "running" // legacy "queued" maps to "running" so the CLI can show progress
             : st.status === "failed"
               ? "failed"
-              : "completed",
+              : st.status === "cancelled"
+                ? "cancelled"
+                : st.status === "timeout"
+                  ? "timeout"
+                  : "failed",
       exitCode: st.exitCode ?? null,
       signal: st.signal ?? null,
       stdout: "", // legacy callers use getOutput(id) for output

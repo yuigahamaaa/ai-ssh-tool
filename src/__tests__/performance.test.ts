@@ -9,8 +9,10 @@ import { remoteExec } from "../remote-shell.js"
 import { uploadFile, downloadFile } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>

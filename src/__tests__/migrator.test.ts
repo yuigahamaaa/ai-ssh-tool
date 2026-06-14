@@ -1,181 +1,295 @@
-/**
- * P1-3 Stage 2 / Task 2.2: migrate old `~/.ssh-tool/exec-tasks/*.json`
- * into the new scheduler layout.
- *
- * The migration is one-shot at daemon startup. The old files are preserved
- * (read-only fallback) but the new layout becomes the source of truth.
- *
- *   ~/.ssh-tool/exec-tasks/<id>.json   (old, ExecTask with embedded stdout/stderr)
- *   ~/.ssh-tool/scheduler/tasks/<id>.json       (new, ScheduledTask-shaped, tail in memory)
- *   ~/.ssh-tool/scheduler/outputs/<id>.stdout   (new, full stdout)
- *   ~/.ssh-tool/scheduler/outputs/<id>.stderr   (new, full stderr)
- *
- * Idempotency: we re-migrate on every daemon start, but the cost is small
- * (one stat per old file) and we don't re-write the new files if the
- * old one is older than the corresponding new files.
- */
-
-import { describe, it, before, after } from "node:test"
-import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, mkdirSync } from "fs"
-import { join } from "path"
+import { describe, it, beforeEach, afterEach } from "node:test"
+import assert from "node:assert"
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from "fs"
+import { join, resolve } from "path"
 import { tmpdir } from "os"
 import { migrateExecTasks } from "../scheduler/migrator.js"
 
-function makeOldTaskJson(id: string, overrides?: Record<string, unknown>): string {
-  return JSON.stringify({
-    id,
-    type: "exec",
-    command: "echo hi",
-    status: "completed",
-    exitCode: 0,
-    signal: null,
-    stdout: "hello world\n",
-    stderr: "",
-    startedAt: 1700000000000,
-    finishedAt: 1700000001000,
-    pid: null,
-    hostname: "test.example.com",
-    createdAt: 1700000000000,
-    updatedAt: 1700000001000,
-    ...overrides,
-  })
-}
-
-describe("migrateExecTasks", () => {
+describe("Migrator", () => {
+  let tmpDir: string
   let srcDir: string
-  let destTaskDir: string
+  let destTasksDir: string
   let destOutputDir: string
 
-  before(() => {
-    srcDir = mkdtempSync(join(tmpdir(), "migrator-src-"))
-    destTaskDir = mkdtempSync(join(tmpdir(), "migrator-dest-tasks-"))
-    destOutputDir = mkdtempSync(join(tmpdir(), "migrator-dest-outputs-"))
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "migrator-test-"))
+    srcDir = join(tmpDir, "exec-tasks")
+    destTasksDir = join(tmpDir, "scheduler", "tasks")
+    destOutputDir = join(tmpDir, "scheduler", "outputs")
+    mkdirSync(srcDir, { recursive: true })
   })
 
-  after(() => {
-    rmSync(srcDir, { recursive: true, force: true })
-    rmSync(destTaskDir, { recursive: true, force: true })
-    rmSync(destOutputDir, { recursive: true, force: true })
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
   })
 
-  it("migrates a single old task to the new layout", () => {
-    const oldPath = join(srcDir, "abc123.json")
-    writeFileSync(oldPath, makeOldTaskJson("abc123"))
-
-    const result = migrateExecTasks({
-      srcDir,
-      destTaskDir,
-      destOutputDir,
-    })
-
-    assert.equal(result.migrated, 1)
-    assert.equal(result.skipped, 0)
-    assert.equal(result.failed, 0)
-
-    // New task JSON exists, has tail fields, no embedded stdout
-    const newTaskPath = join(destTaskDir, "abc123.json")
-    assert.ok(existsSync(newTaskPath), "new task file written")
-    const newTask = JSON.parse(readFileSync(newTaskPath, "utf-8"))
-    assert.equal(newTask.id, "abc123")
-    // Old `hostname` is mapped to the new scheduler's `hostId` field
-    assert.equal(newTask.hostId, "test.example.com")
-    assert.equal(newTask.command, "echo hi")
-    // stdout/stderr are gone from the metadata; tail lives on disk
-    assert.equal(newTask.stdout, undefined)
-    assert.equal(newTask.stderr, undefined)
-    assert.equal(newTask.stdoutTail, "hello world\n")
-    assert.equal(newTask.stdoutBytes, "hello world\n".length)
-
-    // Full stdout/stderr written to outputs/
-    assert.ok(existsSync(join(destOutputDir, "abc123.stdout")), "stdout file written")
-    assert.ok(existsSync(join(destOutputDir, "abc123.stderr")), "stderr file written")
-    const stdout = readFileSync(join(destOutputDir, "abc123.stdout"), "utf-8")
-    assert.equal(stdout, "hello world\n")
-  })
-
-  it("is idempotent: re-running does not re-write newer files", () => {
-    // Use a fresh src dir so other tests' data doesn't pollute the count
-    const freshSrc = mkdtempSync(join(tmpdir(), "migrator-idemp-"))
-    try {
-      const oldPath = join(freshSrc, "idemp.json")
-      writeFileSync(oldPath, makeOldTaskJson("idemp"))
-      migrateExecTasks({ srcDir: freshSrc, destTaskDir, destOutputDir })
-
-      // Stale the old file (back-date it) so the comparison is meaningful
-      const past = new Date(Date.now() - 10_000)
-      utimesSync(oldPath, past, past)
-      // Bump the new task forward so it's "newer" than the old one
-      const newTaskPath = join(destTaskDir, "idemp.json")
-      const future = new Date(Date.now() + 10_000)
-      utimesSync(newTaskPath, future, future)
-
-      const result = migrateExecTasks({ srcDir: freshSrc, destTaskDir, destOutputDir })
-      assert.equal(result.migrated, 0, "no re-migration when new is newer")
-      assert.equal(result.skipped, 1, "the already-migrated file is counted as skipped")
-    } finally {
-      rmSync(freshSrc, { recursive: true, force: true })
+  it("migrates legacy task files to scheduler format", () => {
+    const legacyTask = {
+      id: "task-123",
+      type: "exec",
+      command: "echo hello",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "hello\n",
+      stderr: "",
+      startedAt: Date.now() - 1000,
+      finishedAt: Date.now(),
+      pid: 12345,
+      hostname: "test-host",
+      createdAt: Date.now() - 1000,
+      updatedAt: Date.now(),
+      profileKey: "test-profile",
+      sessionId: "session-1",
+      cwd: "/tmp",
     }
+    writeFileSync(join(srcDir, "task-123.json"), JSON.stringify(legacyTask))
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.migrated, 1)
+    assert.strictEqual(result.skipped, 0)
+    assert.strictEqual(result.failed, 0)
+
+    // Verify task file was created
+    const destTaskPath = join(destTasksDir, "task-123.json")
+    assert.ok(existsSync(destTaskPath))
+    const migrated = JSON.parse(readFileSync(destTaskPath, "utf8"))
+    assert.strictEqual(migrated.id, "task-123")
+    assert.strictEqual(migrated.command, "echo hello")
+    assert.strictEqual(migrated.status, "completed")
+    assert.strictEqual(migrated.agentId, "exec-task-manager")
+    assert.strictEqual(migrated.hostId, "test-host")
+
+    // Verify output files were created
+    assert.ok(existsSync(join(destOutputDir, "task-123.stdout")))
+    assert.strictEqual(readFileSync(join(destOutputDir, "task-123.stdout"), "utf8"), "hello\n")
+
+    // Verify source file was deleted
+    assert.ok(!existsSync(join(srcDir, "task-123.json")))
   })
 
-  it("re-migrates if the old file is newer than the new file", () => {
-    // Seed a task in the new layout, then re-write the old file with new
-    // content and bump the old mtime forward.
-    const oldPath = join(srcDir, "rere.json")
-    const newTaskPath = join(destTaskDir, "rere.json")
-    writeFileSync(oldPath, makeOldTaskJson("rere"))
-    const firstPass = migrateExecTasks({ srcDir, destTaskDir, destOutputDir })
-    assert.equal(firstPass.migrated, 1)
+  it("skips tasks that already exist in destination", () => {
+    const legacyTask = {
+      id: "task-456",
+      type: "exec",
+      command: "ls",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      pid: null,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "task-456.json"), JSON.stringify(legacyTask))
 
-    // Back-date the new file
-    const past = new Date(Date.now() - 10_000)
-    utimesSync(newTaskPath, past, past)
+    // Pre-create destination
+    mkdirSync(destTasksDir, { recursive: true })
+    writeFileSync(join(destTasksDir, "task-456.json"), JSON.stringify({ id: "task-456", status: "completed" }))
 
-    // Re-write old file with mutated content + newer mtime
-    writeFileSync(oldPath, makeOldTaskJson("rere", { command: "echo v2" }))
-    const future = new Date(Date.now() + 10_000)
-    utimesSync(oldPath, future, future)
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
 
-    const secondPass = migrateExecTasks({ srcDir, destTaskDir, destOutputDir })
-    assert.equal(secondPass.migrated, 1, "re-migrates when old is newer")
-    const task = JSON.parse(readFileSync(newTaskPath, "utf-8"))
-    assert.equal(task.command, "echo v2", "new content is on disk")
+    assert.strictEqual(result.skipped, 1)
+    assert.strictEqual(result.migrated, 0)
+    // Source file should still be deleted even if skipped
+    assert.ok(!existsSync(join(srcDir, "task-456.json")))
   })
 
-  it("counts corrupted files as failures and leaves the source untouched", () => {
-    const oldPath = join(srcDir, "bad.json")
-    writeFileSync(oldPath, "{not valid json")
-    const result = migrateExecTasks({ srcDir, destTaskDir, destOutputDir })
-    assert.equal(result.failed, 1, "corrupt file is counted as failure")
-    assert.ok(existsSync(oldPath), "corrupt source file is preserved")
+  it("backfills missing output files when destination task already exists", () => {
+    const legacyTask = {
+      id: "task-existing-output",
+      type: "exec",
+      command: "echo legacy",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "legacy stdout\n",
+      stderr: "legacy stderr\n",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      pid: null,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "task-existing-output.json"), JSON.stringify(legacyTask))
+    mkdirSync(destTasksDir, { recursive: true })
+    writeFileSync(join(destTasksDir, "task-existing-output.json"), JSON.stringify({ id: "task-existing-output", stdoutBytes: 0, stderrBytes: 0 }))
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.skipped, 1)
+    assert.strictEqual(result.migrated, 0)
+    assert.strictEqual(readFileSync(join(destOutputDir, "task-existing-output.stdout"), "utf8"), "legacy stdout\n")
+    assert.strictEqual(readFileSync(join(destOutputDir, "task-existing-output.stderr"), "utf8"), "legacy stderr\n")
+    const migrated = JSON.parse(readFileSync(join(destTasksDir, "task-existing-output.json"), "utf8"))
+    assert.strictEqual(migrated.stdoutBytes, Buffer.byteLength("legacy stdout\n"))
+    assert.strictEqual(migrated.stderrBytes, Buffer.byteLength("legacy stderr\n"))
+    assert.ok(!existsSync(join(srcDir, "task-existing-output.json")))
   })
 
-  it("returns zeros when the source directory does not exist", () => {
-    const result = migrateExecTasks({
-      srcDir: join(srcDir, "does-not-exist"),
-      destTaskDir,
-      destOutputDir,
-    })
-    assert.equal(result.migrated, 0)
-    assert.equal(result.skipped, 0)
-    assert.equal(result.failed, 0)
+  it("rejects unsafe task ids and leaves source file untouched", () => {
+    const legacyTask = {
+      id: "../outside",
+      type: "exec",
+      command: "echo bad",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "bad\n",
+      stderr: "",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      pid: null,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "unsafe.json"), JSON.stringify(legacyTask))
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.failed, 1)
+    assert.strictEqual(result.migrated, 0)
+    assert.ok(existsSync(join(srcDir, "unsafe.json")))
+    assert.ok(!existsSync(resolve(destTasksDir, "..", "outside.json")))
   })
 
-  it("handles a batch of mixed tasks in one call", () => {
-    // Reset dirs for a clean batch
-    const batchSrc = mkdtempSync(join(tmpdir(), "migrator-batch-"))
-    try {
-      writeFileSync(join(batchSrc, "t1.json"), makeOldTaskJson("t1", { hostname: "h1" }))
-      writeFileSync(join(batchSrc, "t2.json"), makeOldTaskJson("t2", { hostname: "h2" }))
-      writeFileSync(join(batchSrc, "t3.json"), makeOldTaskJson("t3", { hostname: "h3" }))
-      const result = migrateExecTasks({ srcDir: batchSrc, destTaskDir, destOutputDir })
-      assert.equal(result.migrated, 3)
-      for (const id of ["t1", "t2", "t3"]) {
-        assert.ok(existsSync(join(destTaskDir, `${id}.json`)))
-        assert.ok(existsSync(join(destOutputDir, `${id}.stdout`)))
+  it("maps running status to stale", () => {
+    const legacyTask = {
+      id: "task-789",
+      type: "exec",
+      command: "sleep 100",
+      status: "running",
+      exitCode: null,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      startedAt: Date.now(),
+      finishedAt: null,
+      pid: 999,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "task-789.json"), JSON.stringify(legacyTask))
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.migrated, 1)
+    const migrated = JSON.parse(readFileSync(join(destTasksDir, "task-789.json"), "utf8"))
+    assert.strictEqual(migrated.status, "stale")
+  })
+
+  it("handles empty source directory", () => {
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+    assert.strictEqual(result.migrated, 0)
+    assert.strictEqual(result.skipped, 0)
+    assert.strictEqual(result.failed, 0)
+  })
+
+  it("handles non-existent source directory", () => {
+    const nonExistent = join(tmpDir, "does-not-exist")
+    const result = migrateExecTasks(nonExistent, destTasksDir, destOutputDir)
+    assert.strictEqual(result.migrated, 0)
+  })
+
+  it("cleans up empty source directory after migration", () => {
+    const legacyTask = {
+      id: "task-cleanup",
+      type: "exec",
+      command: "echo",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      pid: null,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "task-cleanup.json"), JSON.stringify(legacyTask))
+
+    migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    // Source directory should be deleted if empty
+    assert.ok(!existsSync(srcDir))
+  })
+
+  it("preserves source directory if files remain", () => {
+    const legacyTask = {
+      id: "task-partial",
+      type: "exec",
+      command: "echo",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      pid: null,
+      hostname: "host",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    writeFileSync(join(srcDir, "task-partial.json"), JSON.stringify(legacyTask))
+    writeFileSync(join(srcDir, "other.txt"), "not a json file")
+
+    migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    // Source directory should still exist
+    assert.ok(existsSync(srcDir))
+    // But the JSON file should be gone
+    assert.ok(!existsSync(join(srcDir, "task-partial.json")))
+    // Other files remain
+    assert.ok(existsSync(join(srcDir, "other.txt")))
+  })
+
+  it("handles corrupted JSON gracefully", () => {
+    writeFileSync(join(srcDir, "corrupted.json"), "not valid json{{{")
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.failed, 1)
+    assert.strictEqual(result.migrated, 0)
+    // Corrupted file should remain in source
+    assert.ok(existsSync(join(srcDir, "corrupted.json")))
+  })
+
+  it("migrates multiple tasks in one batch", () => {
+    for (let i = 0; i < 5; i++) {
+      const task = {
+        id: `task-batch-${i}`,
+        type: "exec",
+        command: `echo ${i}`,
+        status: "completed",
+        exitCode: 0,
+        signal: null,
+        stdout: `output-${i}\n`,
+        stderr: "",
+        startedAt: Date.now() - (5 - i) * 1000,
+        finishedAt: Date.now() - (5 - i) * 500,
+        pid: 1000 + i,
+        hostname: "batch-host",
+        createdAt: Date.now() - (5 - i) * 1000,
+        updatedAt: Date.now(),
       }
-    } finally {
-      rmSync(batchSrc, { recursive: true, force: true })
+      writeFileSync(join(srcDir, `task-batch-${i}.json`), JSON.stringify(task))
     }
+
+    const result = migrateExecTasks(srcDir, destTasksDir, destOutputDir)
+
+    assert.strictEqual(result.migrated, 5)
+    assert.strictEqual(readdirSync(destTasksDir).length, 5)
+    assert.strictEqual(readdirSync(destOutputDir).length, 5) // 5 stdout files
   })
 })

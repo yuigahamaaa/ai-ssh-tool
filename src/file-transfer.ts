@@ -9,7 +9,7 @@
  */
 
 import type { Client } from "ssh2"
-import { createReadStream, createWriteStream, statSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs"
+import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs"
 import { basename, dirname, join } from "path"
 import { tmpdir } from "os"
 import { randomUUID } from "crypto"
@@ -304,10 +304,9 @@ export async function uploadFile(
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
 
-  const statInfo = statSync(localPath)
-  const totalSize = statInfo.size
+  const linkStat = lstatSync(localPath)
 
-  if (options?.skipSymlinks && statInfo.isSymbolicLink()) {
+  if (options?.skipSymlinks && linkStat.isSymbolicLink()) {
     log("transfer", `Skipping symbolic link: ${localPath}`)
     return {
       success: true,
@@ -316,6 +315,9 @@ export async function uploadFile(
       duration: 0,
     }
   }
+
+  const statInfo = statSync(localPath)
+  const totalSize = statInfo.size
 
   const checkResult = await checkOverwrite(client, remotePath, options)
   if (!checkResult.proceed) {
@@ -437,10 +439,6 @@ async function uploadFileDirect(
         return
       }
 
-      const writeStream = sftp.createWriteStream(remotePath, {
-        mode: options?.mode ?? statInfo.mode,
-      })
-
       let settled = false
       const finishOnce = (fn: () => void) => {
         if (settled) return
@@ -449,22 +447,38 @@ async function uploadFileDirect(
         fn()
       }
 
-      writeStream.on("error", (streamErr: Error) => {
+      try {
+        const writeStream = sftp.createWriteStream(remotePath, {
+          mode: options?.mode ?? statInfo.mode,
+        })
+
+        writeStream.on("error", (streamErr: Error) => {
+          finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
+        })
+
+        writeStream.on("close", () => {
+          const duration = Date.now() - startTime
+          if (options?.onProgress && totalSize > 0) {
+            options.onProgress({
+              filename: basename(localPath),
+              transferred: totalSize,
+              total: totalSize,
+              percent: 100,
+            })
+          }
+          log("transfer", `Upload (direct) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
+          finishOnce(() => resolve({
+            success: true,
+            path: remotePath,
+            size: totalSize,
+            duration,
+          }))
+        })
+
+        writeStream.end(data)
+      } catch (streamErr: any) {
         finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
-      })
-
-      writeStream.on("close", () => {
-        const duration = Date.now() - startTime
-        log("transfer", `Upload (direct) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
-        finishOnce(() => resolve({
-          success: true,
-          path: remotePath,
-          size: totalSize,
-          duration,
-        }))
-      })
-
-      writeStream.end(data)
+      }
     })
   })
 }

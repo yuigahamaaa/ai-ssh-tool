@@ -20,8 +20,19 @@ import { SSHConnection } from "../connection.js"
 import { upload, download, transfer } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+// Suppress ECONNRESET fired by ssh2's mock Server during teardown — the
+// Node test runner reports any post-test async error as a failure even
+// though the test itself has already passed. file-transfer-multi-hop.test.ts
+// has the same guard for the same mock-server teardown race.
+process.on("uncaughtException", (err: any) => {
+  if (err?.code === "ECONNRESET" || err?.code === "ERR_STREAM_PREMATURE_CLOSE") return
+  throw err
+})
+
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 
 // In-memory remote filesystem backing the mock server
 const memFs = new Map<string, Buffer>()
@@ -142,8 +153,9 @@ function createTestServer(): Promise<{
           resetMemFs()
           for (const client of clients) {
             try { client.end() } catch {}
+            try { (client as any)._sock?.destroy?.() } catch {}
           }
-          server.close(() => res())
+          server.close(() => setTimeout(res, 200))
         }),
       })
     })

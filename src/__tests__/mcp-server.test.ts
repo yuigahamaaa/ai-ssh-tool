@@ -8,8 +8,11 @@ import { PortForwardManager } from "../port-forwarding.js"
 import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
+const memFs = new Map<string, Buffer>()
 
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>
@@ -18,7 +21,11 @@ function createTestServer(): Promise<{
   cleanup: () => Promise<void>
 }> {
   return new Promise((resolve, reject) => {
+    const clients = new Set<any>()
     const server = new Server({ hostKeys: [hostKey.private] }, (client: any) => {
+      clients.add(client)
+      client.on("close", () => clients.delete(client))
+      client.on("error", () => {})
       client.on("authentication", (ctx: any) => {
         if (ctx.method === "password" && ctx.password === "testpass") ctx.accept()
         else ctx.reject()
@@ -30,28 +37,47 @@ function createTestServer(): Promise<{
           session.on("window-change", (accept: any) => { if (accept) accept() })
           session.on("shell", (accept: any) => {
             const stream = accept()
+            stream.on("error", () => {})
             stream.on("close", () => {})
           })
-          session.on("exec", (acceptExec: any) => {
+          session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
             const stream = acceptExec()
-            stream.write("ok\n")
+            stream.on("error", () => {})
+            const command = String(info?.command ?? "").replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
+            if (command.startsWith("echo ")) {
+              stream.write(`${command.slice(5)}\n`)
+            } else if (command.startsWith("grep ")) {
+              stream.write("mcp match\n")
+            } else if (command.startsWith("find ")) {
+              stream.write("/tmp/mcp-test.txt\n")
+            } else {
+              stream.write("ok\n")
+            }
             stream.exit(0)
             stream.close()
           })
           session.on("sftp", (acceptSftp: any) => {
             const sftpStream = acceptSftp()
-            const handles = new Map<number, { path: string; data?: Buffer }>()
+            sftpStream.on("error", () => {})
+            const handles = new Map<number, { path: string; data?: Buffer; readDirDone?: boolean }>()
             let nextHandle = 1
             sftpStream.on("OPEN", (reqId: any, path: any, flags: any) => {
               const h = nextHandle++
               if (flags & 0x02) {
                 handles.set(h, { path, data: Buffer.alloc(0) })
               } else {
-                sftpStream.status(reqId, 2); return
+                const data = memFs.get(path)
+                if (data) handles.set(h, { path, data })
+                else { sftpStream.status(reqId, 2); return }
               }
               const buf = Buffer.alloc(4); buf.writeUInt32BE(h, 0); sftpStream.handle(reqId, buf)
             })
-            sftpStream.on("READ", (reqId: any) => { sftpStream.status(reqId, 2) })
+            sftpStream.on("READ", (reqId: any, handle: any, offset: any, len: any) => {
+              const entry = handles.get(handle.readUInt32BE(0))
+              if (!entry?.data) { sftpStream.status(reqId, 2); return }
+              if (offset >= entry.data.length) { sftpStream.status(reqId, 1); return }
+              sftpStream.data(reqId, entry.data.subarray(offset, offset + len))
+            })
             sftpStream.on("WRITE", (reqId: any, handle: any, offset: any, data: any) => {
               const h = handle.readUInt32BE(0); const entry = handles.get(h)
               if (!entry) { sftpStream.status(reqId, 2); return }
@@ -62,9 +88,28 @@ function createTestServer(): Promise<{
               data.copy(entry.data, offset); sftpStream.status(reqId, 0)
             })
             sftpStream.on("CLOSE", (reqId: any, handle: any) => {
-              handles.delete(handle.readUInt32BE(0)); sftpStream.status(reqId, 0)
+              const h = handle.readUInt32BE(0); const entry = handles.get(h)
+              if (entry?.data && entry.path) memFs.set(entry.path, entry.data)
+              handles.delete(h); sftpStream.status(reqId, 0)
             })
-            sftpStream.on("STAT", (reqId: any) => { sftpStream.status(reqId, 2) })
+            sftpStream.on("STAT", (reqId: any, path: any) => {
+              if (path === "/tmp") { sftpStream.attrs(reqId, { mode: 0o040755, size: 0, uid: 0, gid: 0, atime: 0, mtime: 0 }); return }
+              const data = memFs.get(path)
+              if (data) sftpStream.attrs(reqId, { mode: 0o100644, size: data.length, uid: 0, gid: 0, atime: 0, mtime: 0 })
+              else sftpStream.status(reqId, 2)
+            })
+            sftpStream.on("OPENDIR", (reqId: any, path: any) => {
+              if (path !== "/tmp") { sftpStream.status(reqId, 2); return }
+              const h = nextHandle++; handles.set(h, { path }); const buf = Buffer.alloc(4); buf.writeUInt32BE(h, 0); sftpStream.handle(reqId, buf)
+            })
+            sftpStream.on("READDIR", (reqId: any, handle: any) => {
+              const entry = handles.get(handle.readUInt32BE(0))
+              if (!entry) { sftpStream.status(reqId, 2); return }
+              if (entry.readDirDone) { sftpStream.status(reqId, 1); return }
+              entry.readDirDone = true
+              const files = Array.from(memFs.keys()).filter(p => p.startsWith("/tmp/")).map(p => ({ filename: p.slice(5), longname: `-rw-r--r-- 1 0 0 ${memFs.get(p)?.length ?? 0} Jan 1 00:00 ${p.slice(5)}`, attrs: { mode: 0o100644, size: memFs.get(p)?.length ?? 0 } }))
+              sftpStream.name(reqId, files)
+            })
             sftpStream.on("REALPATH", (reqId: any, path: any) => {
               sftpStream.name(reqId, [{ filename: path, longname: "", attrs: {} as any }])
             })
@@ -79,7 +124,14 @@ function createTestServer(): Promise<{
         server,
         port: addr.port,
         hostConfig: { name: "test", host: "127.0.0.1", port: addr.port, auth: { username: "testuser", password: "testpass" } },
-        cleanup: () => new Promise<void>((res) => { server.close(() => setTimeout(res, 50)) }),
+        cleanup: () => new Promise<void>((res) => {
+          memFs.clear()
+          for (const client of clients) {
+            try { client.end() } catch {}
+            try { (client as any)._sock?.destroy?.() } catch {}
+          }
+          server.close(() => setTimeout(res, 200))
+        }),
       })
     })
     server.on("error", reject)

@@ -37,8 +37,19 @@ import { uploadFile, downloadFile } from "../file-transfer.js"
 import { remoteExec } from "../remote-shell.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+// Suppress ECONNRESET fired by ssh2's mock Server during teardown — the
+// Node test runner reports any post-test async error as a failure even
+// though the test itself has already passed. integration.test.ts uses
+// the same guard (search for ECONNRESET there) for the same reason.
+process.on("uncaughtException", (err: any) => {
+  if (err?.code === "ECONNRESET" || err?.code === "ERR_STREAM_PREMATURE_CLOSE") return
+  throw err
+})
+
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 const memFs = new Map<string, Buffer>()
 
 function createTestServer(
@@ -145,9 +156,22 @@ function createTestServer(
         cleanup: () => new Promise<void>((res) => {
           memFs.clear()
           for (const client of clients) {
+            // end() is graceful but ssh2's mock Server closes its underlying
+            // socket asynchronously, which lets a stray RST race past the
+            // outer `after` hook. Forcing the underlying socket closed here
+            // makes the teardown synchronous from the kernel's POV.
             try { client.end() } catch {}
+            try { (client as any)._sock?.destroy?.() } catch {}
           }
-          server.close(() => res())
+          server.close(() => {
+            // Give the kernel enough time to drain any RST that the mock
+            // ssh2 server emits as its SFTP/session sockets tear down.
+            // 50ms (used by integration.test.ts) is enough when only the
+            // shell session is open, but SFTP keeps a richer per-connection
+            // state machine, so we wait a bit longer to keep the
+            // asynchronous error inside this `after` hook.
+            setTimeout(res, 200)
+          })
         }),
       })
     })

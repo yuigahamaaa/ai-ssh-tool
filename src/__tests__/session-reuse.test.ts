@@ -15,8 +15,10 @@ import { normalizeConfig } from "../ipc-protocol.js";
 import { SSHSessionManager } from "../session-manager.js";
 import type { SSHHostConfig } from "../types.js";
 
-const { Server, utils } = ssh2;
-const hostKey = utils.generateKeyPairSync("ed25519");
+import { createStableEd25519KeyPair } from "./ssh-test-key.js";
+
+const { Server } = ssh2;
+const hostKey = createStableEd25519KeyPair();
 
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>;
@@ -173,10 +175,12 @@ describe("Session Reuse Tests", () => {
       await manager.connect({
         chain: [{ id: "a1", ...srv.hostConfig }],
         timeout: 10000,
+        reuseSession: false,
       });
       await manager.connect({
         chain: [{ id: "a2", ...srv.hostConfig }],
         timeout: 10000,
+        reuseSession: false,
       });
 
       assert.equal(manager.listSessions().length, 2);
@@ -202,10 +206,12 @@ describe("Session Reuse Tests", () => {
       const s1 = await manager.connect({
         chain: [{ id: "m1", ...srv.hostConfig }],
         timeout: 10000,
+        reuseSession: false,
       });
       const s2 = await manager.connect({
         chain: [{ id: "m2", ...srv.hostConfig }],
         timeout: 10000,
+        reuseSession: false,
       });
 
       await assert.rejects(
@@ -213,6 +219,7 @@ describe("Session Reuse Tests", () => {
           manager.connect({
             chain: [{ id: "m3", ...srv.hostConfig }],
             timeout: 10000,
+            reuseSession: false,
           }),
         /Maximum concurrent sessions/,
       );

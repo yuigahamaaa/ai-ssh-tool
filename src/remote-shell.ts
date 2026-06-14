@@ -15,7 +15,7 @@ import { log } from "./logger.js"
 export function remoteExec(
   client: Client,
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string> },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string },
 ): Promise<ExecResult> {
   const taskManager = getGlobalTaskManager()
   const { id, promise } = taskManager.start(client, command, {
@@ -23,6 +23,7 @@ export function remoteExec(
     cwd: options?.cwd,
     env: options?.env,
     timeout: options?.timeout,
+    host: options?.host,
   })
 
   log("exec", `[${id}] Starting: ${command.slice(0, 100)}${command.length > 100 ? "..." : ""}`)
@@ -40,7 +41,7 @@ export function remoteExec(
 export function execOnChain(
   clients: { client: Client }[],
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string> },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string },
 ): Promise<ExecResult> {
   if (clients.length === 0) {
     throw new Error("No SSH clients in chain")

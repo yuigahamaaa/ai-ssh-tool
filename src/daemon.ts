@@ -135,7 +135,7 @@ export class SSHDaemon {
   private forwardManagers = new Map<string, PortForwardManager>()
   private scheduler: SchedulerService
   private stopping = false
-  private readonly signalShutdownHandler = () => { this.shutdown().catch(() => {}) }
+  private readonly signalShutdownHandler = () => { this.shutdown().catch((err) => log("daemon", `signal shutdown failed: ${err.message}`)) }
 
   constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
@@ -600,7 +600,7 @@ export class SSHDaemon {
       }
       this.sessionMap.delete(configHash)
       if (session) {
-        this.gateway.disconnect(existing.sessionId).catch(() => {})
+        this.gateway.disconnect(existing.sessionId).catch((err) => log("daemon", `disconnect stale session ${existing.sessionId.slice(0, 8)} failed: ${err.message}`))
         this.forwardManagers.delete(existing.sessionId)
       }
     }
@@ -635,13 +635,13 @@ export class SSHDaemon {
       for (const [sid, entry] of this.sessionMap) {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
-          this.gateway.disconnect(entry.sessionId).catch(() => {})
+          this.gateway.disconnect(entry.sessionId).catch((e) => log("daemon", `disconnect error session ${entry.sessionId.slice(0, 8)} failed: ${e.message}`))
           this.cleanupSession(entry.sessionId)
         }
       }
       // Also clean up error sessions not in sessionMap (freshly created ones)
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
-        this.gateway.disconnect(s.id).catch(() => {})
+        this.gateway.disconnect(s.id).catch((e) => log("daemon", `disconnect error session ${s.id.slice(0, 8)} failed: ${e.message}`))
         this.forwardManagers.delete(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
@@ -663,7 +663,7 @@ export class SSHDaemon {
       }
       this.sessionMap.delete(configHash)
       if (session) {
-        this.gateway.disconnect(existing.sessionId).catch(() => {})
+        this.gateway.disconnect(existing.sessionId).catch((err) => log("daemon", `disconnect stale session ${existing.sessionId.slice(0, 8)} failed: ${err.message}`))
         this.forwardManagers.delete(existing.sessionId)
       }
     }
@@ -699,12 +699,12 @@ export class SSHDaemon {
       for (const [sid, entry] of this.sessionMap) {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
-          this.gateway.disconnect(entry.sessionId).catch(() => {})
+          this.gateway.disconnect(entry.sessionId).catch((e) => log("daemon", `disconnect error session ${entry.sessionId.slice(0, 8)} failed: ${e.message}`))
           this.cleanupSession(entry.sessionId)
         }
       }
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
-        this.gateway.disconnect(s.id).catch(() => {})
+        this.gateway.disconnect(s.id).catch((e) => log("daemon", `disconnect error session ${s.id.slice(0, 8)} failed: ${e.message}`))
         this.forwardManagers.delete(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
@@ -1020,7 +1020,7 @@ export class SSHDaemon {
     for (const session of this.gateway.listSessions()) {
       if (session.status === "connected" && now - session.lastActivity > this.idleTimeoutMs) {
         console.log(`[daemon] idle timeout: disconnecting ${session.name} (${session.id})`)
-        this.gateway.disconnect(session.id).catch(() => {})
+        this.gateway.disconnect(session.id).catch((err) => log("daemon", `idle disconnect ${session.id.slice(0, 8)} failed: ${err.message}`))
         this.cleanupSession(session.id)
       }
     }

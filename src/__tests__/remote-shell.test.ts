@@ -1,12 +1,38 @@
 /**
  * RemoteShell Tests
- * Tests remoteExec with mocked ssh2 Client
+ * Tests remoteExec with mocked ssh2 Client.
+ *
+ * HOME redirect: remoteExec() lazily constructs a global ExecTaskManager,
+ * which builds a SchedulerService that writes under `~/.ssh-tool/...`. In
+ * sandboxed CI environments writes to the real $HOME may fail with EPERM,
+ * so we point HOME at a tmpdir before the module is first evaluated and
+ * use a dynamic `import()` to bind the functions under that env.
  */
 
-import { describe, it } from "node:test"
+import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "events"
-import { remoteExec, execOnChain } from "../remote-shell.js"
+import { rmSync, mkdirSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
+
+const testHome = join(tmpdir(), `remote-shell-${Date.now()}-${process.pid}`)
+const origHome = process.env.HOME
+let remoteExec: typeof import("../remote-shell.js").remoteExec
+let execOnChain: typeof import("../remote-shell.js").execOnChain
+
+before(async () => {
+  mkdirSync(testHome, { recursive: true })
+  process.env.HOME = testHome
+  const mod = await import(`../remote-shell.js?t=${Date.now()}`)
+  remoteExec = mod.remoteExec
+  execOnChain = mod.execOnChain
+})
+
+after(() => {
+  process.env.HOME = origHome
+  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+})
 
 // Mock ssh2 stream
 function createMockStream() {
@@ -73,7 +99,10 @@ describe("remoteExec", () => {
 
     await assert.rejects(
       () => remoteExec(client, "cmd"),
-      { message: "Failed to exec command: exec failed" },
+      // ExecTaskManager wraps ssh2 client.exec() errors with "Failed to exec:"
+      // (see src/exec-task-manager.ts). The previous "Failed to exec command:"
+      // wording predated the unified task manager and was never updated.
+      { message: "Failed to exec: exec failed" },
     )
   })
 
@@ -102,7 +131,13 @@ describe("remoteExec", () => {
     })
 
     await remoteExec(client, "ls", { cwd: "/tmp" })
-    assert.ok(receivedCmd.startsWith('cd "/tmp" &&'))
+    // The full wrapped command is `echo "SSH_TOOL_PID:$$" >&2; exec cd "<cwd>" && <cmd>`,
+    // so we assert the cwd prefix appears somewhere inside the payload rather
+    // than at offset 0 (the PID marker wrapper always precedes it).
+    assert.ok(
+      receivedCmd.includes('cd "/tmp" &&'),
+      `expected cwd prefix in wrapped command, got: ${receivedCmd}`,
+    )
   })
 
   it("should prepend env vars to command", async () => {

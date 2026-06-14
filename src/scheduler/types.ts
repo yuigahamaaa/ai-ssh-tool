@@ -48,6 +48,8 @@ export interface CommandClassification {
 }
 
 export interface ScheduleRequest {
+  /** Optional caller-owned id for externally-driven legacy tasks. */
+  id?: string
   agent: AgentIdentity
   host: HostIdentity
   sessionId: string
@@ -168,11 +170,23 @@ export interface VirtualCwdState {
   updatedAt: number
 }
 
+export interface TaskRunResult {
+  stdout: string
+  stderr: string
+  code: number
+  signal?: string
+}
+
+export interface TaskRunHandle {
+  promise: Promise<TaskRunResult>
+  stop: () => void
+}
+
 export interface TaskRunner {
   start(
     task: ScheduledTask,
     onOutput?: (stdout: string, stderr: string) => void
-  ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }>
+  ): Promise<TaskRunResult> | TaskRunHandle
   cancel?(task: ScheduledTask): boolean
   startBackground(
     task: ScheduledTask,

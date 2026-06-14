@@ -13,8 +13,10 @@ import { SSHConnection } from "../connection.js"
 import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile, SSHHostConfig, SSHConnectionChain } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 
 interface TestServerInfo {
   server: InstanceType<typeof Server>

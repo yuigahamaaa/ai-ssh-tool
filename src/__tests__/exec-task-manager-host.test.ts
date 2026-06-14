@@ -1,6 +1,9 @@
-import { describe, it } from "node:test"
+import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "events"
+import { rmSync, mkdirSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
 
 /**
  * P2-5: ExecTaskManager.start() accepts an explicit `host` parameter that
@@ -8,12 +11,31 @@ import { EventEmitter } from "events"
  * enough of the Client shape to exercise the host resolution path and
  * asserts that the explicit value wins.
  *
- * We import the module under test as `import` so we can poke the
- * hostname that ends up on the task by re-using the public getStatus().
+ * HOME redirect: ExecTaskManager's constructor builds a SchedulerService
+ * which writes to `~/.ssh-tool/scheduler/...`. Some sandboxes don't allow
+ * writing under the real $HOME, so we point HOME at a tmpdir before any
+ * import + construction. We use a dynamic `import()` so the module is
+ * (re-)evaluated AFTER the HOME swap.
  */
 
-import { ExecTaskManager } from "../exec-task-manager.js"
 import type { Client } from "ssh2"
+
+const testHome = join(tmpdir(), `etm-host-${Date.now()}-${process.pid}`)
+const origHome = process.env.HOME
+let ExecTaskManager: typeof import("../exec-task-manager.js").ExecTaskManager
+
+before(async () => {
+  mkdirSync(testHome, { recursive: true })
+  process.env.HOME = testHome
+  // Cache-bust so the module is re-evaluated under the new HOME.
+  const mod = await import(`../exec-task-manager.js?t=${Date.now()}`)
+  ExecTaskManager = mod.ExecTaskManager
+})
+
+after(() => {
+  process.env.HOME = origHome
+  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+})
 
 function makeFakeClient(): Client {
   // Construct a bare object that looks enough like a Client to pass

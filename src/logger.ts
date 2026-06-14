@@ -91,6 +91,11 @@ export function enableDebug(context?: { host?: string; command?: string; label?:
   debugEnabled = true
   if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true })
 
+  // Ensure buffered logs are flushed on process exit so the last 100ms of
+  // debug output isn't lost when the process calls process.exit(1) or
+  // terminates synchronously (before 'beforeExit' fires).
+  process.on("exit", flushNow)
+
   const parts = ["debug"]
   if (context?.label) parts.push(sanitize(context.label))
   else if (context?.host) parts.push(sanitize(context.host))

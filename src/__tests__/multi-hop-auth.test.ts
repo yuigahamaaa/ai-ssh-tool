@@ -1,13 +1,16 @@
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
 import ssh2 from "ssh2"
+import { createConnection } from "net"
 import { SSHConnection } from "../connection.js"
 import { remoteExec } from "../remote-shell.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
-const userPrivateKey = utils.generateKeyPairSync("ed25519")
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
+const userPrivateKey = createStableEd25519KeyPair()
 
 function createTestServer(opts?: {
   authMethods?: ("password" | "publickey")[]
@@ -19,9 +22,14 @@ function createTestServer(opts?: {
 }> {
   return new Promise((resolve, reject) => {
     const allowedAuth = opts?.authMethods ?? ["password", "publickey"]
+    const clients = new Set<any>()
+    const forwardSockets = new Set<any>()
     const server = new Server(
       { hostKeys: [hostKey.private] },
       (client: any) => {
+        clients.add(client)
+        client.on("close", () => clients.delete(client))
+        client.on("error", () => {})
         client.on("authentication", (ctx: any) => {
           if (allowedAuth.includes("password") && ctx.method === "password" && ctx.password === "testpass") {
             ctx.accept()
@@ -33,16 +41,31 @@ function createTestServer(opts?: {
         })
         client.on("ready", () => {
           if (opts?.enableForwarding) {
-            client.on("tcpip", (accept: any, rejectConn: any) => { try { rejectConn?.() } catch {} })
+            client.on("tcpip", (accept: any, rejectConn: any, info: any) => {
+              const sock = createConnection(info.destPort, info.destIP, () => {
+                forwardSockets.add(sock)
+                const stream = accept()
+                stream.on("error", () => {})
+                sock.on("data", (d: any) => { try { stream.write(d) } catch {} })
+                stream.on("data", (d: any) => { try { sock.write(d) } catch {} })
+                sock.on("error", () => { forwardSockets.delete(sock); try { stream.close() } catch {} })
+                sock.on("close", () => { forwardSockets.delete(sock); try { stream.close() } catch {} })
+                stream.on("close", () => { forwardSockets.delete(sock); try { sock.destroy() } catch {} })
+              })
+              sock.on("error", () => { try { rejectConn?.() } catch {} })
+            })
           }
           client.on("session", (accept: any) => {
             const session = accept()
             session.on("pty", (accept: any) => { accept() })
           session.on("window-change", (accept: any) => { if (accept) accept() })
-          session.on("shell", (accept: any) => { const s = accept(); s.on("close", () => {}) })
-          session.on("exec", (acceptExec: any) => {
+          session.on("shell", (accept: any) => { const s = accept(); s.on("error", () => {}); s.on("close", () => {}) })
+          session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
               const stream = acceptExec()
-              stream.write("ok\n")
+              stream.on("error", () => {})
+              const command = String(info?.command ?? "").replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
+              if (command.startsWith("echo ")) stream.write(`${command.slice(5)}\n`)
+              else stream.write("ok\n")
               stream.exit(0)
               stream.close()
             })
@@ -56,7 +79,12 @@ function createTestServer(opts?: {
       resolve({
         server,
         port: addr.port,
-        cleanup: () => new Promise<void>((res) => { server.close(() => setTimeout(res, 50)) }),
+        cleanup: () => new Promise<void>((res) => {
+          for (const sock of forwardSockets) { try { sock.destroy() } catch {} }
+          forwardSockets.clear()
+          for (const client of clients) { try { client.end() } catch {}; try { (client as any)._sock?.destroy?.() } catch {} }
+          server.close(() => setTimeout(res, 200))
+        }),
       })
     })
     server.on("error", reject)

@@ -65,9 +65,9 @@ describe("ExecTaskManager memory management", () => {
     const tasksMap = (mgr as any).tasks as Map<string, unknown>
     assert.equal(tasksMap.size, 0, "finished task should be evicted from memory")
 
-    // But status should still be readable from disk
+    // But status should still be readable from the scheduler store.
     const status = mgr.getStatus(id)
-    assert.ok(status, "task status should be readable from disk after eviction")
+    assert.ok(status, "task status should be readable from scheduler after eviction")
     assert.equal(status!.status, "completed")
   })
 
@@ -108,7 +108,7 @@ describe("ExecTaskManager memory management", () => {
     assert.equal(status!.status, "cancelled")
   })
 
-  it("getOutput works from disk after eviction", async () => {
+  it("getOutput works from scheduler after eviction", async () => {
     const mgr = new ExecTaskManager()
     const client = new FakeClient() as any
     const { id, promise } = mgr.start(client, "echo hello", { timeout: 5000 })
@@ -120,7 +120,7 @@ describe("ExecTaskManager memory management", () => {
     await promise
 
     const output = mgr.getOutput(id)
-    assert.ok(output, "output should be readable from disk")
+    assert.ok(output, "output should be readable from scheduler")
     assert.ok(output!.stdout.includes("hello"))
   })
 

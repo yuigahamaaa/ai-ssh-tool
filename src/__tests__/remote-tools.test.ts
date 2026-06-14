@@ -1,13 +1,36 @@
 /**
  * RemoteTools Unit Tests
  * Tests tool definitions (readFile, writeFile, exec, listDir, exists, stat, grep, find, cd)
- * Uses mock SFTP and mock ssh2 exec
+ * Uses mock SFTP and mock ssh2 exec.
+ *
+ * HOME redirect: createRemoteTools imports remote-shell which lazily builds
+ * a global ExecTaskManager → SchedulerService that writes under
+ * `~/.ssh-tool/...`. We redirect HOME to a tmpdir before first module
+ * evaluation so sandboxed environments don't EPERM.
  */
 
-import { describe, it, beforeEach, mock } from "node:test"
+import { describe, it, beforeEach, before, after, mock } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "events"
-import { createRemoteTools } from "../remote-tools.js"
+import { rmSync, mkdirSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
+
+const testHome = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
+const origHome = process.env.HOME
+let createRemoteTools: typeof import("../remote-tools.js").createRemoteTools
+
+before(async () => {
+  mkdirSync(testHome, { recursive: true })
+  process.env.HOME = testHome
+  const mod = await import(`../remote-tools.js?t=${Date.now()}`)
+  createRemoteTools = mod.createRemoteTools
+})
+
+after(() => {
+  process.env.HOME = origHome
+  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+})
 
 // --- Mock SFTP ---
 function createMockSftp() {

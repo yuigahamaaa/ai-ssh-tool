@@ -1,189 +1,248 @@
 /**
- * P1-3 Stage 2 / Task 2.2: migrator for old `~/.ssh-tool/exec-tasks/`
- * JSON files into the new scheduler layout.
+ * Migrator: imports legacy exec-task files (~/.ssh-tool/exec-tasks/*.json)
+ * into the new scheduler storage layout (~/.ssh-tool/scheduler/tasks/ + outputs/).
  *
- * The migrator runs once at daemon startup. It is idempotent: it
- * compares the mtime of each old file to the mtime of the corresponding
- * new task file and re-migrates only when the old file is newer (which
- * happens when an in-flight task wrote to the old store after the
- * daemon started but before this pass).
- *
- * Failures are non-fatal: a corrupt or unparseable file is left on disk
- * and counted in `result.failed`. The daemon still boots.
+ * Idempotent: if task metadata already exists in the scheduler store, missing
+ * output files are backfilled, then the old file is removed. Failed files stay
+ * on disk and are retried on the next daemon start.
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, rmdirSync, renameSync } from "fs"
 import { join } from "path"
+import { homedir } from "os"
+import { log } from "../logger.js"
+import type { ScheduledTask, ScheduledTaskStatus } from "./types.js"
 
 const OUTPUT_TAIL_LIMIT = 64 * 1024
+const SAFE_TASK_ID = /^[A-Za-z0-9_-]+$/
 
-export interface MigrateOptions {
-  srcDir: string
-  destTaskDir: string
-  destOutputDir: string
+function getUserDataDir(): string {
+  if (process.platform === "win32") {
+    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
+    if (userProfile) return userProfile
+  }
+  return homedir()
+}
+
+/** Legacy exec-task shape (from exec-task-manager.ts) */
+interface LegacyExecTask {
+  id: string
+  type: string
+  command: string
+  status: string
+  exitCode: number | null
+  signal: string | null
+  stdout: string
+  stderr: string
+  startedAt: number
+  finishedAt: number | null
+  pid: number | null
+  hostname: string
+  createdAt: number
+  updatedAt: number
+  profileKey?: string
+  sessionId?: string
+  cwd?: string
 }
 
 export interface MigrateResult {
   migrated: number
   skipped: number
   failed: number
-  errors: { file: string; reason: string }[]
 }
 
-/** Shape of the old on-disk format (subset — only what the migrator reads). */
-interface OldExecTask {
-  id: string
-  type?: string
-  command?: string
-  status?: string
-  exitCode?: number | null
-  signal?: string | null
-  stdout?: string
-  stderr?: string
-  startedAt?: number
-  finishedAt?: number | null
-  pid?: number | null
-  hostname?: string
-  createdAt?: number
-  updatedAt?: number
-  profileKey?: string
-  sessionId?: string
-  cwd?: string
+function mapStatus(legacy: string): ScheduledTaskStatus {
+  switch (legacy) {
+    case "running": return "stale" // orphaned running tasks become stale
+    case "completed": return "completed"
+    case "failed": return "failed"
+    case "cancelled": return "cancelled"
+    case "timeout": return "failed"
+    default: return "completed"
+  }
+}
+
+function atomicWrite(filePath: string, data: string): void {
+  const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  writeFileSync(tempPath, data, { mode: 0o600 })
+  renameSync(tempPath, filePath)
+}
+
+function outputStats(text: string): { bytes: number; tail: string } {
+  const buf = Buffer.from(text, "utf8")
+  return {
+    bytes: buf.length,
+    tail: buf.length > OUTPUT_TAIL_LIMIT
+      ? buf.subarray(buf.length - OUTPUT_TAIL_LIMIT).toString("utf8")
+      : text,
+  }
+}
+
+function writeOutputIfMissing(path: string, data: string): { wrote: boolean; bytes: number; tail: string } {
+  const stats = outputStats(data)
+  if (!data || existsSync(path)) return { wrote: false, ...stats }
+  atomicWrite(path, data)
+  return { wrote: true, ...stats }
+}
+
+function buildScheduledTask(id: string, legacy: LegacyExecTask): ScheduledTask {
+  const status = mapStatus(legacy.status)
+  return {
+    id,
+    agentId: "exec-task-manager",
+    hostId: legacy.hostname,
+    profileKey: legacy.profileKey ?? "",
+    sessionId: legacy.sessionId ?? id,
+    command: legacy.command,
+    effectiveCwd: legacy.cwd,
+    classification: {
+      intent: "custom",
+      cost: "small",
+      blocking: false,
+      mutates: false,
+      risky: false,
+      source: "default",
+      reason: "migrated from legacy exec-task",
+    },
+    scheduler: "bypass",
+    status,
+    startedAt: legacy.startedAt,
+    finishedAt: legacy.finishedAt ?? undefined,
+    updatedAt: legacy.updatedAt,
+    pid: legacy.pid,
+    exitCode: legacy.exitCode,
+    signal: legacy.signal,
+    stdoutTail: "",
+    stderrTail: "",
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    decisionReason: "Migrated from legacy exec-task-manager",
+  }
+}
+
+function backfillOutputMetadata(destPath: string, legacy: LegacyExecTask, stdout: ReturnType<typeof writeOutputIfMissing>, stderr: ReturnType<typeof writeOutputIfMissing>): void {
+  if (!stdout.wrote && !stderr.wrote) return
+  try {
+    const task = JSON.parse(readFileSync(destPath, "utf8")) as Partial<ScheduledTask>
+    if (stdout.wrote) {
+      task.stdoutBytes = stdout.bytes
+      task.stdoutTail = stdout.tail
+    }
+    if (stderr.wrote) {
+      task.stderrBytes = stderr.bytes
+      task.stderrTail = stderr.tail
+    }
+    task.updatedAt = legacy.updatedAt ?? task.updatedAt ?? Date.now()
+    atomicWrite(destPath, JSON.stringify(task))
+  } catch (err) {
+    log("migrator", `Backfilled outputs but failed to refresh metadata for ${legacy.id}: ${(err as Error).message}`)
+  }
 }
 
 /**
- * Truncate the head of a long output to the last OUTPUT_TAIL_LIMIT bytes
- * (UTF-8 byte boundary). OutputStore does the same thing on its in-memory
- * tail; this keeps the on-disk new task JSON in sync.
+ * Migrate legacy exec-task files to the scheduler storage layout.
+ *
+ * @param opts - Configuration object or positional srcDir string
  */
-function tailBuffer(s: string, limit: number): { tail: string; bytes: number } {
-  if (s.length === 0) return { tail: "", bytes: 0 }
-  const buf = Buffer.from(s, "utf8")
-  if (buf.length <= limit) return { tail: s, bytes: buf.length }
-  // subarray keeps bytes; toString re-decodes and may emit U+FFFD for
-  // truncated code points, which is the same tolerance OutputStore offers.
-  return { tail: buf.subarray(buf.length - limit).toString("utf8"), bytes: buf.length }
-}
-
-function safeTaskId(id: string): boolean {
-  return /^[A-Za-z0-9_-]+$/.test(id)
-}
-
-export function migrateExecTasks(opts: MigrateOptions): MigrateResult {
-  const result: MigrateResult = { migrated: 0, skipped: 0, failed: 0, errors: [] }
-
-  if (!existsSync(opts.srcDir)) return result
-
-  if (!existsSync(opts.destTaskDir)) {
-    mkdirSync(opts.destTaskDir, { recursive: true, mode: 0o700 })
-  }
-  if (!existsSync(opts.destOutputDir)) {
-    mkdirSync(opts.destOutputDir, { recursive: true, mode: 0o700 })
+export function migrateExecTasks(
+  opts?: { srcDir?: string; destTaskDir?: string; destOutputDir?: string } | string,
+  destTasksDir?: string,
+  destOutputDir?: string,
+): MigrateResult {
+  // Support both object and positional argument styles
+  let srcDir: string | undefined
+  if (typeof opts === "string") {
+    srcDir = opts
+  } else {
+    srcDir = opts?.srcDir
+    destTasksDir = opts?.destTaskDir ?? destTasksDir
+    destOutputDir = opts?.destOutputDir ?? destOutputDir
   }
 
-  const files = readdirSync(opts.srcDir).filter((f) => f.endsWith(".json"))
+  const src = srcDir ?? join(getUserDataDir(), ".ssh-tool", "exec-tasks")
+  const destTasks = destTasksDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "tasks")
+  const destOutputs = destOutputDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "outputs")
+
+  const result: MigrateResult = { migrated: 0, skipped: 0, failed: 0 }
+
+  if (!existsSync(src)) return result
+
+  // Ensure destination dirs exist
+  if (!existsSync(destTasks)) mkdirSync(destTasks, { recursive: true, mode: 0o700 })
+  if (!existsSync(destOutputs)) mkdirSync(destOutputs, { recursive: true, mode: 0o700 })
+
+  const files = readdirSync(src).filter((f) => f.endsWith(".json"))
+
   for (const file of files) {
-    const oldPath = join(opts.srcDir, file)
-    const taskId = file.replace(/\.json$/, "")
-
-    if (!safeTaskId(taskId)) {
-      result.failed += 1
-      result.errors.push({ file, reason: "unsafe task id (must match /^[A-Za-z0-9_-]+$/)" })
-      continue
-    }
-
-    const newTaskPath = join(opts.destTaskDir, file)
-    const stdoutPath = join(opts.destOutputDir, `${taskId}.stdout`)
-    const stderrPath = join(opts.destOutputDir, `${taskId}.stderr`)
-
-    // Idempotency: if new file is newer than old, skip.
+    const srcPath = join(src, file)
     try {
-      if (existsSync(newTaskPath)) {
-        const oldStat = statSync(oldPath)
-        const newStat = statSync(newTaskPath)
-        if (newStat.mtimeMs >= oldStat.mtimeMs) {
-          result.skipped += 1
-          continue
-        }
-      }
-    } catch {
-      // stat failure: proceed to full re-migration, will surface any read errors below
-    }
+      const content = readFileSync(srcPath, "utf8")
+      const legacy = JSON.parse(content) as LegacyExecTask
+      const taskId = file.replace(/\.json$/, "")
 
-    try {
-      const raw = readFileSync(oldPath, "utf-8")
-      const old = JSON.parse(raw) as OldExecTask
-      const stdout = old.stdout ?? ""
-      const stderr = old.stderr ?? ""
-      const stdoutTail = tailBuffer(stdout, OUTPUT_TAIL_LIMIT)
-      const stderrTail = tailBuffer(stderr, OUTPUT_TAIL_LIMIT)
-
-      // Write full stdout/stderr to outputs dir. Atomic via temp+rename.
-      const tmpStdout = `${stdoutPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const tmpStderr = `${stderrPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      try {
-        writeFileSync(tmpStdout, stdout, { mode: 0o600 })
-        renameSync(tmpStdout, stdoutPath)
-        writeFileSync(tmpStderr, stderr, { mode: 0o600 })
-        renameSync(tmpStderr, stderrPath)
-      } catch (err) {
-        try { unlinkSync(tmpStdout) } catch {}
-        try { unlinkSync(tmpStderr) } catch {}
-        throw err
+      if (!SAFE_TASK_ID.test(taskId) || legacy.id !== taskId) {
+        throw new Error("unsafe or mismatched task id")
       }
 
-      // Build new task JSON (ScheduledTask-shaped) without embedded stdout/stderr
-      const newTask = {
-        id: old.id ?? taskId,
-        agentId: "migrated",
-        agentName: "migrated",
-        hostId: old.hostname ?? "unknown",
-        profileKey: old.profileKey,
-        sessionId: old.sessionId,
-        command: old.command ?? "",
-        effectiveCwd: old.cwd,
-        reason: "migrated from ~/.ssh-tool/exec-tasks/",
-        classification: {
-          cost: "small" as const,
-          mutates: false,
-          blocking: true,
-          risky: false,
-          script: false,
-          intent: "exec" as const,
-          confidence: 1.0,
-          reason: "migrated",
-        },
-        scheduler: "bypass" as const,
-        status: "completed" as const,
-        updatedAt: old.updatedAt ?? old.finishedAt ?? Date.now(),
-        startedAt: old.startedAt ?? Date.now(),
-        finishedAt: old.finishedAt ?? Date.now(),
-        exitCode: old.exitCode ?? 0,
-        signal: old.signal ?? null,
-        stdoutTail: stdoutTail.tail,
-        stderrTail: stderrTail.tail,
-        stdoutBytes: stdoutTail.bytes,
-        stderrBytes: stderrTail.bytes,
+      // Skip if already migrated (same id exists in dest)
+      const destPath = join(destTasks, `${taskId}.json`)
+      const stdoutPath = join(destOutputs, `${taskId}.stdout`)
+      const stderrPath = join(destOutputs, `${taskId}.stderr`)
+      if (existsSync(destPath)) {
+        const stdout = writeOutputIfMissing(stdoutPath, legacy.stdout ?? "")
+        const stderr = writeOutputIfMissing(stderrPath, legacy.stderr ?? "")
+        backfillOutputMetadata(destPath, legacy, stdout, stderr)
+        result.skipped++
+        // Still clean up the source file since dest already has it
+        try { unlinkSync(srcPath) } catch {}
+        continue
       }
 
-      const tmpTask = `${newTaskPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      writeFileSync(tmpTask, JSON.stringify(newTask), { mode: 0o600 })
-      renameSync(tmpTask, newTaskPath)
+      // Convert to ScheduledTask
+      const status = mapStatus(legacy.status)
+      const scheduledTask = buildScheduledTask(taskId, legacy)
 
-      result.migrated += 1
+      // Write task file
+      atomicWrite(destPath, JSON.stringify(scheduledTask))
+
+      // Write output files if there's content
+      if (legacy.stdout) {
+        const stdout = writeOutputIfMissing(stdoutPath, legacy.stdout)
+        scheduledTask.stdoutBytes = stdout.bytes
+        scheduledTask.stdoutTail = stdout.tail
+      }
+      if (legacy.stderr) {
+        const stderr = writeOutputIfMissing(stderrPath, legacy.stderr)
+        scheduledTask.stderrBytes = stderr.bytes
+        scheduledTask.stderrTail = stderr.tail
+      }
+
+      // Re-write task with updated byte counts
+      if (legacy.stdout || legacy.stderr) {
+        atomicWrite(destPath, JSON.stringify(scheduledTask))
+      }
+
+      // Delete source file
+      try { unlinkSync(srcPath) } catch {}
+
+      result.migrated++
+      log("migrator", `Migrated legacy task ${taskId} (${legacy.status} → ${status})`)
     } catch (err) {
-      result.failed += 1
-      result.errors.push({ file, reason: (err as Error).message })
+      result.failed++
+      log("migrator", `Failed to migrate ${file}: ${(err as Error).message}`)
     }
+  }
+
+  // Clean up empty source directory
+  try {
+    const remaining = readdirSync(src)
+    if (remaining.length === 0) {
+      rmdirSync(src)
+    }
+  } catch {}
+
+  if (result.migrated > 0 || result.failed > 0) {
+    log("migrator", `Migration complete: ${result.migrated} migrated, ${result.skipped} skipped, ${result.failed} failed`)
   }
 
   return result

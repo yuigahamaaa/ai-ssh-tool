@@ -6,6 +6,7 @@ import { describe, it, before, after } from "node:test"
 import assert from "node:assert"
 import { createConnection } from "net"
 import ssh2 from "ssh2"
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
 
 // Suppress ECONNRESET during test cleanup (TCP forwarding sockets)
 process.on("uncaughtException", (err: any) => {
@@ -13,7 +14,6 @@ process.on("uncaughtException", (err: any) => {
   throw err
 })
 
-const { Server, utils } = ssh2
 import { SSHConnection } from "../connection.js"
 import { SSHSessionManager } from "../session-manager.js"
 import { SSHGateway } from "../gateway.js"
@@ -21,9 +21,11 @@ import { createRemoteTools } from "../remote-tools.js"
 import { remoteExec } from "../remote-shell.js"
 import type { SecurityPolicy, SSHHostConfig } from "../types.js"
 
+const { Server } = ssh2
+
 // Generate test keys once
-const hostKey = utils.generateKeyPairSync("ed25519")
-const userPrivateKey = utils.generateKeyPairSync("ed25519")
+const hostKey = createStableEd25519KeyPair()
+const userPrivateKey = createStableEd25519KeyPair()
 
 // In-memory filesystem for SFTP tests
 const memFs = new Map<string, Buffer>()
@@ -38,11 +40,16 @@ function createTestServer(opts?: {
   cleanup: () => Promise<void>
 }> {
   return new Promise((resolve, reject) => {
+    const clients = new Set<any>()
+    const forwardSockets = new Set<any>()
     const server = new Server(
       {
         hostKeys: [hostKey.private],
       },
       (client: any) => {
+        clients.add(client)
+        client.on("close", () => clients.delete(client))
+        client.on("error", () => {})
         client.on("authentication", (ctx: any) => {
           if (ctx.method === "password" && ctx.password === "testpass") {
             ctx.accept()
@@ -59,12 +66,14 @@ function createTestServer(opts?: {
             client.on("tcpip", (accept: any, reject: any, info: any) => {
               // Tunnel traffic to the actual target
               const sock = createConnection(info.destPort, info.destIP, () => {
+                forwardSockets.add(sock)
                 const stream = accept()
+                stream.on("error", () => {})
                 sock.on("data", (d: any) => { try { stream.write(d) } catch {} })
                 stream.on("data", (d: any) => { try { sock.write(d) } catch {} })
-                sock.on("error", () => { try { stream.close() } catch {} })
-                sock.on("close", () => { try { stream.close() } catch {} })
-                stream.on("close", () => { try { sock.destroy() } catch {} })
+                sock.on("error", () => { forwardSockets.delete(sock); try { stream.close() } catch {} })
+                sock.on("close", () => { forwardSockets.delete(sock); try { stream.close() } catch {} })
+                stream.on("close", () => { forwardSockets.delete(sock); try { sock.destroy() } catch {} })
               })
               sock.on("error", () => {
                 try { reject() } catch {}
@@ -86,11 +95,13 @@ function createTestServer(opts?: {
             session.on("shell", (accept: any, reject: any) => {
               const stream = accept()
               // Keep shell open until client closes it
+              stream.on("error", () => {})
               stream.on("close", () => {})
             })
 
             session.on("exec", (acceptExec: any, rejectExec: any, info: any) => {
               const stream = acceptExec()
+              stream.on("error", () => {})
               const command = info.command
 
               const handler = opts?.execHandler ?? defaultExecHandler
@@ -104,6 +115,7 @@ function createTestServer(opts?: {
 
             session.on("sftp", (acceptSftp: any) => {
               const sftpStream = acceptSftp()
+              sftpStream.on("error", () => {})
 
               // Minimal SFTP server for testing
               const handles = new Map<number, { path: string; data?: Buffer; pos: number }>()
@@ -253,9 +265,17 @@ function createTestServer(opts?: {
         cleanup: () =>
           new Promise<void>((res) => {
             memFs.clear()
+            for (const sock of forwardSockets) {
+              try { sock.destroy() } catch {}
+            }
+            forwardSockets.clear()
+            for (const client of clients) {
+              try { client.end() } catch {}
+              try { (client as any)._sock?.destroy?.() } catch {}
+            }
             server.close(() => {
               // Allow pending connections to finish
-              setTimeout(res, 50)
+              setTimeout(res, 200)
             })
           }),
       })
@@ -266,8 +286,10 @@ function createTestServer(opts?: {
 }
 
 function defaultExecHandler(command: string): { stdout: string; stderr: string; code: number } {
-  // Strip "cd ... && " prefix that remoteExec adds
-  const stripped = command.replace(/^cd\s+"[^"]*"\s*&&\s*/, "")
+  // Strip wrappers that remoteExec/ExecTaskManager add before the actual command.
+  const stripped = command
+    .replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
+    .replace(/^cd\s+"[^"]*"\s*&&\s*/, "")
   if (stripped === "echo hello") return { stdout: "hello\n", stderr: "", code: 0 }
   if (stripped === "echo test123") return { stdout: "test123\n", stderr: "", code: 0 }
   if (stripped === "whoami") return { stdout: "testuser\n", stderr: "", code: 0 }
@@ -394,15 +416,27 @@ describe("Integration Tests", () => {
       // Read
       const readData = await new Promise<Buffer>((resolve, reject) => {
         const chunks: Buffer[] = []
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          resolve(Buffer.concat(chunks))
+        }
         const rs = sftp.createReadStream("/tmp/test.txt")
-        rs.on("error", reject)
+        rs.on("error", (err) => {
+          if (settled) return
+          settled = true
+          reject(err)
+        })
         rs.on("data", (chunk: Buffer) => chunks.push(chunk))
-        rs.on("end", () => resolve(Buffer.concat(chunks)))
+        rs.on("close", finish)
+        rs.on("end", () => setImmediate(finish))
       })
 
       assert.strictEqual(readData.toString(), "hello integration test")
 
       sftp.end()
+      await new Promise((resolve) => setTimeout(resolve, 100))
       await conn.disconnect()
     })
   })

@@ -9,8 +9,10 @@ import { uploadFile, downloadFile } from "../file-transfer.js"
 import type { TransferResult } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
-const { Server, utils } = ssh2
-const hostKey = utils.generateKeyPairSync("ed25519")
+import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+
+const { Server } = ssh2
+const hostKey = createStableEd25519KeyPair()
 const memFs = new Map<string, Buffer>()
 const remoteExecResults = new Map<string, { stdout: string, stderr: string }>()
 
@@ -35,14 +37,21 @@ function createTestServer(): Promise<{
             const stream = accept()
             stream.on("close", () => {})
           })
-          session.on("exec", (acceptExec: any) => {
+          session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
             const stream = acceptExec()
-            const cmd = stream.readableHighWaterMark
             const testResult = remoteExecResults.get("test")
             if (testResult) {
               stream.write(testResult.stdout)
               stream.write(testResult.stderr)
               remoteExecResults.delete("test")
+            } else if (typeof info?.command === "string") {
+              const existsMatch = info.command.match(/test -e ("(?:\\.|[^"])*") && echo "YES" \|\| echo "NO"/)
+              if (existsMatch) {
+                const remotePath = JSON.parse(existsMatch[1])
+                stream.write(memFs.has(remotePath) ? "YES\n" : "NO\n")
+              } else {
+                stream.write("ok\n")
+              }
             } else {
               stream.write("ok\n")
             }

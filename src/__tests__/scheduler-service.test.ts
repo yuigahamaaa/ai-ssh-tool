@@ -390,6 +390,35 @@ describe("SchedulerService", () => {
     assert.equal(scheduler.getTask(a.taskId!)?.exitCode, undefined)
   })
 
+  it("cancelTask stops a foreground runner controller before marking task cancelled", async () => {
+    let stopCount = 0
+    let resolveRun!: (value: { code: number; stdout: string; stderr: string }) => void
+    const controllerRunner: TaskRunner = {
+      start: () => ({
+        promise: new Promise((resolve) => { resolveRun = resolve }),
+        stop: () => { stopCount++ },
+      }),
+      startBackground: () => {},
+    }
+    const s = trackScheduler(new SchedulerService({
+      persistence,
+      runner: controllerRunner,
+      outputStore: new OutputStore(join(tmpDir, "foreground-controller-outputs")),
+      eventLog: new EventLog(join(tmpDir, "events-foreground-controller")),
+    }))
+
+    const decision = s.schedule(makeRequest({ command: "sleep 999", scheduler: "bypass" }))
+    assert.equal(decision.action, "run_now")
+
+    assert.equal(s.cancelTask(decision.taskId!), true)
+    assert.equal(stopCount, 1)
+    assert.equal(s.getTask(decision.taskId!)?.status, "cancelled")
+
+    resolveRun({ code: 0, stdout: "late", stderr: "" })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(s.getTask(decision.taskId!)?.status, "cancelled")
+  })
+
   it("cancelTask releases exclusive host lock before pumping queued work", async () => {
     const a = scheduler.schedule(makeRequest({ command: "kubectl apply -f deploy.yaml", intent: "deploy", cost: "exclusive", force: true, agent: makeAgent("deploy") }))
     const b = scheduler.schedule(makeRequest({ command: "rg foo src", cost: "tiny", agent: makeAgent("reader") }))
