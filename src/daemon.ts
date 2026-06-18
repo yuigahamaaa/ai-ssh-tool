@@ -659,7 +659,10 @@ export class SSHDaemon {
       const session = this.gateway.sessions.getSession(existing.sessionId)
       const connection = this.gateway.sessions.getConnection(existing.sessionId)
       if (session?.status === "connected" && connection?.isConnected()) {
-        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true, configHash } }
+        // Reuse path: still need to parse config for hostId since it's not stored in sessionMap
+        const config = JSON.parse(configJson)
+        const hostId = `${config.target.host}:${config.target.username}`
+        return { id: req.id, ok: true, data: { sessionId: existing.sessionId, reused: true, configHash, hostId } }
       }
       this.sessionMap.delete(configHash)
       if (session) {
@@ -673,6 +676,11 @@ export class SSHDaemon {
     if (!config.target?.host || !config.target?.username) {
       return { id: req.id, ok: false, error: "Config must have target.host and target.username" }
     }
+
+    // hostId is derived only from target.host + target.username for virtual cwd consistency.
+    // Unlike configHash, it ignores jumpHosts and port so the same host+user always
+    // gets the same virtual cwd regardless of which profile/jumpHosts are used.
+    const hostId = `${config.target.host}:${config.target.username}`
 
     const jumpHosts = (config.gateways ?? []).map((g: any) => ({
       host: g.host,
@@ -694,7 +702,7 @@ export class SSHDaemon {
       })
 
       this.sessionMap.set(configHash, { sessionId: session.id, configHash })
-      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash } }
+      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash, hostId } }
     } catch (err: any) {
       for (const [sid, entry] of this.sessionMap) {
         const s = this.gateway.sessions.getSession(entry.sessionId)

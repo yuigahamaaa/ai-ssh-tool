@@ -11,6 +11,9 @@ export interface McpScheduleRequestInput {
   profile: SSHProfile
   sessionId: string
   configHash?: string
+  /** Virtual cwd hostId: derived from target.host + target.username only, not the full config.
+   * This ensures the same host+user gets the same virtual cwd regardless of jumpHosts or port. */
+  hostId: string
   agentId: string
   command: string
   cwd?: string
@@ -50,7 +53,10 @@ export function profileToLegacyConfigJson(profile: SSHProfile): string {
 
 export function createMcpScheduleRequest(input: McpScheduleRequestInput): ScheduleRequest {
   const target = input.profile.chain[input.profile.chain.length - 1]
-  const hostKey = input.configHash ?? input.sessionId.slice(0, 16)
+  // hostId comes from the daemon and is based on target.host + target.username only,
+  // not the full configHash. This ensures virtual cwd works consistently
+  // regardless of which profile (jumpHosts, port, etc.) is used.
+  const hostKey = input.hostId
   const agent: AgentIdentity = {
     id: input.agentId,
     name: "mcp-server",

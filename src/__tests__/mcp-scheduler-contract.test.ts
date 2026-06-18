@@ -30,6 +30,7 @@ describe("MCP scheduler contract", () => {
       profile: profile(),
       sessionId: "sess-1234567890abcdef",
       configHash: "cfg-abc",
+      hostId: "target.example.com:deploy",
       agentId: "mcp-agent",
       command: "npm test",
       cwd: "/repo",
@@ -45,7 +46,9 @@ describe("MCP scheduler contract", () => {
     assert.equal(req.scheduler, "auto")
     assert.equal(req.agent.id, "mcp-agent")
     assert.equal(req.agent.clientType, "mcp")
-    assert.equal(req.host.id, "cfg-abc")
+    // hostId is based on target.host:target.username, not configHash
+    assert.equal(req.host.id, "target.example.com:deploy")
+    assert.equal(req.host.profileKey, "target.example.com:deploy")
     assert.equal(req.host.targetHost, "target.example.com")
     assert.equal(req.host.targetUser, "deploy")
     assert.equal(req.command, "npm test")
@@ -63,14 +66,15 @@ describe("MCP scheduler contract", () => {
     const req = createMcpScheduleRequest({
       profile: profile(),
       sessionId: "sess-abcdef",
+      hostId: "target.example.com:deploy",
       agentId: "mcp-agent",
       command: "rg TODO src",
       scheduler: "bypass",
     })
 
     assert.equal(req.scheduler, "bypass")
-    assert.equal(req.host.id, "sess-abcdef")
-    assert.equal(req.host.profileKey, "sess-abcdef")
+    assert.equal(req.host.id, "target.example.com:deploy")
+    assert.equal(req.host.profileKey, "target.example.com:deploy")
     assert.equal(req.command, "rg TODO src")
   })
 

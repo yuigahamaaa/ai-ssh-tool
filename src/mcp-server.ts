@@ -292,12 +292,13 @@ async function main() {
     if (!connectResp.ok) {
       throw new Error(`Connection failed: ${(connectResp as any).error}`)
     }
-    const { sessionId, configHash } = connectResp.data as any
+    const { sessionId, configHash, hostId } = connectResp.data as any
 
     const scheduleReq = createMcpScheduleRequest({
       profile,
       sessionId,
       configHash,
+      hostId,
       agentId: MCP_AGENT_ID,
       command: params.command,
       cwd: params.cwd,
@@ -992,11 +993,11 @@ async function main() {
       if (!connectResp.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
       }
-      const { sessionId, configHash } = connectResp.data as any
+      const { sessionId, configHash, hostId } = connectResp.data as any
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
       const hostIdentity: HostIdentity = {
-        id: configHash ?? sessionId.slice(0, 16),
-        profileKey: configHash ?? sessionId.slice(0, 16),
+        id: hostId,
+        profileKey: configHash,
         targetHost: profile.chain[profile.chain.length - 1].host,
         targetUser: profile.chain[profile.chain.length - 1].auth.username,
         displayName: profile.name,
