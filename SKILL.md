@@ -72,6 +72,16 @@ ssh-tool/
 | `ssh_grep` | 搜索文件内容 | `pattern`, `path` |
 | `ssh_find` | 查找文件 | `path`, `name` |
 
+### 文件工具返回契约
+
+文件类 MCP 工具返回统一 JSON envelope：`ok`、`kind`、`data`、`error`、`agentGuidance`。AI 应优先读取结构化字段，不要解析展示文本。
+
+- `ssh_read_file`: `data.content` 是带行号文本；同时看 `binaryDetected`、`truncated`、`sizeBytes`、`totalLines`、`contentBytes`、`maxContentBytes`。若 `binaryDetected=true` 或需要完整无损文件，使用 `ssh_download`，不要自行 shell/base64。
+- `ssh_list_dir`: 读 `data.entries[]` 的 `name`、`path`、`type`、`sizeBytes`、`mode`、`mtime`。
+- `ssh_stat`: 读 `data.path`、`type`、`sizeBytes`、`mode`、`owner`、`group`、`mtime`。
+- `ssh_grep`: 读 `data.matches[]` 的 `file`、`line`、`text`，并用 `count`/`noMatches` 判断结果。
+- `ssh_find`: 读 `data.results[]` 的 `path`、`type`、`sizeBytes`、`mtime`，并用 `count`/`noResults` 判断结果。
+
 ### 调度器 & 队列管理（新增！）
 
 | 工具 | 功能 | 核心参数 |

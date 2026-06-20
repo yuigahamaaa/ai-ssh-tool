@@ -347,6 +347,18 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 | Sessions | `ssh_list_sessions` | List active SSH sessions |
 | Disconnect | `ssh_disconnect` | Disconnect a session |
 
+### File Tool Return Contract
+
+All MCP file tools return a JSON envelope with `ok`, `kind`, `data`, `error`, and `agentGuidance`.
+
+- `ssh_read_file`: `data.content` is line-numbered text, with `offset`, `limit`, `sizeBytes`, `totalLines`, `contentBytes`, `maxContentBytes`, `binaryDetected`, and `truncated`. If `binaryDetected` is true, use `ssh_download`; do not manually base64 through shell commands.
+- `ssh_list_dir`: `data.entries[]` contains `name`, `path`, `type`, `sizeBytes`, `mode`, and `mtime`.
+- `ssh_stat`: `data` contains `path`, `type`, `sizeBytes`, `mode`, `owner`, `group`, and `mtime`.
+- `ssh_grep`: `data.matches[]` contains `file`, `line`, and `text`, plus `count` and `noMatches`.
+- `ssh_find`: `data.results[]` contains `path`, `type`, `sizeBytes`, and `mtime`, plus `count` and `noResults`.
+
+`ssh_read_file` reads metadata before content, refuses binary text rendering, and caps inline text at 1 MiB. Use `offset`/`limit` for another slice or `ssh_download` for lossless full-file transfer.
+
 ---
 
 ### Configuration
@@ -822,6 +834,18 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 | 配置列表 | `ssh_list_profiles` | 列出保存的连接配置 |
 | 会话列表 | `ssh_list_sessions` | 列出活跃的 SSH 会话 |
 | 断开连接 | `ssh_disconnect` | 断开指定会话 |
+
+### 文件工具返回契约
+
+所有 MCP 文件工具都返回 JSON envelope：`ok`、`kind`、`data`、`error`、`agentGuidance`。
+
+- `ssh_read_file`：`data.content` 是带行号文本，并包含 `offset`、`limit`、`sizeBytes`、`totalLines`、`contentBytes`、`maxContentBytes`、`binaryDetected`、`truncated`。如果 `binaryDetected=true`，不要自己用 shell/base64 传输，应该用 `ssh_download`。
+- `ssh_list_dir`：`data.entries[]` 包含 `name`、`path`、`type`、`sizeBytes`、`mode`、`mtime`。
+- `ssh_stat`：`data` 包含 `path`、`type`、`sizeBytes`、`mode`、`owner`、`group`、`mtime`。
+- `ssh_grep`：`data.matches[]` 包含 `file`、`line`、`text`，并带 `count`、`noMatches`。
+- `ssh_find`：`data.results[]` 包含 `path`、`type`、`sizeBytes`、`mtime`，并带 `count`、`noResults`。
+
+`ssh_read_file` 会先读取元数据，不把二进制当文本返回，并把内联文本限制在 1 MiB。需要继续读时用 `offset`/`limit` 分片；需要完整无损文件时用 `ssh_download`。
 
 ---
 

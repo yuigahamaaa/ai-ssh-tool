@@ -15,6 +15,27 @@ import { createRemoteFs, type RemoteFs } from "./remote-fs.js"
 import { remoteExec, type ExecResult } from "./remote-shell.js"
 import type { SecurityPolicy } from "./types.js"
 import { shellQuote } from "./shell-quote.js"
+import {
+  buildFindCommand,
+  buildFindFallbackCommand,
+  buildGrepCommand,
+  buildGrepFallbackCommand,
+  buildListDirFallbackCommand,
+  buildListDirCommand,
+  buildReadFileContentCommand,
+  buildReadFileMetadataCommand,
+  buildStatFallbackCommand,
+  buildStatCommand,
+  DEFAULT_READ_LINE_LIMIT,
+  fallbackListDirFromEntries,
+  fallbackStatFromRemoteStat,
+  formatReadFileResult,
+  parseFindOutput,
+  parseGrepOutput,
+  parseListDirOutput,
+  parseReadFileMetadata,
+  parseStatOutput,
+} from "./remote-file-tools.js"
 
 export interface RemoteToolContext {
   sessionId: string
@@ -97,14 +118,29 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           const buffer = await fs.readFile(params.path)
           return (buffer as Buffer).toString("base64")
         }
-        const content = await fs.readFile(params.path, { encoding: "utf-8" })
-        const lines = (content as string).split("\n")
-        const start = params.offset ?? 0
-        const end = params.limit ? start + params.limit : lines.length
-        const selected = lines.slice(start, end)
-        return selected
-          .map((line, i) => `${start + i + 1}\t${line}`)
-          .join("\n")
+        const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path), { timeout: 10000 })
+        if (metadataResult.code !== 0) {
+          throw new Error(`Failed to read metadata for ${params.path}: ${metadataResult.stderr}`)
+        }
+        const metadata = parseReadFileMetadata(metadataResult.stdout)
+        if (metadata.binaryDetected) {
+          return formatReadFileResult({ path: params.path, metadata, offset: params.offset, limit: params.limit })
+        }
+        const contentResult = await remoteExec(
+          ctx.client,
+          buildReadFileContentCommand(params.path, params.offset ?? 0, params.limit ?? DEFAULT_READ_LINE_LIMIT),
+          { timeout: 30000 },
+        )
+        if (contentResult.code !== 0) {
+          throw new Error(`Failed to read ${params.path}: ${contentResult.stderr}`)
+        }
+        return formatReadFileResult({
+          path: params.path,
+          metadata,
+          rawContent: contentResult.stdout,
+          offset: params.offset,
+          limit: params.limit,
+        })
       },
     },
 
@@ -178,17 +214,16 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string; showHidden?: boolean }) {
+        const result = await remoteExec(ctx.client, buildListDirCommand(params.path, Boolean(params.showHidden)), { timeout: 15000 })
+        if (result.code === 0) {
+          return { ...parseListDirOutput(params.path, result.stdout), strategy: "gnu" as const }
+        }
+        const fallback = await remoteExec(ctx.client, buildListDirFallbackCommand(params.path, Boolean(params.showHidden)), { timeout: 15000 })
+        if (fallback.code === 0) {
+          return { ...parseListDirOutput(params.path, fallback.stdout), strategy: "shell" as const }
+        }
         const entries = await fs.readdir(params.path)
-        const filtered = params.showHidden
-          ? entries
-          : entries.filter((e) => !e.filename.startsWith("."))
-        return filtered
-          .map((e) => {
-            const type = e.attrs.isDirectory ? "d" : e.attrs.isSymbolicLink ? "l" : "-"
-            const size = String(e.attrs.size).padStart(10)
-            return `${type} ${size} ${e.filename}`
-          })
-          .join("\n")
+        return fallbackListDirFromEntries(params.path, entries, Boolean(params.showHidden))
       },
     },
 
@@ -220,7 +255,16 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string }) {
-        return fs.stat(params.path)
+        const result = await remoteExec(ctx.client, buildStatCommand(params.path), { timeout: 10000 })
+        if (result.code === 0) {
+          return { ...parseStatOutput(result.stdout), raw: result.stdout, strategy: "gnu" as const }
+        }
+        const fallback = await remoteExec(ctx.client, buildStatFallbackCommand(params.path), { timeout: 10000 })
+        if (fallback.code === 0) {
+          return { ...parseStatOutput(fallback.stdout), raw: fallback.stdout, strategy: "shell" as const }
+        }
+        const stat = await fs.stat(params.path)
+        return fallbackStatFromRemoteStat(params.path, stat)
       },
     },
 
@@ -245,12 +289,31 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         caseInsensitive?: boolean
       }) {
         validateCommand("grep", policy)
-        let cmd = "grep -rn"
-        if (params.caseInsensitive) cmd += "i"
-        if (params.glob) cmd += ` --include=${shellQuote(params.glob)}`
-        cmd += ` ${shellQuote(params.pattern)} ${shellQuote(params.path)}`
-        const result = await remoteExec(ctx.client, cmd, { timeout: 15000 })
-        return result.stdout || result.stderr || "(no matches)"
+        let result = await remoteExec(ctx.client, buildGrepCommand({
+          pattern: params.pattern,
+          path: params.path,
+          glob: params.glob,
+          caseInsensitive: Boolean(params.caseInsensitive),
+        }), { timeout: 15000 })
+        if (result.code > 1) {
+          result = await remoteExec(ctx.client, buildGrepFallbackCommand({
+            pattern: params.pattern,
+            path: params.path,
+            glob: params.glob,
+            caseInsensitive: Boolean(params.caseInsensitive),
+          }), { timeout: 15000 })
+        }
+        const raw = result.stdout || ""
+        if (result.code > 1) {
+          throw new Error(result.stderr || raw || "grep failed")
+        }
+        return {
+          pattern: params.pattern,
+          path: params.path,
+          glob: params.glob,
+          caseInsensitive: Boolean(params.caseInsensitive),
+          ...parseGrepOutput(raw),
+        }
       },
     },
 
@@ -275,12 +338,30 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         maxDepth?: number
       }) {
         validateCommand("find", policy)
-        let cmd = `find ${shellQuote(params.path)}`
-        if (params.maxDepth) cmd += ` -maxdepth ${params.maxDepth}`
-        if (params.type) cmd += ` -type ${params.type}`
-        if (params.name) cmd += ` -name ${shellQuote(params.name)}`
-        const result = await remoteExec(ctx.client, cmd, { timeout: 15000 })
-        return result.stdout || result.stderr || "(no results)"
+        let result = await remoteExec(ctx.client, buildFindCommand({
+          path: params.path,
+          name: params.name,
+          type: params.type as "f" | "d" | "l" | undefined,
+          maxDepth: params.maxDepth,
+        }), { timeout: 15000 })
+        if (result.code !== 0) {
+          result = await remoteExec(ctx.client, buildFindFallbackCommand({
+            path: params.path,
+            name: params.name,
+            type: params.type as "f" | "d" | "l" | undefined,
+            maxDepth: params.maxDepth,
+          }), { timeout: 15000 })
+        }
+        if (result.code !== 0) {
+          throw new Error(result.stderr || "find failed")
+        }
+        return {
+          path: params.path,
+          name: params.name,
+          type: params.type,
+          maxDepth: params.maxDepth,
+          ...parseFindOutput(result.stdout),
+        }
       },
     },
 

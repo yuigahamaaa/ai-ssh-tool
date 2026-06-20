@@ -1,4 +1,5 @@
 import { shellQuote } from "./shell-quote.js"
+import type { DirEntry, RemoteFileStat } from "./remote-fs.js"
 
 export type RemoteFileType = "file" | "directory" | "symlink" | "other"
 
@@ -41,6 +42,18 @@ export interface FindResult {
   mtime: number
 }
 
+export interface ReadFileResult extends ReadFileMetadata {
+  path: string
+  offset: number
+  limit: number
+  content: string
+  raw: string
+  contentBytes: number
+  maxContentBytes: number
+  truncated: boolean
+  agentGuidance: string[]
+}
+
 export const DEFAULT_READ_LINE_LIMIT = 2000
 export const MAX_READ_FILE_BYTES = 1024 * 1024
 
@@ -76,9 +89,70 @@ export function parseReadFileMetadata(raw: string): ReadFileMetadata {
   }
 }
 
+export function formatReadFileResult(params: {
+  path: string
+  metadata: ReadFileMetadata
+  rawContent?: string
+  offset?: number
+  limit?: number
+}): ReadFileResult {
+  const offset = Math.max(0, Math.floor(params.offset ?? 0))
+  const limit = Math.max(1, Math.floor(params.limit ?? DEFAULT_READ_LINE_LIMIT))
+
+  if (params.metadata.binaryDetected) {
+    return {
+      path: params.path,
+      offset,
+      limit,
+      content: "",
+      raw: "",
+      contentBytes: 0,
+      maxContentBytes: MAX_READ_FILE_BYTES,
+      truncated: false,
+      ...params.metadata,
+      agentGuidance: ["Binary file detected. Use ssh_download for lossless transfer instead of ssh_read_file or manual base64."],
+    }
+  }
+
+  const rawContent = params.rawContent ?? ""
+  const contentBytes = Buffer.byteLength(rawContent)
+  const cappedContent = contentBytes > MAX_READ_FILE_BYTES
+    ? rawContent.slice(0, MAX_READ_FILE_BYTES)
+    : rawContent
+  const lines = cappedContent.split("\n")
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+  const content = lines.map((line, i) => `${offset + i + 1}\t${line}`).join("\n")
+  const truncated = offset + lines.length < params.metadata.totalLines
+    || contentBytes > MAX_READ_FILE_BYTES
+    || params.metadata.sizeBytes > MAX_READ_FILE_BYTES
+
+  return {
+    path: params.path,
+    offset,
+    limit,
+    content,
+    raw: content,
+    contentBytes: Math.min(contentBytes, MAX_READ_FILE_BYTES),
+    maxContentBytes: MAX_READ_FILE_BYTES,
+    truncated,
+    ...params.metadata,
+    agentGuidance: truncated
+      ? ["Read result is partial. Increase offset/limit for another slice, or use ssh_download for the full file."]
+      : [],
+  }
+}
+
 export function buildListDirCommand(path: string, showHidden = false): string {
   const hiddenFilter = showHidden ? "" : " ! -name '.*'"
   return `find ${shellQuote(path)} -maxdepth 1 -mindepth 1${hiddenFilter} -printf '%f\\t%y\\t%s\\t%m\\t%T@\\t%p\\n'`
+}
+
+export function buildListDirFallbackCommand(path: string, showHidden = false): string {
+  const q = shellQuote(path)
+  const hiddenFilter = showHidden
+    ? ""
+    : `case "$name" in .*) continue ;; esac; `
+  return `sh -c 'base=$1; shift; for item do [ "$item" = "$base/*" ] && continue; name=$(basename "$item"); ${hiddenFilter}out=$(ls -ldn "$item" 2>/dev/null) || continue; set -- $out; mode=$1; size=$5; type=o; case "$mode" in d*) type=d ;; l*) type=l ;; -*) type=f ;; esac; printf "%s\\t%s\\t%s\\t%s\\t0\\t%s\\n" "$name" "$type" "$size" "$mode" "$item"; done' sh ${q} ${q}/*`
 }
 
 export function parseListDirOutput(basePath: string, raw: string): { path: string; entries: ListDirEntry[]; raw: string } {
@@ -92,7 +166,7 @@ export function parseListDirOutput(basePath: string, raw: string): { path: strin
         path: pathParts.join("\t"),
         type: mapFindType(type),
         sizeBytes: numberValue(size),
-        mode,
+        mode: normalizeMode(mode),
         mtime: numberValue(mtime),
       }
     })
@@ -100,8 +174,32 @@ export function parseListDirOutput(basePath: string, raw: string): { path: strin
   return { path: basePath, entries, raw }
 }
 
+export function fallbackListDirFromEntries(basePath: string, entries: DirEntry[], showHidden = false): { path: string; entries: ListDirEntry[]; raw: string; strategy: "sftp" } {
+  const list = entries
+    .filter(entry => showHidden || !entry.filename.startsWith("."))
+    .map(entry => {
+      const childPath = basePath.endsWith("/")
+        ? `${basePath}${entry.filename}`
+        : `${basePath}/${entry.filename}`
+      return {
+        name: entry.filename,
+        path: childPath,
+        type: remoteStatType(entry.attrs),
+        sizeBytes: entry.attrs.size,
+        mode: modeString(entry.attrs.mode),
+        mtime: normalizeMtime(entry.attrs.mtime),
+      }
+    })
+  const raw = list.map(entry => `${entry.name}\t${shortType(entry.type)}\t${entry.sizeBytes}\t${entry.mode}\t${entry.mtime}\t${entry.path}`).join("\n")
+  return { path: basePath, entries: list, raw, strategy: "sftp" }
+}
+
 export function buildStatCommand(path: string): string {
   return `stat -c '%F\\t%s\\t%a\\t%U\\t%G\\t%Y\\t%n' ${shellQuote(path)}`
+}
+
+export function buildStatFallbackCommand(path: string): string {
+  return `sh -c 'out=$(ls -ldn "$1" 2>/dev/null) || exit 1; set -- $out; mode=$1; size=$5; type=other; case "$mode" in d*) type=directory ;; l*) type=symlink ;; -*) type=file ;; esac; printf "%s\\t%s\\t%s\\t%s\\t%s\\t0\\t%s\\n" "$type" "$size" "$mode" "$3" "$4" "$1"' sh ${shellQuote(path)}`
 }
 
 export function parseStatOutput(raw: string): StatResult {
@@ -110,10 +208,23 @@ export function parseStatOutput(raw: string): StatResult {
     path: pathParts.join("\t"),
     type: mapStatType(fileType),
     sizeBytes: numberValue(size),
-    mode,
+    mode: normalizeMode(mode),
     owner,
     group,
     mtime: numberValue(mtime),
+  }
+}
+
+export function fallbackStatFromRemoteStat(path: string, stat: RemoteFileStat): StatResult & { strategy: "sftp" } {
+  return {
+    path,
+    type: remoteStatType(stat),
+    sizeBytes: stat.size,
+    mode: modeString(stat.mode),
+    owner: String(stat.uid),
+    group: String(stat.gid),
+    mtime: normalizeMtime(stat.mtime),
+    strategy: "sftp",
   }
 }
 
@@ -126,6 +237,13 @@ export interface GrepCommandParams {
 
 export function buildGrepCommand(params: GrepCommandParams): string {
   let cmd = "grep -RInIZ"
+  if (params.caseInsensitive) cmd += "i"
+  if (params.glob) cmd += ` --include=${shellQuote(params.glob)}`
+  return `${cmd} ${shellQuote(params.pattern)} ${shellQuote(params.path)}`
+}
+
+export function buildGrepFallbackCommand(params: GrepCommandParams): string {
+  let cmd = "grep -RInI"
   if (params.caseInsensitive) cmd += "i"
   if (params.glob) cmd += ` --include=${shellQuote(params.glob)}`
   return `${cmd} ${shellQuote(params.pattern)} ${shellQuote(params.path)}`
@@ -154,6 +272,14 @@ export function buildFindCommand(params: FindCommandParams): string {
   if (params.type) cmd += ` -type ${params.type}`
   if (params.name) cmd += ` -name ${shellQuote(params.name)}`
   return `${cmd} -printf '%p\\t%y\\t%s\\t%T@\\n'`
+}
+
+export function buildFindFallbackCommand(params: FindCommandParams): string {
+  let cmd = `find ${shellQuote(params.path)}`
+  if (params.maxDepth !== undefined) cmd += ` -maxdepth ${Math.max(0, Math.floor(params.maxDepth))}`
+  if (params.type) cmd += ` -type ${params.type}`
+  if (params.name) cmd += ` -name ${shellQuote(params.name)}`
+  return `${cmd} -exec sh -c 'for item do out=$(ls -ldn "$item" 2>/dev/null) || continue; set -- $out; mode=$1; size=$5; type=o; case "$mode" in d*) type=d ;; l*) type=l ;; -*) type=f ;; esac; printf "%s\\t%s\\t%s\\t0\\n" "$item" "$type" "$size"; done' sh {} +`
 }
 
 export function parseFindOutput(raw: string): { results: FindResult[]; count: number; noResults: boolean; raw: string } {
@@ -206,8 +332,48 @@ function mapFindType(type: string): RemoteFileType {
 function mapStatType(type: string): RemoteFileType {
   if (type.includes("directory")) return "directory"
   if (type.includes("symbolic link")) return "symlink"
-  if (type.includes("regular file")) return "file"
+  if (type.includes("regular file") || type === "file") return "file"
   return "other"
+}
+
+function remoteStatType(stat: RemoteFileStat): RemoteFileType {
+  if (stat.isDirectory) return "directory"
+  if (stat.isSymbolicLink) return "symlink"
+  if (stat.isFile) return "file"
+  return "other"
+}
+
+function shortType(type: RemoteFileType): string {
+  if (type === "file") return "f"
+  if (type === "directory") return "d"
+  if (type === "symlink") return "l"
+  return "o"
+}
+
+function modeString(mode: number): string {
+  return (mode & 0o777).toString(8).padStart(3, "0")
+}
+
+function normalizeMode(mode: string): string {
+  if (/^[0-7]{3,4}$/.test(mode)) return mode
+  if (/^[dl-][rwx-]{9}/.test(mode)) return symbolicModeToOctal(mode)
+  return mode
+}
+
+function symbolicModeToOctal(mode: string): string {
+  const bits = mode.slice(1, 10)
+  const digits = [bits.slice(0, 3), bits.slice(3, 6), bits.slice(6, 9)].map(part => {
+    let value = 0
+    if (part[0] === "r") value += 4
+    if (part[1] === "w") value += 2
+    if (part[2] === "x" || part[2] === "s" || part[2] === "t") value += 1
+    return String(value)
+  })
+  return digits.join("")
+}
+
+function normalizeMtime(mtime: number): number {
+  return mtime > 10_000_000_000 ? Math.floor(mtime / 1000) : mtime
 }
 
 function numberValue(value: string | undefined): number {

@@ -15,6 +15,7 @@ import { EventEmitter } from "events"
 import { rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
+import { MAX_READ_FILE_BYTES } from "../remote-file-tools.js"
 
 const testHome = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
 const origHome = process.env.HOME
@@ -111,10 +112,22 @@ function createMockClient(opts?: { sftp?: any; execHandler?: Function }) {
 
       cb(null, stream)
       process.nextTick(() => {
-        if (cmd.includes("grep")) {
-          stream.emit("data", Buffer.from("file.txt:1:match\n"))
+        if (cmd.includes("size_bytes=")) {
+          stream.emit("data", Buffer.from("size_bytes=24\ntotal_lines=3\nbinary_detected=false\nencoding=utf-8\n"))
+        } else if (cmd.includes("sed -n")) {
+          stream.emit("data", Buffer.from("hello world\nline 2\nline 3\n"))
+        } else if (cmd.includes("stat -c")) {
+          stream.emit("data", Buffer.from("regular file\t1024\t644\tuser\tgroup\t2000\t/tmp/file.txt\n"))
+        } else if (cmd.includes("grep")) {
+          stream.emit("data", Buffer.from("file.txt\x001:match\n"))
+        } else if (cmd.includes("-maxdepth 1 -mindepth 1")) {
+          if (cmd.includes("! -name")) {
+            stream.emit("data", Buffer.from("file.txt\tf\t1024\t644\t2000\t/tmp/file.txt\nsubdir\td\t4096\t755\t2001\t/tmp/subdir\n"))
+          } else {
+            stream.emit("data", Buffer.from("file.txt\tf\t1024\t644\t2000\t/tmp/file.txt\n.hidden\tf\t100\t644\t2000\t/tmp/.hidden\nsubdir\td\t4096\t755\t2001\t/tmp/subdir\n"))
+          }
         } else if (cmd.includes("find")) {
-          stream.emit("data", Buffer.from("/tmp/file.txt\n/tmp/dir\n"))
+          stream.emit("data", Buffer.from("/tmp/file.txt\tf\t1024\t2000\n/tmp/dir\td\t4096\t2001\n"))
         } else {
           stream.emit("data", Buffer.from("cmd output"))
         }
@@ -199,10 +212,10 @@ describe("RemoteTools", () => {
         cwd: "/home/testuser",
       })
 
-      const result = await tools.readFile.execute({ path: "/tmp/file.txt" })
-      assert.ok(typeof result === "string")
-      assert.ok(result.includes("1\thello world"))
-      assert.ok(result.includes("2\tline 2"))
+      const result = await tools.readFile.execute({ path: "/tmp/file.txt" }) as any
+      assert.equal(result.content, "1\thello world\n2\tline 2\n3\tline 3")
+      assert.equal(result.binaryDetected, false)
+      assert.equal(result.truncated, false)
 
       tools.dispose()
     })
@@ -215,9 +228,52 @@ describe("RemoteTools", () => {
         cwd: "/home/testuser",
       })
 
-      const result = await tools.readFile.execute({ path: "/tmp/file.txt", offset: 1, limit: 1 })
-      assert.ok(result.includes("2\tline 2"))
-      assert.ok(!result.includes("1\thello world"))
+      const result = await tools.readFile.execute({ path: "/tmp/file.txt", offset: 1, limit: 1 }) as any
+      assert.ok(result.content.includes("2\thello world"))
+      assert.equal(result.offset, 1)
+      assert.equal(result.limit, 1)
+
+      tools.dispose()
+    })
+
+    it("should not read the whole file through SFTP and should report binary files", async () => {
+      const sftp = createMockSftp()
+      let readStreamCalls = 0
+      sftp.createReadStream = mock.fn((_path: string) => {
+        readStreamCalls++
+        const stream = new EventEmitter()
+        process.nextTick(() => {
+          stream.emit("data", Buffer.alloc(MAX_READ_FILE_BYTES + 100))
+          stream.emit("end")
+        })
+        return stream
+      })
+      const execHandler = mock.fn((cmd: string, cb: Function) => {
+        const stream = new EventEmitter() as any
+        stream.stderr = new EventEmitter()
+        cb(null, stream)
+        process.nextTick(() => {
+          if (cmd.includes("size_bytes=")) {
+            stream.emit("data", Buffer.from("size_bytes=10485760\ntotal_lines=0\nbinary_detected=true\nencoding=utf-8\n"))
+          } else {
+            stream.emit("data", Buffer.from("unexpected content"))
+          }
+          stream.emit("close", 0)
+        })
+      })
+
+      const client = createMockClient({ sftp, execHandler })
+      const tools = await createRemoteTools({
+        sessionId: "test",
+        client,
+        cwd: "/home/testuser",
+      })
+
+      const result = await tools.readFile.execute({ path: "/tmp/blob.bin" }) as any
+      assert.equal(readStreamCalls, 0)
+      assert.equal(result.binaryDetected, true)
+      assert.equal(result.content, "")
+      assert.ok(result.agentGuidance[0].includes("ssh_download"))
 
       tools.dispose()
     })
@@ -275,7 +331,8 @@ describe("RemoteTools", () => {
       })
 
       await tools.exec.execute({ command: "pwd" })
-      assert.ok(receivedCmd.includes('cd "/home/testuser"'))
+      assert.ok(receivedCmd.includes("cd "))
+      assert.ok(receivedCmd.includes("/home/testuser"))
 
       tools.dispose()
     })
@@ -291,9 +348,9 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.listDir.execute({ path: "/tmp" })
-      assert.ok(result.includes("file.txt"))
-      assert.ok(result.includes("subdir"))
-      assert.ok(!result.includes(".hidden"))
+      assert.deepEqual(result.entries.map((e: any) => e.name), ["file.txt", "subdir"])
+      assert.equal(result.entries[0].type, "file")
+      assert.equal(result.entries[1].type, "directory")
 
       tools.dispose()
     })
@@ -307,7 +364,7 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.listDir.execute({ path: "/tmp", showHidden: true })
-      assert.ok(result.includes(".hidden"))
+      assert.ok(result.entries.some((entry: any) => entry.name === ".hidden"))
 
       tools.dispose()
     })
@@ -321,8 +378,8 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.listDir.execute({ path: "/tmp" })
-      assert.ok(result.includes("- "))  // file
-      assert.ok(result.includes("d "))  // directory
+      assert.equal(result.entries[0].sizeBytes, 1024)
+      assert.equal(result.entries[0].mode, "644")
 
       tools.dispose()
     })
@@ -368,8 +425,9 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.stat.execute({ path: "/tmp/file.txt" })
-      assert.equal(result.size, 1024)
-      assert.equal(result.isFile, true)
+      assert.equal(result.sizeBytes, 1024)
+      assert.equal(result.type, "file")
+      assert.equal(result.mode, "644")
 
       tools.dispose()
     })
@@ -385,8 +443,8 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.grep.execute({ pattern: "match", path: "/tmp" })
-      assert.ok(typeof result === "string")
-      assert.ok(result.includes("match"))
+      assert.equal(result.count, 1)
+      assert.deepEqual(result.matches[0], { file: "file.txt", line: 1, text: "match" })
 
       tools.dispose()
     })
@@ -409,7 +467,7 @@ describe("RemoteTools", () => {
       })
 
       await tools.grep.execute({ pattern: "test", path: "/tmp", caseInsensitive: true })
-      assert.ok(receivedCmd.includes("grep -rni"))
+      assert.ok(receivedCmd.includes("grep -RInIZi"))
 
       tools.dispose()
     })
@@ -449,8 +507,9 @@ describe("RemoteTools", () => {
       })
 
       const result = await tools.find.execute({ path: "/tmp" })
-      assert.ok(typeof result === "string")
-      assert.ok(result.includes("/tmp/file.txt"))
+      assert.equal(result.count, 2)
+      assert.equal(result.results[0].path, "/tmp/file.txt")
+      assert.deepEqual(result.results.map((item: any) => item.type), ["file", "directory"])
 
       tools.dispose()
     })
@@ -602,7 +661,8 @@ describe("RemoteTools", () => {
       await tools.exec.execute({ command: "ls" })
 
       // After cd, the exec should use the new cwd
-      assert.ok(receivedCmd.includes('cd "/var/log"'))
+      assert.ok(receivedCmd.includes("cd "))
+      assert.ok(receivedCmd.includes("/var/log"))
 
       tools.dispose()
     })
