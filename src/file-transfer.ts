@@ -9,10 +9,10 @@
  */
 
 import type { Client } from "ssh2"
-import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs"
+import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "fs"
 import { basename, dirname, join, posix as pathPosix } from "path"
 import { tmpdir } from "os"
-import { randomUUID } from "crypto"
+import { createHash, randomUUID } from "crypto"
 import { Transform, pipeline } from "stream"
 import { promisify } from "util"
 import iconv from "iconv-lite"
@@ -47,6 +47,17 @@ export interface TransferResult {
   overwritten?: boolean
   renamed?: boolean
   backupPath?: string
+  sourceBytes?: number
+  bytesTransferred?: number
+  checksum?: {
+    algorithm: "sha256"
+    source?: string
+    destination?: string
+  }
+  verification?: {
+    sizeMatched: boolean
+    checksumMatched?: boolean
+  }
   size: number
   duration: number
   error?: string
@@ -81,6 +92,10 @@ type OverwriteDecision = {
   existed: boolean
   renamed?: boolean
   backupPath?: string
+}
+
+type LocalOverwriteDecision = OverwriteDecision & {
+  requestedPath: string
 }
 
 export interface FileTransferOptions {
@@ -335,6 +350,65 @@ function resolveLocalFileTarget(remotePath: string, localPath: string): string {
   return localPath
 }
 
+function sha256Buffer(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex")
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256")
+  await pipelineAsync(createReadStream(path), hash)
+  return hash.digest("hex")
+}
+
+function checkLocalOverwrite(localPath: string, options: FileTransferOptions | undefined): LocalOverwriteDecision {
+  const strategy = options?.overwrite ?? "overwrite"
+  if (!existsSync(localPath)) {
+    return { proceed: true, targetPath: localPath, requestedPath: localPath, strategy, existed: false }
+  }
+
+  switch (strategy) {
+    case false:
+    case "skip":
+      log("transfer", `Skipping existing file: ${localPath}`)
+      return { proceed: false, targetPath: localPath, requestedPath: localPath, strategy, existed: true }
+
+    case "backup": {
+      const backupPath = `${localPath}.bak`
+      log("transfer", `Backing up existing file: ${localPath} -> ${backupPath}`)
+      try {
+        if (existsSync(backupPath)) {
+          unlinkSync(backupPath)
+        }
+        renameSync(localPath, backupPath)
+      } catch (e) {
+        log("transfer", `Backup failed, continuing with overwrite: ${(e as Error).message}`)
+      }
+      return { proceed: true, targetPath: localPath, requestedPath: localPath, strategy, existed: true, backupPath }
+    }
+
+    case "rename": {
+      let counter = 1
+      let newPath: string
+      do {
+        newPath = `${localPath}.${counter}`
+        counter++
+      } while (existsSync(newPath))
+      log("transfer", `Renaming local target to avoid overwrite: ${localPath} -> ${newPath}`)
+      return { proceed: true, targetPath: newPath, requestedPath: localPath, strategy, existed: true, renamed: true }
+    }
+
+    case true:
+    case "overwrite":
+    case "ask":
+    default:
+      return { proceed: true, targetPath: localPath, requestedPath: localPath, strategy, existed: true }
+  }
+}
+
+function checkLocalDirectoryOverwrite(directoryPath: string, options: FolderTransferOptions | undefined): LocalOverwriteDecision {
+  return checkLocalOverwrite(directoryPath, options as FileTransferOptions | undefined)
+}
+
 /**
  * Upload a single file to remote server via SFTP streaming.
  * Uses streaming for large files - never loads entire file into memory.
@@ -376,8 +450,8 @@ export async function uploadFile(
   if (!checkResult.proceed) {
     return {
       success: true,
-      path: remotePath,
-      finalPath: remotePath,
+      path: targetRemotePath,
+      finalPath: targetRemotePath,
       requestedPath: remotePath,
       sourcePath: localPath,
       action: "skipped",
@@ -457,6 +531,10 @@ export async function uploadFile(
           overwritten: checkResult.existed && !checkResult.renamed && !checkResult.backupPath,
           renamed: checkResult.renamed,
           backupPath: checkResult.backupPath,
+          sourceBytes: totalSize,
+          bytesTransferred: transferred,
+          checksum: { algorithm: "sha256", source: await sha256File(localPath) },
+          verification: { sizeMatched: transferred === totalSize },
           size: totalSize,
           duration,
         })
@@ -552,6 +630,10 @@ async function uploadFileDirect(
             overwritten: transferMeta ? transferMeta.existed && !transferMeta.renamed && !transferMeta.backupPath : undefined,
             renamed: transferMeta?.renamed,
             backupPath: transferMeta?.backupPath,
+            sourceBytes: totalSize,
+            bytesTransferred: data.length,
+            checksum: { algorithm: "sha256", source: sha256Buffer(data as unknown as Buffer) },
+            verification: { sizeMatched: data.length === totalSize },
             size: totalSize,
             duration,
           }))
@@ -577,46 +659,28 @@ export async function downloadFile(
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
-  const targetLocalPath = resolveLocalFileTarget(remotePath, localPath)
+  const requestedLocalPath = resolveLocalFileTarget(remotePath, localPath)
+  const localDecision = checkLocalOverwrite(requestedLocalPath, options)
+  const targetLocalPath = localDecision.targetPath
 
   const dir = dirname(targetLocalPath)
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
   }
 
-  if (existsSync(targetLocalPath)) {
-    const strategy = options?.overwrite ?? "overwrite"
-    switch (strategy) {
-      case false:
-      case "skip":
-        log("transfer", `Skipping existing file: ${targetLocalPath}`)
-        return {
-          success: true,
-          path: targetLocalPath,
-          finalPath: targetLocalPath,
-          requestedPath: localPath,
-          sourcePath: remotePath,
-          action: "skipped",
-          targetType: "file",
-          overwriteStrategy: strategy,
-          skipped: true,
-          size: 0,
-          duration: Date.now() - startTime,
-        }
-      case "backup":
-        const backupPath = `${targetLocalPath}.bak`
-        log("transfer", `Backing up existing file: ${targetLocalPath} -> ${backupPath}`)
-        try {
-          if (existsSync(backupPath)) {
-            const { unlinkSync } = await import("fs")
-            unlinkSync(backupPath)
-          }
-          const { renameSync } = await import("fs")
-          renameSync(targetLocalPath, backupPath)
-        } catch (e) {
-          log("transfer", `Backup failed, skipping: ${(e as Error).message}`)
-        }
-        break
+  if (!localDecision.proceed) {
+    return {
+      success: true,
+      path: targetLocalPath,
+      finalPath: targetLocalPath,
+      requestedPath: localPath,
+      sourcePath: remotePath,
+      action: "skipped",
+      targetType: "file",
+      overwriteStrategy: localDecision.strategy,
+      skipped: true,
+      size: 0,
+      duration: Date.now() - startTime,
     }
   }
 
@@ -706,6 +770,14 @@ export async function downloadFile(
             action: "downloaded",
             targetType: "file",
             size: totalSize,
+            overwriteStrategy: localDecision.strategy,
+            overwritten: localDecision.existed && !localDecision.renamed && !localDecision.backupPath,
+            renamed: localDecision.renamed,
+            backupPath: localDecision.backupPath,
+            sourceBytes: totalSize,
+            bytesTransferred: data.length,
+            checksum: { algorithm: "sha256", destination: sha256Buffer(data as unknown as Buffer) },
+            verification: { sizeMatched: data.length === totalSize },
             duration,
           })
         }
@@ -756,6 +828,14 @@ export async function downloadFile(
           sourcePath: remotePath,
           action: "downloaded",
           targetType: "file",
+          overwriteStrategy: localDecision.strategy,
+          overwritten: localDecision.existed && !localDecision.renamed && !localDecision.backupPath,
+          renamed: localDecision.renamed,
+          backupPath: localDecision.backupPath,
+          sourceBytes: totalSize,
+          bytesTransferred: transferred,
+          checksum: { algorithm: "sha256", destination: await sha256File(targetLocalPath) },
+          verification: { sizeMatched: transferred === totalSize },
           size: totalSize,
           duration,
         })
@@ -830,6 +910,7 @@ export async function uploadFolder(
     )
 
     const localStat = statSync(tmpFile)
+    const archiveChecksum = await sha256File(tmpFile)
     log("transfer", `Compressed ${localPath} -> ${tmpFile} (${localStat.size} bytes)`)
 
     uploadResult = await uploadFile(client, tmpFile, remoteTmp, {
@@ -856,6 +937,10 @@ export async function uploadFolder(
       overwritten: targetDecision.existed && !targetDecision.renamed && !targetDecision.backupPath,
       renamed: targetDecision.renamed,
       backupPath: targetDecision.backupPath,
+      sourceBytes: localStat.size,
+      bytesTransferred: uploadResult.bytesTransferred ?? uploadResult.size,
+      checksum: { algorithm: "sha256", source: archiveChecksum },
+      verification: { sizeMatched: (uploadResult.bytesTransferred ?? uploadResult.size) === localStat.size },
       size: uploadResult.size,
       duration,
     }
@@ -908,12 +993,33 @@ export async function downloadFolder(
   const folderName = basename(remotePath)
   const remoteTmp = `/tmp/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
+  const requestedExtractPath = join(localPath, folderName)
+  let finalExtractPath = requestedExtractPath
   let downloadResult: TransferResult | null = null
+  let targetDecision: LocalOverwriteDecision | undefined
 
   try {
     const isDir = await remoteIsDir(client, remotePath)
     if (!isDir) {
       throw new Error(`Remote path is not a directory: ${remotePath}`)
+    }
+
+    targetDecision = checkLocalDirectoryOverwrite(requestedExtractPath, options)
+    finalExtractPath = targetDecision.targetPath
+    if (!targetDecision.proceed) {
+      return {
+        success: true,
+        path: localPath,
+        finalPath: finalExtractPath,
+        requestedPath: localPath,
+        sourcePath: remotePath,
+        action: "skipped",
+        targetType: "directory",
+        overwriteStrategy: targetDecision.strategy,
+        skipped: true,
+        size: 0,
+        duration: Date.now() - startTime,
+      }
     }
 
     const remoteParent = dirname(remotePath)
@@ -938,27 +1044,35 @@ export async function downloadFolder(
         : undefined,
       timeout,
     })
+    const archiveChecksum = await sha256File(tmpFile)
 
-    if (!existsSync(localPath)) {
-      mkdirSync(localPath, { recursive: true })
+    if (!existsSync(finalExtractPath)) {
+      mkdirSync(finalExtractPath, { recursive: true })
     }
     const { execSync } = await import("child_process")
     execSync(
-      `tar -xzf ${shellQuote(tmpFile)} -C ${shellQuote(localPath)}`,
+      `tar -xzf ${shellQuote(tmpFile)} -C ${shellQuote(finalExtractPath)} --strip-components=1`,
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
     const duration = Date.now() - startTime
-    log("transfer", `Folder download complete: ${remotePath} -> ${localPath} (${duration}ms)`)
+    log("transfer", `Folder download complete: ${remotePath} -> ${finalExtractPath} (${duration}ms)`)
     return {
       success: true,
       path: localPath,
-      finalPath: join(localPath, folderName),
+      finalPath: finalExtractPath,
       requestedPath: localPath,
       sourcePath: remotePath,
       action: "downloaded",
       targetType: "directory",
-      overwriteStrategy: options?.overwrite,
+      overwriteStrategy: targetDecision.strategy,
+      overwritten: targetDecision.existed && !targetDecision.renamed && !targetDecision.backupPath,
+      renamed: targetDecision.renamed,
+      backupPath: targetDecision.backupPath,
+      sourceBytes: remoteSize,
+      bytesTransferred: downloadResult.size,
+      checksum: { algorithm: "sha256", destination: archiveChecksum },
+      verification: { sizeMatched: downloadResult.size === remoteSize },
       size: downloadResult.size,
       duration,
     }
@@ -967,12 +1081,14 @@ export async function downloadFolder(
     return {
       success: false,
       path: localPath,
-      finalPath: join(localPath, folderName),
+      finalPath: finalExtractPath,
       requestedPath: localPath,
       sourcePath: remotePath,
       action: "failed",
       targetType: "directory",
-      overwriteStrategy: options?.overwrite,
+      overwriteStrategy: targetDecision?.strategy ?? options?.overwrite,
+      renamed: targetDecision?.renamed,
+      backupPath: targetDecision?.backupPath,
       size: downloadResult?.size ?? 0,
       duration: Date.now() - startTime,
       error: err.message,
