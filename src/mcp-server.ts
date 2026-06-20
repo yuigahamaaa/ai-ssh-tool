@@ -42,6 +42,21 @@ import {
 import { randomUUID } from "crypto"
 import { assertOctalMode, shellQuote } from "./shell-quote.js"
 import { remoteParentDir } from "./remote-path.js"
+import {
+  buildFindCommand,
+  buildGrepCommand,
+  buildListDirCommand,
+  buildReadFileContentCommand,
+  buildReadFileMetadataCommand,
+  buildStatCommand,
+  DEFAULT_READ_LINE_LIMIT,
+  MAX_READ_FILE_BYTES,
+  parseFindOutput,
+  parseGrepOutput,
+  parseListDirOutput,
+  parseReadFileMetadata,
+  parseStatOutput,
+} from "./remote-file-tools.js"
 
 interface HostConfig {
   host: string
@@ -432,16 +447,47 @@ async function main() {
     },
     wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `cat ${shellQuote(path)}`, { timeout: 30000 })
-      if (result.code !== 0) {
-	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error reading file: ${result.stderr}`)) }] }
+      const metadataResult = await remoteExec(client, buildReadFileMetadataCommand(path), { timeout: 10000 })
+      if (metadataResult.code !== 0) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error reading file metadata: ${metadataResult.stderr}`)) }] }
       }
-      const lines = result.stdout.split("\n")
+      const metadata = parseReadFileMetadata(metadataResult.stdout)
       const start = offset ?? 0
-      const end = limit ? start + limit : lines.length
-      const selected = lines.slice(start, end)
-      const output = selected.map((line, i) => `${start + i + 1}\t${line}`).join("\n")
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, offset: start, limit, content: output, raw: output })) }] }
+      const requestedLimit = limit ?? DEFAULT_READ_LINE_LIMIT
+
+      if (metadata.binaryDetected) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: jsonText(mcpEnvelope("file_result", {
+              path,
+              offset: start,
+              limit: requestedLimit,
+              content: "",
+              raw: "",
+              ...metadata,
+              truncated: false,
+            }, ["Binary file detected. Use ssh_download for lossless transfer instead of ssh_read_file or manual base64."])),
+          }],
+        }
+      }
+
+      const contentResult = await remoteExec(client, buildReadFileContentCommand(path, start, requestedLimit), { timeout: 30000 })
+      if (contentResult.code !== 0) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error reading file: ${contentResult.stderr}`)) }] }
+      }
+      const contentBytes = Buffer.byteLength(contentResult.stdout)
+      const cappedContent = contentBytes > MAX_READ_FILE_BYTES
+        ? contentResult.stdout.slice(0, MAX_READ_FILE_BYTES)
+        : contentResult.stdout
+      const lines = cappedContent.split("\n")
+      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+      const output = lines.map((line, i) => `${start + i + 1}\t${line}`).join("\n")
+      const truncated = start + lines.length < metadata.totalLines || contentBytes > MAX_READ_FILE_BYTES || metadata.sizeBytes > MAX_READ_FILE_BYTES
+      const guidance = truncated
+        ? ["Read result is partial. Increase offset/limit for another slice, or use ssh_download for the full file."]
+        : []
+      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, offset: start, limit: requestedLimit, content: output, raw: output, contentBytes: Math.min(contentBytes, MAX_READ_FILE_BYTES), maxContentBytes: MAX_READ_FILE_BYTES, ...metadata, truncated }, guidance)) }] }
     },
   ))
 
@@ -484,12 +530,11 @@ async function main() {
     },
     wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const flag = show_hidden ? "-la" : "-l"
-      const result = await remoteExec(client, `ls ${flag} ${shellQuote(path)}`, { timeout: 15000 })
+      const result = await remoteExec(client, buildListDirCommand(path, Boolean(show_hidden)), { timeout: 15000 })
       if (result.code !== 0) {
 	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr)) }] }
 	      }
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, raw: result.stdout })) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", parseListDirOutput(path, result.stdout))) }] }
     },
   ))
 
@@ -521,11 +566,11 @@ async function main() {
     },
     wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `stat ${shellQuote(path)}`, { timeout: 10000 })
+      const result = await remoteExec(client, buildStatCommand(path), { timeout: 10000 })
       if (result.code !== 0) {
 	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr)) }] }
 	      }
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, raw: result.stdout })) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { ...parseStatOutput(result.stdout), raw: result.stdout })) }] }
     },
   ))
 
@@ -543,12 +588,13 @@ async function main() {
     },
     wrapTool("ssh_grep", async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      let cmd = "grep -rn"
-      if (case_insensitive) cmd += "i"
-      if (glob) cmd += ` --include=${shellQuote(glob)}`
-      cmd += ` ${shellQuote(pattern)} ${shellQuote(path)}`
-      const result = await remoteExec(client, cmd, { timeout: 15000 })
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { pattern, path, glob, raw: result.stdout || result.stderr || "", noMatches: !result.stdout })) }] }
+      const result = await remoteExec(client, buildGrepCommand({ pattern, path, glob, caseInsensitive: Boolean(case_insensitive) }), { timeout: 15000 })
+      const raw = result.stdout || ""
+      const parsed = parseGrepOutput(raw)
+      if (result.code > 1) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr || raw)) }] }
+      }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { pattern, path, glob, caseInsensitive: Boolean(case_insensitive), ...parsed })) }] }
     },
   ))
 
@@ -566,12 +612,11 @@ async function main() {
     },
     wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      let cmd = `find ${shellQuote(path)}`
-      if (max_depth) cmd += ` -maxdepth ${max_depth}`
-      if (type) cmd += ` -type ${type}`
-      if (name) cmd += ` -name ${shellQuote(name)}`
-      const result = await remoteExec(client, cmd, { timeout: 15000 })
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, name, type, maxDepth: max_depth, raw: result.stdout || result.stderr || "", noResults: !result.stdout })) }] }
+      const result = await remoteExec(client, buildFindCommand({ path, name, type, maxDepth: max_depth }), { timeout: 15000 })
+      if (result.code !== 0) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr)) }] }
+      }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, name, type, maxDepth: max_depth, ...parseFindOutput(result.stdout) })) }] }
     },
   ))
 
