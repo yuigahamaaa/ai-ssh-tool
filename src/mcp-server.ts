@@ -29,13 +29,14 @@ import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
-import type { AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
+import type { AgentIdentity, CwdSource, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
 import { createMcpScheduleRequest, profileToLegacyConfigJson } from "./mcp-scheduler-contract.js"
 import {
   guidanceForTaskStatus,
   guidanceForTransferResult,
   guidanceForWaitResult,
   jsonText,
+  makeCwdState,
   mcpEnvelope,
   mcpErrorEnvelope,
   scheduleDecisionEnvelope,
@@ -330,7 +331,24 @@ async function main() {
   }
 
   function formatScheduleDecisionForAgent(decision: ScheduleDecision): string {
-    return jsonText(scheduleDecisionEnvelope(decision))
+    return jsonText(scheduleDecisionEnvelope(withDecisionCwdState(decision)))
+  }
+
+  function buildCwdState(params: { effectiveCwd?: string; virtualCwd?: string; source?: CwdSource }) {
+    return makeCwdState(params)
+  }
+
+  function withDecisionCwdState(decision: ScheduleDecision): ScheduleDecision {
+    const source = decision.cwdState?.source ?? (decision.effectiveCwd ? "virtual" : "none")
+    const virtualCwd = decision.cwdState?.virtualCwd ?? (source === "virtual" ? decision.effectiveCwd ?? null : null)
+    return {
+      ...decision,
+      cwdState: buildCwdState({
+        effectiveCwd: decision.effectiveCwd,
+        virtualCwd: virtualCwd ?? undefined,
+        source,
+      }),
+    }
   }
 
   async function getProfileForScheduler(
@@ -385,7 +403,7 @@ async function main() {
   // --- Remote execution ---
   server.tool(
     "ssh_exec",
-    "Execute a shell command on the remote server via the shared scheduler. Default behavior: scripts, tests, builds, installs, and unknown medium+ commands are serial on the same host and may queue. If action=queued, do not rerun; use taskId with ssh_wait_task/ssh_queue_status and do unrelated work. If result.truncated=true, returned output is only a tail; read stdoutPath/stderrPath for full logs. Only use if_busy=run_anyway or scheduler=bypass when you are certain concurrency is safe.",
+    "Execute a finite shell command on the remote server via the shared scheduler and wait for its result. Use this for quick inspections and commands expected to finish soon. Prefer ssh_exec_background for servers, watch mode, tail -f, log streams, and other long-running commands. Prefer ssh_schedule for heavy work you want to queue and revisit later. If action=queued or waitTimedOut=true, do not rerun; use taskId with ssh_wait_task/ssh_exec_status/ssh_queue_status.",
     {
       command: z.string().describe("Shell command to execute"),
       cwd: z.string().optional().describe("Working directory"),
@@ -429,7 +447,7 @@ async function main() {
   // --- File operations ---
   server.tool(
     "ssh_read_file",
-    "Read a file from the remote server. Returns file content as text.",
+    "Read a remote text file through the structured file API. Prefer this over ssh_exec cat/sed/head for normal text reads; it returns metadata, line-numbered content, truncation flags, and binary detection. Use ssh_download for binary or full lossless file transfer.",
     {
       path: z.string().describe("File path on remote server"),
       offset: z.number().optional().describe("Start line (0-based)"),
@@ -447,7 +465,7 @@ async function main() {
 
   server.tool(
     "ssh_write_file",
-    "Write content to a file on the remote server. Creates parent directories if needed.",
+    "Write text content to a remote file through the structured file API. Prefer this over ssh_exec with echo/cat/base64 for normal text writes; it creates parent directories and returns structured file metadata. Use ssh_upload for large, binary, or exact local-file transfer.",
     {
       path: z.string().describe("File path on remote server"),
       content: z.string().describe("Content to write"),
@@ -630,7 +648,7 @@ async function main() {
   // --- Background execution ---
   server.tool(
     "ssh_exec_background",
-    "Start a command in the background on the remote server. It is registered in the shared scheduler and subject to the same serial/queuing rules as ssh_exec. Use ssh_exec_status with the returned taskId; do not start duplicate background jobs if action=queued.",
+    "Start a long-running command in the background on the remote server and return a taskId immediately. Prefer this first for servers, watch mode, tail -f, log streams, long builds, migrations, and commands that should keep running while you continue other work. Use ssh_exec_status with the returned taskId; do not start duplicate background jobs if action=queued.",
     {
       command: z.string().describe("Command to execute in background"),
       cwd: z.string().optional().describe("Working directory"),
@@ -654,9 +672,9 @@ async function main() {
 
   server.tool(
     "ssh_exec_status",
-    "Get exact status and output for a scheduler task. Default mode returns a bounded tail plus stdoutPath/stderrPath metadata; use mode=full only when you truly need the full output inline.",
+    "Get exact status and output for any scheduler taskId from ssh_exec, ssh_exec_background, ssh_schedule, or ssh_wait_task. Default mode returns a bounded tail plus stdoutPath/stderrPath metadata; use mode=full only when you truly need the full output inline.",
     {
-      task_id: z.string().describe("Task ID from exec_background"),
+      task_id: z.string().describe("Task ID from ssh_exec, ssh_exec_background, ssh_schedule, or ssh_wait_task"),
       mode: z.enum(["tail", "full"]).optional().describe("Output mode: tail (default) or full"),
     },
     wrapTool("ssh_exec_status", async ({ task_id, mode }) => {
@@ -674,6 +692,11 @@ async function main() {
       const result = {
         task: statusResp.data as any,
         output: outputResp.data as any,
+        cwdState: buildCwdState({
+          effectiveCwd: (statusResp.data as any).effectiveCwd,
+          virtualCwd: (statusResp.data as any).cwdSource === "virtual" ? (statusResp.data as any).effectiveCwd : undefined,
+          source: (statusResp.data as any).cwdSource ?? "none",
+        }),
       }
       return {
         content: [{
@@ -975,9 +998,9 @@ async function main() {
 
   server.tool(
     "ssh_cd",
-    "Set a virtual working directory for this AI session on the target host. This is NOT a persistent remote shell cd: it only stores cwd for agentId+hostId and is applied to later ssh_exec/ssh_schedule calls that omit cwd. It does not affect other AI agents or shared SSH sessions.",
+    "Set the default cwd for this AI session on the target host. Later ssh_exec/ssh_schedule calls use it when cwd is omitted. It does not affect other AI agents or shared SSH sessions.",
     {
-      path: z.string().describe("Directory path to store as this AI session's virtual cwd"),
+      path: z.string().describe("Directory path to store as this AI session's default cwd"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
@@ -1010,7 +1033,54 @@ async function main() {
           text: jsonText(mcpEnvelope("cwd_result", {
             success: true,
             cwd: data.cwd,
-            message: "已设置当前 AI 会话在该 host 上的虚拟 cwd；这不是远端 shell 的持久 cd，不会影响其他 AI 或共享 SSH 会话。",
+            cwdState: buildCwdState({ effectiveCwd: data.cwd, virtualCwd: data.cwd, source: "virtual" }),
+            message: "已设置当前 AI 会话在该 host 上的默认 cwd；后续未显式传 cwd 的命令会使用它。",
+          })),
+        }],
+      }
+    },
+  ))
+
+  server.tool(
+    "ssh_get_cwd",
+    "Show the default cwd for this AI session on the target host.",
+    {
+      profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
+      profile_json: z.string().optional().describe("JSON string of SSH profile"),
+      profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
+    },
+    wrapTool("ssh_get_cwd", async ({ profile_name, profile_json, profile_file }) => {
+      const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
+      await daemonClient.ensureDaemon()
+      const configJson = profileToLegacyConfigJson(profile)
+      const connectResp = await daemonClient.connectHostJson(configJson)
+      if (!connectResp.ok) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
+      }
+      const { sessionId, configHash } = connectResp.data as any
+      const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
+      const hostIdentity: HostIdentity = {
+        id: configHash ?? sessionId.slice(0, 16),
+        profileKey: configHash ?? sessionId.slice(0, 16),
+        targetHost: profile.chain[profile.chain.length - 1].host,
+        targetUser: profile.chain[profile.chain.length - 1].auth.username,
+        displayName: profile.name,
+      }
+      const resp = await daemonClient.getCwd(agentIdentity, hostIdentity)
+      if (!resp.ok) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", (resp as any).error)) }] }
+      }
+      const data = resp.data as any
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("cwd_result", {
+            ...data,
+            cwdState: buildCwdState({
+              effectiveCwd: data.virtualCwd ?? undefined,
+              virtualCwd: data.virtualCwd ?? undefined,
+              source: data.virtualCwd ? "virtual" : "none",
+            }),
           })),
         }],
       }
@@ -1020,7 +1090,7 @@ async function main() {
   // --- Scheduler tools ---
   server.tool(
     "ssh_schedule",
-    "Submit a command to the shared VM scheduler. Heavy commands (tests, builds, installs, scripts) default to serial and may queue behind running heavy work. If queued, keep the taskId and do other useful work; later call ssh_wait_task or ssh_queue_status. Use if_busy=run_anyway only for truly independent work.",
+    "Submit work to the shared VM scheduler and return quickly with a taskId/queue decision. Prefer this over ssh_exec for heavy tests, builds, installs, scripts, deploys, migrations, or any task you can revisit later. If queued, keep the taskId and do useful independent work; later call ssh_wait_task, ssh_exec_status, or ssh_queue_status. Use if_busy=run_anyway only for truly independent work.",
     {
       command: z.string().describe("Command to execute"),
       cwd: z.string().optional().describe("Working directory"),
@@ -1073,7 +1143,14 @@ async function main() {
       return {
         content: [{
           type: "text" as const,
-          text: jsonText(mcpEnvelope("queue_status", resp.data, [
+          text: jsonText(mcpEnvelope("queue_status", {
+            ...(resp.data as any),
+            cwdState: buildCwdState({
+              effectiveCwd: (resp.data as any).virtualCwd ?? undefined,
+              virtualCwd: (resp.data as any).virtualCwd ?? undefined,
+              source: (resp.data as any).virtualCwd ? "virtual" : "none",
+            }),
+          }, [
             "Use running/queued/recent to decide whether to wait, queue, or run independent read-only work. Do not duplicate queued taskIds.",
           ])),
         }],
@@ -1101,7 +1178,16 @@ async function main() {
         const outputResp = await daemonClient.getTaskOutput(task_id, "tail")
         if (outputResp.ok) output = outputResp.data
       }
-      const data = { task, output, waitTimedOut }
+      const data = {
+        task,
+        output,
+        waitTimedOut,
+        cwdState: buildCwdState({
+          effectiveCwd: task.effectiveCwd,
+          virtualCwd: task.cwdSource === "virtual" ? task.effectiveCwd : undefined,
+          source: task.cwdSource ?? "none",
+        }),
+      }
       return {
         content: [{
           type: "text" as const,

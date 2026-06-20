@@ -14,6 +14,14 @@ export type TaskCost = "tiny" | "small" | "medium" | "large" | "exclusive"
 
 export type TaskUrgency = "low" | "normal" | "high" | "urgent"
 
+export type CwdSource = "explicit" | "virtual" | "none"
+
+export interface CwdState {
+  effectiveCwd: string | null
+  virtualCwd: string | null
+  source: CwdSource
+}
+
 export type ScheduledTaskStatus =
   | "queued"
   | "running"
@@ -75,6 +83,7 @@ export interface ScheduledTask {
   sessionId: string
   command: string
   effectiveCwd?: string
+  cwdSource?: CwdSource
   reason?: string
   classification: CommandClassification
   scheduler: "auto" | "bypass"
@@ -126,6 +135,7 @@ export interface ScheduleDecision {
   taskId?: string
   queuePosition?: number
   effectiveCwd?: string
+  cwdState?: CwdState
   classification?: CommandClassification
   blockers?: ScheduledTaskSummary[]
   reason: string
@@ -206,6 +216,7 @@ export interface SchedulerServiceInterface {
   cancelTask(taskId: string): boolean
   abortActiveTasks(reason: string): { cancelled: number; cancelFailed: number }
   setCwd(agentId: string, hostId: string, cwd: string): string
+  getCwdState(agentId: string, hostId: string): VirtualCwdState | undefined
   resolveCwd(agentId: string, hostId: string, explicitCwd?: string): string | undefined
 }
 

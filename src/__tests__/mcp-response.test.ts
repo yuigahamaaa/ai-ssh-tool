@@ -1,9 +1,11 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import {
+  guidanceForScheduleDecision,
   guidanceForTaskStatus,
   guidanceForTransferResult,
   guidanceForWaitResult,
+  makeCwdState,
   mcpEnvelope,
   scheduleDecisionEnvelope,
 } from "../mcp-response.js"
@@ -78,20 +80,43 @@ describe("MCP response envelopes", () => {
   })
 
   it("adds truncation guidance for completed task status", () => {
-    const t = task({ status: "completed" })
+    const t = task({ status: "completed", cwdSource: "virtual" })
     const o = output({ truncated: true, stdoutTruncated: true })
 
     const guidance = guidanceForTaskStatus(t, o)
 
     assert.ok(guidance.some(g => g.includes("Task completed")))
     assert.ok(guidance.some(g => g.includes("Output is truncated inline")))
+    assert.ok(guidance.some(g => g.includes("ssh_get_cwd")))
   })
 
   it("marks wait timeout as a non-rerun situation", () => {
-    const guidance = guidanceForWaitResult(task({ status: "running" }), true)
+    const guidance = guidanceForWaitResult(task({ status: "running", command: "npm run dev" }), true)
 
-    assert.equal(guidance.length, 1)
-    assert.ok(guidance[0].includes("Do not rerun"))
+    assert.ok(guidance.some(g => g.includes("Do not rerun")))
+    assert.ok(guidance.some(g => g.includes("ssh_exec_background")))
+    assert.ok(guidance.some(g => g.includes("ssh_exec_status")))
+  })
+
+  it("suggests background execution when foreground wait times out on long-running commands", () => {
+    const guidance = guidanceForScheduleDecision({
+      action: "run_now",
+      taskId: "t_1",
+      waitTimedOut: true,
+      reason: "foreground wait timed out",
+      classification: {
+        intent: "server",
+        cost: "large",
+        blocking: true,
+        mutates: false,
+        risky: false,
+        source: "agent",
+        reason: "dev server",
+      },
+    })
+
+    assert.ok(guidance.some(g => g.includes("ssh_exec_status")))
+    assert.ok(guidance.some(g => g.includes("ssh_exec_background")))
   })
 
   it("wraps auxiliary tool data with ok/kind/data/agentGuidance", () => {
@@ -126,5 +151,44 @@ describe("MCP response envelopes", () => {
     assert.ok(guidance.some(g => g.includes("sha256 checksum: abc123")))
     assert.ok(guidance.some(g => g.includes("binary-safe")))
     assert.ok(guidance.some(g => g.includes("do not use shell/base64")))
+  })
+
+  it("builds cwdState for explicit cwd", () => {
+    assert.deepEqual(
+      makeCwdState({ effectiveCwd: "/tmp", virtualCwd: "/repo", source: "explicit" }),
+      {
+        effectiveCwd: "/tmp",
+        virtualCwd: "/repo",
+        source: "explicit",
+      },
+    )
+  })
+
+  it("builds cwdState for unset cwd", () => {
+    assert.deepEqual(
+      makeCwdState({ effectiveCwd: undefined, virtualCwd: undefined, source: "none" }),
+      {
+        effectiveCwd: null,
+        virtualCwd: null,
+        source: "none",
+      },
+    )
+  })
+
+  it("adds cwd guidance when a virtual cwd was used", () => {
+    const guidance = guidanceForScheduleDecision({
+      action: "run_now",
+      taskId: "t_1",
+      effectiveCwd: "/repo",
+      cwdState: {
+        effectiveCwd: "/repo",
+        virtualCwd: "/repo",
+        source: "virtual",
+      },
+      reason: "started",
+    } as ScheduleDecision)
+
+    assert.ok(guidance.some(g => g.includes("default cwd")))
+    assert.ok(guidance.some(g => g.includes("ssh_get_cwd")))
   })
 })

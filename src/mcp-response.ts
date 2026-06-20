@@ -1,4 +1,4 @@
-import type { ScheduleDecision, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
+import type { CwdSource, CwdState, ScheduleDecision, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
 
 export type McpResponseKind =
   | "schedule_decision"
@@ -66,6 +66,28 @@ export interface TransferGuidancePayload {
   error?: string
 }
 
+export interface CwdStateInput {
+  effectiveCwd?: string
+  virtualCwd?: string
+  source?: CwdSource
+}
+
+export function makeCwdState(input: CwdStateInput): CwdState {
+  return {
+    effectiveCwd: input.effectiveCwd ?? null,
+    virtualCwd: input.virtualCwd ?? null,
+    source: input.source ?? "none",
+  }
+}
+
+function looksLongRunning(taskLike: { command?: string; classification?: { intent?: string } }): boolean {
+  const command = taskLike.command ?? ""
+  if (taskLike.classification?.intent === "server") return true
+  return /\b(npm|pnpm|yarn|bun)\s+run\s+(dev|start|serve|watch)\b/.test(command)
+    || /\b(vite|next\s+dev|webpack-dev-server|nodemon|pm2|forever)\b/.test(command)
+    || /\b(tail\s+-f|journalctl\s+-f|docker\s+logs\s+-f)\b/.test(command)
+}
+
 export function guidanceForScheduleDecision(decision: ScheduleDecision): string[] {
   const guidance: string[] = []
 
@@ -73,6 +95,9 @@ export function guidanceForScheduleDecision(decision: ScheduleDecision): string[
     guidance.push("Task was queued. Do not immediately resubmit the same command. Continue unrelated read/search/planning work, then call ssh_queue_status or ssh_wait_task with this taskId.")
   } else if (decision.waitTimedOut) {
     guidance.push("The foreground wait timed out but the task is still registered. Use ssh_exec_status with taskId to check status/output instead of rerunning the command.")
+    if (looksLongRunning(decision)) {
+      guidance.push("This looks like a long-running server/watch/log command. For future runs, start it with ssh_exec_background first, then monitor it with ssh_exec_status.")
+    }
   } else if (decision.action === "wait_recommended") {
     guidance.push("A conflicting task is running. Prefer waiting for a blocker or doing unrelated work before retrying.")
   } else if (decision.action === "needs_confirmation") {
@@ -84,6 +109,10 @@ export function guidanceForScheduleDecision(decision: ScheduleDecision): string[
   const result = decision.result
   if (result?.truncated) {
     guidance.push(`Returned stdout/stderr are tails only. Read full output from stdoutPath=${result.stdoutPath} and stderrPath=${result.stderrPath}, or call ssh_exec_status with mode=full when this task is still tracked.`)
+  }
+
+  if (decision.cwdState?.source === "virtual") {
+    guidance.push("Command used this AI session's default cwd. If unsure, call ssh_get_cwd or pass cwd explicitly.")
   }
 
   return guidance
@@ -108,14 +137,22 @@ export function guidanceForTaskStatus(task: ScheduledTask, output?: TaskOutputRe
     guidance.push(`Output is truncated inline. Read stdoutPath=${output.stdoutPath} and stderrPath=${output.stderrPath} for full logs.`)
   }
 
+  if (task.cwdSource === "virtual") {
+    guidance.push("This task is using this AI session's default cwd. If unsure, call ssh_get_cwd or pass cwd explicitly.")
+  }
+
   return guidance
 }
 
 export function guidanceForWaitResult(task: ScheduledTask, waitTimedOut: boolean, output?: TaskOutputResult): string[] {
   if (waitTimedOut) {
-    return [
+    const guidance = [
       "Wait timed out, but the task is still registered. Do not rerun the command; call ssh_exec_status or ssh_wait_task again with the same taskId.",
     ]
+    if (looksLongRunning(task)) {
+      guidance.push("This looks like a long-running server/watch/log command. For future runs, start it with ssh_exec_background first, then monitor it with ssh_exec_status.")
+    }
+    return guidance
   }
   return guidanceForTaskStatus(task, output)
 }

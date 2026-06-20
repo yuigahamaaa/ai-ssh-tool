@@ -274,6 +274,19 @@ describe("SchedulerService", () => {
     scheduler.setCwd("agent-a", "host-1", "/repo")
     const d = scheduler.schedule(makeRequest({ agent: makeAgent("agent-a"), host: makeHost("host-1") }))
     assert.equal(d.effectiveCwd, "/repo")
+    assert.equal(scheduler.getTask(d.taskId!)?.cwdSource, "virtual")
+  })
+
+  it("schedule persists explicit cwd source on the task", () => {
+    const d = scheduler.schedule(makeRequest({ cwd: "/tmp" }))
+    assert.equal(d.effectiveCwd, "/tmp")
+    assert.equal(scheduler.getTask(d.taskId!)?.cwdSource, "explicit")
+  })
+
+  it("schedule persists none cwd source when no cwd applies", () => {
+    const d = scheduler.schedule(makeRequest({ agent: makeAgent("agent-none"), host: makeHost("host-none") }))
+    assert.equal(d.effectiveCwd, undefined)
+    assert.equal(scheduler.getTask(d.taskId!)?.cwdSource, "none")
   })
 
   it("schedule includes classification", () => {

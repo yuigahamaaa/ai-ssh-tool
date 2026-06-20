@@ -534,6 +534,10 @@ export class SSHDaemon {
         resp = this.handleSetCwd(req as any)
         break
 
+      case "getCwd":
+        resp = this.handleGetCwd(req as any)
+        break
+
       case "cancelTask":
         resp = this.handleCancelTask(req as any)
         break
@@ -824,6 +828,26 @@ export class SSHDaemon {
     try {
       const cwd = this.scheduler.setCwd(req.params.agent.id, req.params.host.id, req.params.cwd)
       return { id: req.id, ok: true, data: { success: true, cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" } }
+    } catch (err: any) {
+      return { id: req.id, ok: false, error: err.message }
+    }
+  }
+
+  private handleGetCwd(req: { id: string; params: { agent: AgentIdentity; host: HostIdentity } }): IPCResponse {
+    try {
+      const state = this.scheduler.getCwdState(req.params.agent.id, req.params.host.id)
+      return {
+        id: req.id,
+        ok: true,
+        data: {
+          hostId: req.params.host.id,
+          profileName: req.params.host.displayName,
+          targetHost: req.params.host.targetHost,
+          targetUser: req.params.host.targetUser,
+          virtualCwd: state?.cwd ?? null,
+          updatedAt: state?.updatedAt ?? null,
+        },
+      }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
     }

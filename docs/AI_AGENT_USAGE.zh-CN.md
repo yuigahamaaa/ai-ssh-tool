@@ -177,7 +177,7 @@
 
 ## 虚拟工作目录
 
-`ssh_cd` 不是远端 shell 的持久 `cd`。它只是在调度器里按 `AI agent + host` 保存一个虚拟 cwd；后续未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会自动使用这个目录。
+`ssh_cd` 不是远端 shell 的持久 `cd`。它会在调度器里按 `AI agent + host` 保存默认 cwd；后续未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会自动使用这个目录。
 
 设置当前 AI 会话在某个 host 上的默认目录：
 
@@ -193,6 +193,12 @@
 
 这个 cwd 按 `AI agent + host` 隔离，不影响其他 AI，也不会改变共享 SSH 会话的真实 shell 状态。
 
+如果不确定当前默认目录，先调用 `ssh_get_cwd`。同时，执行相关返回会带 `cwdState`，其中：
+
+- `effectiveCwd`：本次命令实际运行目录
+- `virtualCwd`：当前 AI 会话在该 host 上保存的默认目录
+- `source`：cwd 来源是 `explicit`、`virtual` 或 `none`
+
 ## 常见错误
 
 | 错误做法 | 正确做法 |
@@ -202,12 +208,18 @@
 | 日志 tail 不够就重跑测试 | 读取 `stdoutPath` / `stderrPath` |
 | 为了快给测试加 bypass | 默认排队；确认独立才 `run_anyway` |
 | 多次调用里依赖 `cd` 状态 | 用 `ssh_cd` 或显式 `cwd` |
+| 服务/watch/log 命令先用前台跑到超时 | 一开始用 `ssh_exec_background`，再用 `ssh_exec_status` |
+| 普通读写文件用 shell cat/echo/base64 | 用 `ssh_read_file` / `ssh_write_file`，完整或二进制文件用传输工具 |
 
 ## 快速判断表
 
 | 命令类型 | 建议 |
 |---|---|
-| `pwd`, `ls`, `cat`, `rg`, `git status` | 直接 `ssh_exec` |
+| `pwd`, `ls`, `rg`, `git status` | 直接 `ssh_exec` |
+| 读取/写入文本文件 | `ssh_read_file` / `ssh_write_file` |
+| 完整文件、大文件、二进制、压缩包 | `ssh_upload` / `ssh_download` |
+| `npm run dev`, `tail -f`, watch/server/log stream | `ssh_exec_background` + `ssh_exec_status` |
+| 测试、构建、安装、迁移、部署且可以稍后看结果 | `ssh_schedule` + `ssh_wait_task` / `ssh_exec_status` |
 | `npm test`, `pytest`, `go test`, `cargo test` | `intent="test"`, 默认串行 |
 | `npm run build`, `make`, `cargo build` | `intent="build"`, 默认串行 |
 | `npm install`, `pip install`, `apt install` | `intent="install"`, 默认串行 |
