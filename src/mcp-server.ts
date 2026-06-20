@@ -40,6 +40,8 @@ import {
   scheduleDecisionEnvelope,
 } from "./mcp-response.js"
 import { randomUUID } from "crypto"
+import { assertOctalMode, shellQuote } from "./shell-quote.js"
+import { remoteParentDir } from "./remote-path.js"
 
 interface HostConfig {
   host: string
@@ -231,12 +233,12 @@ async function main() {
         const err = e as Error
         const detail = (err.stack ?? err.message).split("\n").slice(0, 4).join("\n")
         log("mcp", `Tool ${name} threw: ${err.message}\n${detail}`)
-        return {
-          content: [{
-            type: "text" as const,
-            text: `[${name}] ${err.message}`,
-          }],
-        } as Ret
+	        return {
+	          content: [{
+	            type: "text" as const,
+	            text: jsonText(mcpErrorEnvelope("error", err.message, [`Tool ${name} failed. Inspect the error before retrying or changing parameters.`])),
+	          }],
+	        } as Ret
       }
     }
   }
@@ -382,8 +384,8 @@ async function main() {
       timeout: z.number().optional().describe("Timeout in ms (default: 30000)"),
       scheduler: z.enum(["auto", "bypass"]).optional().describe("Scheduler mode: auto (default, through scheduler) or bypass (skip queue, still registered)"),
       reason: z.string().optional().describe("Why you are running this command (for other AI agents to see)"),
-      intent: z.string().optional().describe("Command intent: inspect, search, test, build, install, server, deploy, migration, cleanup, custom"),
-      cost: z.string().optional().describe("Estimated cost: tiny, small, medium, large, exclusive"),
+	      intent: z.enum(["inspect", "search", "test", "build", "install", "server", "deploy", "migration", "cleanup", "custom"]).optional().describe("Command intent"),
+	      cost: z.enum(["tiny", "small", "medium", "large", "exclusive"]).optional().describe("Estimated cost"),
       urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency level"),
       if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("When host is busy: queue (default for heavy), wait, fail, or run_anyway to bypass serial queue -- only use run_anyway when tasks are truly independent"),
       force: z.boolean().optional().describe("Force execution of risky commands"),
@@ -430,16 +432,16 @@ async function main() {
     },
     wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `cat ${JSON.stringify(path)}`, { timeout: 30000 })
+      const result = await remoteExec(client, `cat ${shellQuote(path)}`, { timeout: 30000 })
       if (result.code !== 0) {
-        return { content: [{ type: "text" as const, text: `Error reading file: ${result.stderr}` }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error reading file: ${result.stderr}`)) }] }
       }
       const lines = result.stdout.split("\n")
       const start = offset ?? 0
       const end = limit ? start + limit : lines.length
       const selected = lines.slice(start, end)
       const output = selected.map((line, i) => `${start + i + 1}\t${line}`).join("\n")
-      return { content: [{ type: "text" as const, text: output }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, offset: start, limit, content: output, raw: output })) }] }
     },
   ))
 
@@ -456,17 +458,17 @@ async function main() {
     },
     wrapTool("ssh_write_file", async ({ path, content, mode, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const dirCmd = `mkdir -p ${JSON.stringify(path.replace(/\/[^\/]*$/, ""))}`
+      const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
       await remoteExec(client, dirCmd, { timeout: 10000 })
       const b64 = Buffer.from(content).toString("base64")
       const writeCmd = mode
-        ? `echo ${b64} | base64 -d > ${JSON.stringify(path)} && chmod ${mode} ${JSON.stringify(path)}`
-        : `echo ${b64} | base64 -d > ${JSON.stringify(path)}`
+        ? `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)} && chmod ${assertOctalMode(mode)} ${shellQuote(path)}`
+        : `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)}`
       const result = await remoteExec(client, writeCmd, { timeout: 30000 })
       if (result.code !== 0) {
-        return { content: [{ type: "text" as const, text: `Error writing file: ${result.stderr}` }] }
-      }
-      return { content: [{ type: "text" as const, text: `Written ${content.length} bytes to ${path}` }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error writing file: ${result.stderr}`)) }] }
+	      }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, bytes: Buffer.byteLength(content), mode, message: `Written ${content.length} bytes to ${path}` })) }] }
     },
   ))
 
@@ -483,11 +485,11 @@ async function main() {
     wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       const flag = show_hidden ? "-la" : "-l"
-      const result = await remoteExec(client, `ls ${flag} ${JSON.stringify(path)}`, { timeout: 15000 })
+      const result = await remoteExec(client, `ls ${flag} ${shellQuote(path)}`, { timeout: 15000 })
       if (result.code !== 0) {
-        return { content: [{ type: "text" as const, text: `Error: ${result.stderr}` }] }
-      }
-      return { content: [{ type: "text" as const, text: result.stdout }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr)) }] }
+	      }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, raw: result.stdout })) }] }
     },
   ))
 
@@ -502,8 +504,9 @@ async function main() {
     },
     wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `test -e ${JSON.stringify(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
-      return { content: [{ type: "text" as const, text: result.stdout.trim() }] }
+      const result = await remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
+	      const exists = result.stdout.trim() === "exists"
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, exists, raw: result.stdout.trim() })) }] }
     },
   ))
 
@@ -518,11 +521,11 @@ async function main() {
     },
     wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `stat ${JSON.stringify(path)}`, { timeout: 10000 })
+      const result = await remoteExec(client, `stat ${shellQuote(path)}`, { timeout: 10000 })
       if (result.code !== 0) {
-        return { content: [{ type: "text" as const, text: `Error: ${result.stderr}` }] }
-      }
-      return { content: [{ type: "text" as const, text: result.stdout }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", result.stderr)) }] }
+	      }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, raw: result.stdout })) }] }
     },
   ))
 
@@ -542,10 +545,10 @@ async function main() {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
       let cmd = "grep -rn"
       if (case_insensitive) cmd += "i"
-      if (glob) cmd += ` --include=${JSON.stringify(glob)}`
-      cmd += ` ${JSON.stringify(pattern)} ${JSON.stringify(path)}`
+      if (glob) cmd += ` --include=${shellQuote(glob)}`
+      cmd += ` ${shellQuote(pattern)} ${shellQuote(path)}`
       const result = await remoteExec(client, cmd, { timeout: 15000 })
-      return { content: [{ type: "text" as const, text: result.stdout || result.stderr || "(no matches)" }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { pattern, path, glob, raw: result.stdout || result.stderr || "", noMatches: !result.stdout })) }] }
     },
   ))
 
@@ -563,27 +566,27 @@ async function main() {
     },
     wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
       const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      let cmd = `find ${JSON.stringify(path)}`
+      let cmd = `find ${shellQuote(path)}`
       if (max_depth) cmd += ` -maxdepth ${max_depth}`
       if (type) cmd += ` -type ${type}`
-      if (name) cmd += ` -name ${JSON.stringify(name)}`
+      if (name) cmd += ` -name ${shellQuote(name)}`
       const result = await remoteExec(client, cmd, { timeout: 15000 })
-      return { content: [{ type: "text" as const, text: result.stdout || result.stderr || "(no results)" }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, name, type, maxDepth: max_depth, raw: result.stdout || result.stderr || "", noResults: !result.stdout })) }] }
     },
   ))
 
   // --- File transfer ---
   server.tool(
     "ssh_upload",
-    "Upload a local file or folder to the remote server. Automatically detects file/folder type.",
+    "Upload a local file or folder to the remote server. Automatically detects file/folder type. For files, remote_path may be either a full destination file path or an existing/explicit directory path ending with '/'; directory targets use the local basename. Default overwrite strategy is overwrite. Do not set line_ending or encoding for binary files.",
     {
       local_path: z.string().describe("Local file/folder path to upload"),
-      remote_path: z.string().describe("Destination path on remote server"),
+      remote_path: z.string().describe("Destination path on remote server. For file uploads, pass '/dir/name.ext' for an exact filename or '/dir/' to keep the local filename."),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
       overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
-      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion)"),
-      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("File encoding: auto, utf8, gbk, latin1. Converts between encodings during transfer."),
+      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
@@ -597,21 +600,30 @@ async function main() {
         lineEnding: line_ending as any,
         encoding: encoding as any,
       })
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("transfer_result", result, [
+            result.success
+              ? `Upload completed. Final remote path: ${result.path}.`
+              : `Upload failed: ${result.error ?? "unknown error"}. Do not retry with manual base64 unless the user explicitly asks; inspect the error and adjust paths/options first.`,
+          ])),
+        }],
+      }
     },
   ))
 
   server.tool(
     "ssh_download",
-    "Download a remote file or folder to the local machine. Automatically detects file/folder type.",
+    "Download a remote file or folder to the local machine. Automatically detects file/folder type. For files, local_path may be either a full destination file path or an existing/explicit directory path ending with the local path separator; directory targets use the remote basename. For folders, local_path is the destination parent/extract directory. Default overwrite strategy is overwrite. Do not set line_ending or encoding for binary files.",
     {
       remote_path: z.string().describe("Remote file/folder path to download"),
-      local_path: z.string().describe("Local destination path"),
+      local_path: z.string().describe("Local destination path. For file downloads, pass an exact local file path or an existing directory to keep the remote filename; for folder downloads this is the extract directory."),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
       overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
-      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion)"),
-      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("File encoding: auto, utf8, gbk, latin1. Converts between encodings during transfer."),
+      line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
@@ -625,7 +637,16 @@ async function main() {
         lineEnding: line_ending as any,
         encoding: encoding as any,
       })
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] }
+      return {
+        content: [{
+          type: "text" as const,
+          text: jsonText(mcpEnvelope("transfer_result", result, [
+            result.success
+              ? `Download completed. Final local path: ${result.path}.`
+              : `Download failed: ${result.error ?? "unknown error"}. Do not retry with manual base64 unless the user explicitly asks; inspect the error and adjust paths/options first.`,
+          ])),
+        }],
+      }
     },
   ))
 
@@ -790,8 +811,8 @@ async function main() {
     },
     wrapTool("ssh_local_forward", async ({ local_port, remote_host, remote_port, local_addr, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const forward = await forwardManager.localForward(local_addr ?? "127.0.0.1", local_port, remote_host, remote_port)
-      return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
+	      const forward = await forwardManager.localForward(local_addr ?? "127.0.0.1", local_port, remote_host, remote_port)
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("forward_result", forward)) }] }
     },
   ))
 
@@ -809,8 +830,8 @@ async function main() {
     },
     wrapTool("ssh_remote_forward", async ({ remote_port, local_host, local_port, remote_addr, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const forward = await forwardManager.remoteForward(remote_addr ?? "127.0.0.1", remote_port, local_host, local_port)
-      return { content: [{ type: "text" as const, text: JSON.stringify(forward) }] }
+	      const forward = await forwardManager.remoteForward(remote_addr ?? "127.0.0.1", remote_port, local_host, local_port)
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("forward_result", forward)) }] }
     },
   ))
 
@@ -826,7 +847,7 @@ async function main() {
     wrapTool("ssh_stop_forward", async ({ forward_id, profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const stopped = await forwardManager.stop(forward_id)
-      return { content: [{ type: "text" as const, text: stopped ? `Forward ${forward_id} stopped` : `Forward ${forward_id} not found` }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("forward_result", { forwardId: forward_id, stopped })) }] }
     },
   ))
 
@@ -841,7 +862,7 @@ async function main() {
     wrapTool("ssh_list_forwards", async ({ profile_name, profile_json, profile_file }) => {
       const { forwardManager } = await getClientForProfile(profile_name, profile_json, profile_file)
       const forwards = forwardManager.list()
-      return { content: [{ type: "text" as const, text: JSON.stringify(forwards) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("forward_result", { forwards })) }] }
     },
   ))
 
@@ -852,7 +873,7 @@ async function main() {
     {},
     wrapTool("ssh_list_profiles", async () => {
       const profiles = profileManager.list()
-      return { content: [{ type: "text" as const, text: JSON.stringify(profiles) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profiles })) }] }
     },
   ))
 
@@ -874,10 +895,10 @@ async function main() {
           chain: chainArray,
           tags,
         })
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, profileId: profile.id, message: `Profile '${name}' added successfully` }) }] }
-      } catch (err) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (err as Error).message }) }] }
-      }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { success: true, profileId: profile.id, profile, message: `Profile '${name}' added successfully` })) }] }
+	      } catch (err) {
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", (err as Error).message)) }] }
+	      }
     },
   ))
 
@@ -890,7 +911,7 @@ async function main() {
     },
     wrapTool("ssh_remove_profile", async ({ profile_id, profile_name }) => {
       if (!profile_id && !profile_name) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Must provide profile_id or profile_name" }) }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", "Must provide profile_id or profile_name")) }] }
       }
 
       let removed = false
@@ -904,10 +925,10 @@ async function main() {
       }
 
       if (removed) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: "Profile removed successfully" }) }] }
-      } else {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
-      }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { removed: true, message: "Profile removed successfully" })) }] }
+	      } else {
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", "Profile not found")) }] }
+	      }
     },
   ))
 
@@ -931,10 +952,10 @@ async function main() {
       }
 
       if (profile) {
-        return { content: [{ type: "text" as const, text: JSON.stringify(profile) }] }
-      } else {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Profile not found" }) }] }
-      }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profile })) }] }
+	      } else {
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", "Profile not found")) }] }
+	      }
     },
   ))
 
@@ -955,7 +976,7 @@ async function main() {
         lastActivity: s.lastActivity,
         idleSeconds: Math.floor((Date.now() - s.lastActivity) / 1000)
       }))
-      return { content: [{ type: "text" as const, text: JSON.stringify(sessionList, null, 2) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("session_result", { sessions: sessionList })) }] }
     },
   ))
 
@@ -968,10 +989,10 @@ async function main() {
     wrapTool("ssh_disconnect", async ({ session_id }) => {
       const session = gw.sessions.getSession(session_id)
       if (!session) {
-        return { content: [{ type: "text" as const, text: `Session ${session_id} not found` }] }
-      }
-      await gw.sessions.disconnect(session_id)
-      return { content: [{ type: "text" as const, text: `Session ${session_id} disconnected` }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("session_result", `Session ${session_id} not found`)) }] }
+	      }
+	      await gw.sessions.disconnect(session_id)
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("session_result", { sessionId: session_id, disconnected: true })) }] }
     },
   ))
 
@@ -1027,8 +1048,8 @@ async function main() {
       command: z.string().describe("Command to execute"),
       cwd: z.string().optional().describe("Working directory"),
       reason: z.string().optional().describe("Why you are running this command"),
-      intent: z.string().optional().describe("Command intent"),
-      cost: z.string().optional().describe("Estimated cost"),
+	      intent: z.enum(["inspect", "search", "test", "build", "install", "server", "deploy", "migration", "cleanup", "custom"]).optional().describe("Command intent"),
+	      cost: z.enum(["tiny", "small", "medium", "large", "exclusive"]).optional().describe("Estimated cost"),
       urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency"),
       if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("When host is busy: queue (default for heavy), wait, fail, or run_anyway to bypass serial queue -- only use run_anyway when tasks are truly independent"),
       force: z.boolean().optional().describe("Force risky commands"),

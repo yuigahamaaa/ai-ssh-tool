@@ -71,6 +71,28 @@ describe("ProfileManager", () => {
       const profiles = pm.load()
       assert.deepEqual(profiles, [])
     })
+
+    it("should normalize flat profile chain entries loaded from disk", async () => {
+      const { writeFileSync } = await import("fs")
+      writeFileSync(profilesPath, JSON.stringify([{
+        id: "flat-profile",
+        name: "flat",
+        chain: [{
+          name: "target",
+          host: "127.0.0.1",
+          port: 22,
+          username: "root",
+          password: "secret",
+        }],
+      }]), "utf-8")
+
+      const pm = new ProfileManager(profilesPath)
+      const profiles = pm.load()
+
+      assert.equal(profiles[0].chain[0].auth.username, "root")
+      assert.equal(profiles[0].chain[0].auth.password, "secret")
+      assert.equal((profiles[0].chain[0] as any).username, undefined)
+    })
   })
 
   describe("add", () => {
@@ -93,6 +115,30 @@ describe("ProfileManager", () => {
       const raw = readFileSync(profilesPath, "utf-8")
       const data = JSON.parse(raw)
       assert.equal(data.length, 1)
+    })
+
+    it("should normalize flat profile chain entries before saving", () => {
+      const pm = new ProfileManager(profilesPath)
+      pm.load()
+
+      const profile = pm.add({
+        name: "flat",
+        chain: [{
+          name: "target",
+          host: "127.0.0.1",
+          port: 22,
+          username: "root",
+          privateKey: "KEY",
+        } as any],
+      })
+
+      assert.equal(profile.chain[0].auth.username, "root")
+      assert.equal(profile.chain[0].auth.privateKey, "KEY")
+
+      const raw = readFileSync(profilesPath, "utf-8")
+      const data = JSON.parse(raw)
+      assert.equal(data[0].chain[0].auth.username, "root")
+      assert.equal(data[0].chain[0].username, undefined)
     })
   })
 

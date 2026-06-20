@@ -79,11 +79,9 @@ ssh-tool/
 | `ssh_exec` | 执行命令（走调度器，等待完成） | `command`, `scheduler` |
 | `ssh_schedule` | 提交调度任务（异步） | `command`, `intent`, `cost` |
 | `ssh_queue_status` | 查看队列状态 | `host_id`, `limit` |
-| `ssh_wait_task` | 等待任务完成 | `task_id`, `timeout_ms` |
+| `ssh_wait_task` | 等待任务完成 | `task_id`, `timeout` |
 | `ssh_dequeue_task` | 从队列移除任务 | `task_id` |
 | `ssh_cd` | 设置当前 AI 会话的虚拟 cwd（不是远端 shell 持久 cd） | `path` |
-| `ssh_register_agent` | 注册 Agent（可选） | - |
-| `ssh_heartbeat` | Agent 心跳（可选） | - |
 
 ### 文件传输
 
@@ -404,7 +402,6 @@ AI 优先读 `ok`、`kind`、`data`、`agentGuidance`。`ssh_exec` / `ssh_schedu
 {
   "name": "ssh_queue_status",
   "parameters": {
-    "profile_name": "prod",
     "limit": 20
   }
 }
@@ -424,7 +421,7 @@ AI 优先读 `ok`、`kind`、`data`、`agentGuidance`。`ssh_exec` / `ssh_schedu
 // 之后查询
 {
   "name": "ssh_wait_task",
-  "parameters": { "task_id": "task-xxx", "timeout_ms": 120000 }
+  "parameters": { "task_id": "task-xxx", "timeout": 120000 }
 }
 ```
 

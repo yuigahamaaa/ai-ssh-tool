@@ -10,6 +10,11 @@ export type McpResponseKind =
   | "host_load"
   | "cwd_result"
   | "dequeue_result"
+  | "transfer_result"
+  | "file_result"
+  | "profile_result"
+  | "session_result"
+  | "forward_result"
   | "error"
 
 export interface McpEnvelope<T> {

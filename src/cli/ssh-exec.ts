@@ -52,6 +52,24 @@ interface SshExecConfig {
   timeout?: number
 }
 
+const INTENTS: TaskIntent[] = ["inspect", "search", "test", "build", "install", "server", "deploy", "migration", "cleanup", "custom"]
+const COSTS: TaskCost[] = ["tiny", "small", "medium", "large", "exclusive"]
+const URGENCIES: TaskUrgency[] = ["low", "normal", "high", "urgent"]
+const IF_BUSY = ["run_anyway", "wait", "queue", "fail"] as const
+
+function parseEnum<T extends string>(flag: string, value: string, allowed: readonly T[]): T {
+  if ((allowed as readonly string[]).includes(value)) return value as T
+  throw new Error(`${flag} must be one of ${allowed.join(", ")} (got: ${value})`)
+}
+
+function parsePositiveInt(flag: string, value: string): number {
+  const parsed = parseInt(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer (got: ${value})`)
+  }
+  return parsed
+}
+
 function parseArgs(): {
   configPath?: string;
   configJson?: string;
@@ -104,23 +122,23 @@ function parseArgs(): {
     } else if (args[i] === "--debug") {
       debug = true
     } else if (args[i] === "--scheduler" && i + 1 < args.length) {
-      scheduler = args[++i] as "auto" | "bypass"
+      scheduler = parseEnum("--scheduler", args[++i], ["auto", "bypass"] as const)
     } else if (args[i] === "--reason" && i + 1 < args.length) {
       reason = args[++i]
     } else if (args[i] === "--intent" && i + 1 < args.length) {
-      intent = args[++i] as TaskIntent
+      intent = parseEnum("--intent", args[++i], INTENTS)
     } else if (args[i] === "--cost" && i + 1 < args.length) {
-      cost = args[++i] as TaskCost
+      cost = parseEnum("--cost", args[++i], COSTS)
     } else if (args[i] === "--urgency" && i + 1 < args.length) {
-      urgency = args[++i] as TaskUrgency
+      urgency = parseEnum("--urgency", args[++i], URGENCIES)
     } else if (args[i] === "--if-busy" && i + 1 < args.length) {
-      ifBusy = args[++i] as "run_anyway" | "wait" | "queue" | "fail"
+      ifBusy = parseEnum("--if-busy", args[++i], IF_BUSY)
     } else if (args[i] === "--force") {
       force = true
     } else if (args[i] === "--cwd" && i + 1 < args.length) {
       cwd = args[++i]
     } else if (args[i] === "--timeout" && i + 1 < args.length) {
-      timeout = parseInt(args[++i])
+      timeout = parsePositiveInt("--timeout", args[++i])
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.log(`用法:
   ssh-exec [--debug] --config <json文件> --command <命令>       执行命令（单次连接）
@@ -137,7 +155,20 @@ function parseArgs(): {
   ssh-exec daemon exec --profile-json '<json串>' --command <命令> 使用内联 profile JSON 通过 daemon 执行
   ssh-exec daemon sessions                                      查看活跃会话
   ssh-exec daemon disconnect <sessionId>                        断开指定会话
-  ssh-exec daemon ping                                          检查 daemon 状态
+	  ssh-exec daemon ping                                          检查 daemon 状态
+	  ssh-exec daemon transfer --action upload --local <path> --remote <path> [--overwrite overwrite|skip|rename|backup]
+	  ssh-exec daemon bg-exec --sub start|status|output|cancel|list ...
+	  ssh-exec daemon port-forward --sub start|stop|list --type local|remote ...
+	  ssh-exec mcp [--config <json文件>|--profile-name <名称>]       启动 MCP server
+
+调度参数:
+	  --scheduler auto|bypass     默认 auto；bypass 跳过排队但仍记录任务
+	  --intent ${INTENTS.join("|")}
+	  --cost ${COSTS.join("|")}
+	  --urgency ${URGENCIES.join("|")}
+	  --if-busy run_anyway|wait|queue|fail
+	  --cwd <dir>                 远端工作目录
+	  --timeout <ms>              命令超时毫秒
 
 配置方式 (任选其一):
   --config <文件>           SSH 配置文件路径（旧格式）
@@ -145,7 +176,14 @@ function parseArgs(): {
   --profile-name <名称>    使用保存的 profile（推荐，通过 MCP 或其他方式添加）
   --profile-json <JSON>     直接传入完整的 SSHProfile JSON 字符串
 
---debug                   开启调试日志
+	传输参数:
+	  --overwrite ask|skip|overwrite|rename|backup
+	  --compression-level 1-9
+	  --skip-symlinks
+	  --line-ending auto|lf|crlf|binary
+	  --encoding auto|utf8|gbk|latin1
+
+	--debug                   开启调试日志
 
 持久化模式（daemon）:
   首次 exec 自动启动 daemon，后续命令复用已有 SSH 连接，无需重复握手。
@@ -469,6 +507,11 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
   let action: string | undefined
   let localPath: string | undefined
   let remotePath: string | undefined
+  let compressionLevel: number | undefined
+  let overwrite: "ask" | "skip" | "overwrite" | "rename" | "backup" | undefined
+  let skipSymlinks: boolean | undefined
+  let lineEnding: "auto" | "lf" | "crlf" | "binary" | undefined
+  let encoding: "auto" | "utf8" | "gbk" | "latin1" | undefined
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && i + 1 < args.length) {
@@ -485,6 +528,16 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
       localPath = args[++i]
     } else if (args[i] === "--remote" && i + 1 < args.length) {
       remotePath = args[++i]
+    } else if (args[i] === "--compression-level" && i + 1 < args.length) {
+      compressionLevel = parseInt(args[++i])
+    } else if (args[i] === "--overwrite" && i + 1 < args.length) {
+      overwrite = args[++i] as any
+    } else if (args[i] === "--skip-symlinks") {
+      skipSymlinks = true
+    } else if (args[i] === "--line-ending" && i + 1 < args.length) {
+      lineEnding = args[++i] as any
+    } else if (args[i] === "--encoding" && i + 1 < args.length) {
+      encoding = args[++i] as any
     }
   }
 
@@ -500,6 +553,26 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
   }
   if (action !== "upload" && action !== "download") {
     console.error(`Error: --action must be 'upload' or 'download' (got: ${action}). Path is auto-detected as file or folder.`)
+    process.exitCode = 1
+    return
+  }
+  if (compressionLevel !== undefined && (!Number.isInteger(compressionLevel) || compressionLevel < 1 || compressionLevel > 9)) {
+    console.error(`Error: --compression-level must be an integer from 1 to 9 (got: ${compressionLevel})`)
+    process.exitCode = 1
+    return
+  }
+  if (overwrite !== undefined && !["ask", "skip", "overwrite", "rename", "backup"].includes(overwrite)) {
+    console.error(`Error: --overwrite must be ask, skip, overwrite, rename, or backup (got: ${overwrite})`)
+    process.exitCode = 1
+    return
+  }
+  if (lineEnding !== undefined && !["auto", "lf", "crlf", "binary"].includes(lineEnding)) {
+    console.error(`Error: --line-ending must be auto, lf, crlf, or binary (got: ${lineEnding})`)
+    process.exitCode = 1
+    return
+  }
+  if (encoding !== undefined && !["auto", "utf8", "gbk", "latin1"].includes(encoding)) {
+    console.error(`Error: --encoding must be auto, utf8, gbk, or latin1 (got: ${encoding})`)
     process.exitCode = 1
     return
   }
@@ -540,7 +613,19 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
     console.error(`[ssh-exec] Connected, starting ${action}...`)
 
     const result = await client.send(
-      createRequest("transfer", { sessionId, action, localPath, remotePath }),
+      createRequest("transfer", {
+        sessionId,
+        action,
+        localPath,
+        remotePath,
+        options: {
+          compressionLevel,
+          overwrite,
+          skipSymlinks,
+          lineEnding,
+          encoding,
+        },
+      }),
       300000,
     )
 

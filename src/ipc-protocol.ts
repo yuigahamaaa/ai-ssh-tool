@@ -47,6 +47,7 @@ export function getPidPath(): string {
 }
 
 import type { ScheduleRequest } from "./scheduler/types.js"
+import type { FolderTransferOptions } from "./file-transfer.js"
 
 // --- Request types ---
 
@@ -55,7 +56,7 @@ export type IPCRequest =
   | { id: string; action: "connectJson"; params: { configJson: string } }
   | { id: string; action: "exec"; params: { sessionId: string; command: string; timeout?: number } }
   | { id: string; action: "disconnect"; params: { sessionId: string } }
-  | { id: string; action: "transfer"; params: { sessionId: string; action: string; localPath: string; remotePath: string } }
+  | { id: string; action: "transfer"; params: { sessionId: string; action: string; localPath: string; remotePath: string; options?: FolderTransferOptions } }
   | { id: string; action: "bgExec"; params: { sessionId: string; subcommand: string; command?: string; taskId?: string } }
   | { id: string; action: "portForward"; params: { sessionId: string; subcommand: string; type?: string; bindAddr?: string; bindPort?: number; dstAddr?: string; dstPort?: number; forwardId?: string } }
   | { id: string; action: "schedule"; params: ScheduleRequest }

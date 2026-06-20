@@ -101,7 +101,8 @@ export class ProfileManager {
     try {
       const raw = readFileSync(this.profilesPath, "utf-8")
       const data = JSON.parse(raw)
-      this.profiles = Array.isArray(data) ? data : (data.profiles ?? [])
+      const loaded = Array.isArray(data) ? data : (data.profiles ?? [])
+      this.profiles = loaded.map((profile: Record<string, unknown>) => ProfileManager.normalizeProfile(profile))
 
       // Decrypt passwords if key is set
       if (this.encryptionKey) {
@@ -147,8 +148,9 @@ export class ProfileManager {
 
   /** Add a new profile */
   add(profile: Omit<SSHProfile, "id">): SSHProfile {
+    const normalized = ProfileManager.normalizeProfile(profile as unknown as Record<string, unknown>)
     const newProfile: SSHProfile = {
-      ...profile,
+      ...normalized,
       id: randomUUID(),
     }
     this.profiles.push(newProfile)
@@ -161,7 +163,7 @@ export class ProfileManager {
     const idx = this.profiles.findIndex((p) => p.id === id)
     if (idx < 0) throw new Error(`Profile ${id} not found`)
 
-    this.profiles[idx] = { ...this.profiles[idx], ...updates, id }
+    this.profiles[idx] = ProfileManager.normalizeProfile({ ...this.profiles[idx], ...updates, id })
     this.save()
     return this.profiles[idx]
   }

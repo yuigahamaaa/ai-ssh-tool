@@ -14,6 +14,7 @@ import { homedir } from "os"
 import { log } from "./logger.js"
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import type { ScheduleRequest, TaskRunner } from "./scheduler/types.js"
+import { assertEnvName, shellQuote } from "./shell-quote.js"
 
 /**
  * Get user data directory with cross-platform support.
@@ -244,11 +245,11 @@ export class ExecTaskManager {
 
     let fullCommand = command
     if (options?.cwd) {
-      fullCommand = `cd ${JSON.stringify(options.cwd)} && ${fullCommand}`
+      fullCommand = `cd ${shellQuote(options.cwd)} && ${fullCommand}`
     }
     if (options?.env) {
       const envPrefix = Object.entries(options.env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(v)}`)
+        .map(([k, v]) => `export ${assertEnvName(k)}=${shellQuote(v)}`)
         .join(" ")
       fullCommand = `${envPrefix}; ${fullCommand}`
     }

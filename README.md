@@ -319,7 +319,7 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 
 ---
 
-### MCP Tools (21 total)
+### MCP Tools (31 total)
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -477,7 +477,7 @@ src/
 |------------|-----------|---------|----------|----------------|
 | N-hop jump hosts | JSON declarative | ProxyJump | jumpHost | Auto |
 | Connection reuse | Daemon auto | Manual | Not supported | Auto |
-| AI tool integration | 21 MCP tools | None | None | Copilot |
+| AI tool integration | 31 MCP tools | None | None | Copilot |
 | Folder transfer | Auto compress | Needs scp | None | Built-in |
 | Background exec | Detach mode | screen/tmux | None | None |
 | **Unified task tracking** | ✅ All tasks | ❌ | ❌ | ❌ |

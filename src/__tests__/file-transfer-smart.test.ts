@@ -225,6 +225,8 @@ describe("Smart Transfer (upload/download auto-detect)", () => {
       //   - result.path matches the requested remote path
       //   - and on failure, the error mentions the tar / upload flow
       assert.equal(result.path, "/remote/smart-dir")
+      assert.equal(result.finalPath, "/remote/smart-dir")
+      assert.equal(result.targetType, "directory")
       if (result.success) {
         // If the local tar somehow succeeded, we still must have hit
         // uploadFolder (size > 0 because the archive is non-empty)

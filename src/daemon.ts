@@ -35,6 +35,7 @@ import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
+import { shellQuote } from "./shell-quote.js"
 
 interface DaemonSession {
   sessionId: string
@@ -49,10 +50,6 @@ interface CachedConfig {
 }
 
 const BACKGROUND_HANDLE_TIMEOUT_MS = 5 * 60 * 1000
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`
-}
 
 export function execScheduledStream(
   client: Client,
@@ -895,7 +892,7 @@ export class SSHDaemon {
   }
 
   private async handleTransfer(req: IPCRequest & { action: "transfer" }): Promise<IPCResponse> {
-    const { sessionId, action, localPath, remotePath } = req.params
+    const { sessionId, action, localPath, remotePath, options } = req.params
     const connection = this.gateway.sessions.getConnection(sessionId)
     if (!connection) {
       return { id: req.id, ok: false, error: `Session ${sessionId} not found` }
@@ -905,10 +902,10 @@ export class SSHDaemon {
       let result
       switch (action) {
         case "upload":
-          result = await upload(client, localPath, remotePath)
+          result = await upload(client, localPath, remotePath, options)
           break
         case "download":
-          result = await download(client, remotePath, localPath)
+          result = await download(client, remotePath, localPath, options)
           break
         default:
           return { id: req.id, ok: false, error: `Unknown transfer action: ${action}` }

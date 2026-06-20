@@ -14,6 +14,7 @@ import type { Client } from "ssh2"
 import { createRemoteFs, type RemoteFs } from "./remote-fs.js"
 import { remoteExec, type ExecResult } from "./remote-shell.js"
 import type { SecurityPolicy } from "./types.js"
+import { shellQuote } from "./shell-quote.js"
 
 export interface RemoteToolContext {
   sessionId: string
@@ -246,8 +247,8 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         validateCommand("grep", policy)
         let cmd = "grep -rn"
         if (params.caseInsensitive) cmd += "i"
-        if (params.glob) cmd += ` --include=${JSON.stringify(params.glob)}`
-        cmd += ` ${JSON.stringify(params.pattern)} ${JSON.stringify(params.path)}`
+        if (params.glob) cmd += ` --include=${shellQuote(params.glob)}`
+        cmd += ` ${shellQuote(params.pattern)} ${shellQuote(params.path)}`
         const result = await remoteExec(ctx.client, cmd, { timeout: 15000 })
         return result.stdout || result.stderr || "(no matches)"
       },
@@ -274,10 +275,10 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         maxDepth?: number
       }) {
         validateCommand("find", policy)
-        let cmd = `find ${JSON.stringify(params.path)}`
+        let cmd = `find ${shellQuote(params.path)}`
         if (params.maxDepth) cmd += ` -maxdepth ${params.maxDepth}`
         if (params.type) cmd += ` -type ${params.type}`
-        if (params.name) cmd += ` -name ${JSON.stringify(params.name)}`
+        if (params.name) cmd += ` -name ${shellQuote(params.name)}`
         const result = await remoteExec(ctx.client, cmd, { timeout: 15000 })
         return result.stdout || result.stderr || "(no results)"
       },

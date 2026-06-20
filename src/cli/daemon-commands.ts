@@ -22,6 +22,24 @@ interface DaemonCommandDeps {
   clientFactory?: () => DaemonCommandClient
 }
 
+const INTENTS: TaskIntent[] = ["inspect", "search", "test", "build", "install", "server", "deploy", "migration", "cleanup", "custom"]
+const COSTS: TaskCost[] = ["tiny", "small", "medium", "large", "exclusive"]
+const URGENCIES: TaskUrgency[] = ["low", "normal", "high", "urgent"]
+const IF_BUSY = ["run_anyway", "wait", "queue", "fail"] as const
+
+function parseEnum<T extends string>(flag: string, value: string, allowed: readonly T[]): T {
+  if ((allowed as readonly string[]).includes(value)) return value as T
+  throw new Error(`${flag} must be one of ${allowed.join(", ")} (got: ${value})`)
+}
+
+function parsePositiveInt(flag: string, value: string): number {
+  const parsed = parseInt(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer (got: ${value})`)
+  }
+  return parsed
+}
+
 function createClient(): DaemonClient {
   return new DaemonClient()
 }
@@ -141,23 +159,23 @@ export async function handleDaemonExec(args: string[], deps: DaemonCommandDeps =
     } else if (args[i] === "--command" && i + 1 < args.length) {
       command = args[++i]
     } else if (args[i] === "--scheduler" && i + 1 < args.length) {
-      scheduler = args[++i] as "auto" | "bypass"
+      scheduler = parseEnum("--scheduler", args[++i], ["auto", "bypass"] as const)
     } else if (args[i] === "--reason" && i + 1 < args.length) {
       reason = args[++i]
     } else if (args[i] === "--intent" && i + 1 < args.length) {
-      intent = args[++i] as TaskIntent
+      intent = parseEnum("--intent", args[++i], INTENTS)
     } else if (args[i] === "--cost" && i + 1 < args.length) {
-      cost = args[++i] as TaskCost
+      cost = parseEnum("--cost", args[++i], COSTS)
     } else if (args[i] === "--urgency" && i + 1 < args.length) {
-      urgency = args[++i] as TaskUrgency
+      urgency = parseEnum("--urgency", args[++i], URGENCIES)
     } else if (args[i] === "--if-busy" && i + 1 < args.length) {
-      ifBusy = args[++i] as "run_anyway" | "wait" | "queue" | "fail"
+      ifBusy = parseEnum("--if-busy", args[++i], IF_BUSY)
     } else if (args[i] === "--force") {
       force = true
     } else if (args[i] === "--cwd" && i + 1 < args.length) {
       cwd = args[++i]
     } else if (args[i] === "--timeout" && i + 1 < args.length) {
-      timeout = parseInt(args[++i])
+      timeout = parsePositiveInt("--timeout", args[++i])
     }
   }
 

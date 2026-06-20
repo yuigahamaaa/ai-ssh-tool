@@ -10,7 +10,7 @@
 
 import type { Client } from "ssh2"
 import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs"
-import { basename, dirname, join } from "path"
+import { basename, dirname, join, posix as pathPosix } from "path"
 import { tmpdir } from "os"
 import { randomUUID } from "crypto"
 import { Transform, pipeline } from "stream"
@@ -18,6 +18,7 @@ import { promisify } from "util"
 import iconv from "iconv-lite"
 import { remoteExec } from "./remote-shell.js"
 import { log } from "./logger.js"
+import { shellQuote } from "./shell-quote.js"
 
 const pipelineAsync = promisify(pipeline)
 
@@ -30,7 +31,22 @@ export interface TransferProgress {
 
 export interface TransferResult {
   success: boolean
+  /** Back-compatible final destination path. Prefer finalPath in new callers. */
   path: string
+  /** The actual file/folder path that was written, skipped, renamed, or backed up. */
+  finalPath?: string
+  /** The caller-requested destination before directory basename resolution or rename. */
+  requestedPath?: string
+  /** Local or remote source path, depending on transfer direction. */
+  sourcePath?: string
+  /** What happened to the transfer. */
+  action?: "uploaded" | "downloaded" | "skipped" | "failed"
+  targetType?: "file" | "directory"
+  overwriteStrategy?: OverwriteStrategy
+  skipped?: boolean
+  overwritten?: boolean
+  renamed?: boolean
+  backupPath?: string
   size: number
   duration: number
   error?: string
@@ -58,6 +74,15 @@ export interface FolderTransferOptions {
 
 export type OverwriteStrategy = boolean | "ask" | "skip" | "overwrite" | "rename" | "backup"
 
+type OverwriteDecision = {
+  proceed: boolean
+  targetPath: string
+  strategy: OverwriteStrategy
+  existed: boolean
+  renamed?: boolean
+  backupPath?: string
+}
+
 export interface FileTransferOptions {
   onProgress?: (progress: TransferProgress) => void
   /** File permissions (octal), default: preserve source or 0o644 */
@@ -79,7 +104,7 @@ export interface FileTransferOptions {
 /** Check if a remote path is a directory */
 async function remoteIsDir(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -d ${JSON.stringify(remotePath)} && echo "DIR" || echo "FILE"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`, { timeout: 5000 })
     return result.stdout.trim() === "DIR"
   } catch {
     return false
@@ -89,7 +114,7 @@ async function remoteIsDir(client: Client, remotePath: string): Promise<boolean>
 /** Check if a remote path exists */
 async function remotePathExists(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -e ${JSON.stringify(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -99,7 +124,7 @@ async function remotePathExists(client: Client, remotePath: string): Promise<boo
 /** Check if a remote path is a symbolic link */
 async function remoteIsSymlink(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -L ${JSON.stringify(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -123,7 +148,7 @@ function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Bu
     converted = text
   }
   
-  const result = Buffer.alloc(converted.length * 2); result.write(converted, "utf-8"); return result.slice(0, result.length)
+  return Buffer.from(converted, "utf-8")
 }
 
 /** Detect line ending style in text */
@@ -249,10 +274,10 @@ async function checkOverwrite(
   client: Client,
   remotePath: string,
   options: FileTransferOptions | undefined
-): Promise<{ proceed: boolean; targetPath: string }> {
+): Promise<OverwriteDecision> {
   const exists = await remotePathExists(client, remotePath)
   if (!exists) {
-    return { proceed: true, targetPath: remotePath }
+    return { proceed: true, targetPath: remotePath, strategy: options?.overwrite ?? "overwrite", existed: false }
   }
 
   const strategy = options?.overwrite ?? "overwrite"
@@ -260,18 +285,18 @@ async function checkOverwrite(
   switch (strategy) {
     case true:
     case "overwrite":
-      return { proceed: true, targetPath: remotePath }
+      return { proceed: true, targetPath: remotePath, strategy, existed: true }
     
     case false:
     case "skip":
       log("transfer", `Skipping existing file: ${remotePath}`)
-      return { proceed: false, targetPath: remotePath }
+      return { proceed: false, targetPath: remotePath, strategy, existed: true }
     
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, `mv ${JSON.stringify(remotePath)} ${JSON.stringify(backupPath)}`, { timeout: 5000 })
-      return { proceed: true, targetPath: remotePath }
+      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000 })
+      return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
       let counter = 1
@@ -281,13 +306,33 @@ async function checkOverwrite(
         counter++
       } while (await remotePathExists(client, newPath))
       log("transfer", `Renaming to avoid overwrite: ${remotePath} -> ${newPath}`)
-      return { proceed: true, targetPath: newPath }
+      return { proceed: true, targetPath: newPath, strategy, existed: true, renamed: true }
     
     case "ask":
     default:
       log("transfer", `File exists, defaulting to overwrite: ${remotePath}`)
-      return { proceed: true, targetPath: remotePath }
+      return { proceed: true, targetPath: remotePath, strategy, existed: true }
   }
+}
+
+async function resolveRemoteFileTarget(client: Client, localPath: string, remotePath: string): Promise<string> {
+  if (remotePath.endsWith("/")) {
+    return pathPosix.join(remotePath, basename(localPath))
+  }
+  if (await remoteIsDir(client, remotePath)) {
+    return pathPosix.join(remotePath, basename(localPath))
+  }
+  return remotePath
+}
+
+function resolveLocalFileTarget(remotePath: string, localPath: string): string {
+  if (localPath.endsWith("/") || localPath.endsWith("\\")) {
+    return join(localPath, basename(remotePath))
+  }
+  if (existsSync(localPath) && statSync(localPath).isDirectory()) {
+    return join(localPath, basename(remotePath))
+  }
+  return localPath
 }
 
 /**
@@ -311,6 +356,13 @@ export async function uploadFile(
     return {
       success: true,
       path: remotePath,
+      finalPath: remotePath,
+      requestedPath: remotePath,
+      sourcePath: localPath,
+      action: "skipped",
+      targetType: "file",
+      overwriteStrategy: options?.overwrite,
+      skipped: true,
       size: 0,
       duration: 0,
     }
@@ -318,12 +370,20 @@ export async function uploadFile(
 
   const statInfo = statSync(localPath)
   const totalSize = statInfo.size
+  const targetRemotePath = await resolveRemoteFileTarget(client, localPath, remotePath)
 
-  const checkResult = await checkOverwrite(client, remotePath, options)
+  const checkResult = await checkOverwrite(client, targetRemotePath, options)
   if (!checkResult.proceed) {
     return {
       success: true,
       path: remotePath,
+      finalPath: remotePath,
+      requestedPath: remotePath,
+      sourcePath: localPath,
+      action: "skipped",
+      targetType: "file",
+      overwriteStrategy: checkResult.strategy,
+      skipped: true,
       size: 0,
       duration: Date.now() - startTime,
     }
@@ -333,7 +393,10 @@ export async function uploadFile(
   const shouldUseStreaming = totalSize > fileSizeThreshold
 
   if (!shouldUseStreaming) {
-    return uploadFileDirect(client, localPath, finalRemotePath, options, statInfo)
+    return uploadFileDirect(client, localPath, finalRemotePath, options, statInfo, {
+      ...checkResult,
+      requestedPath: remotePath,
+    })
   }
 
   // Use streaming with pipeline for better error handling
@@ -385,6 +448,15 @@ export async function uploadFile(
         resolve({
           success: true,
           path: finalRemotePath,
+          finalPath: finalRemotePath,
+          requestedPath: remotePath,
+          sourcePath: localPath,
+          action: "uploaded",
+          targetType: "file",
+          overwriteStrategy: checkResult.strategy,
+          overwritten: checkResult.existed && !checkResult.renamed && !checkResult.backupPath,
+          renamed: checkResult.renamed,
+          backupPath: checkResult.backupPath,
           size: totalSize,
           duration,
         })
@@ -409,6 +481,7 @@ async function uploadFileDirect(
   remotePath: string,
   options: FileTransferOptions | undefined,
   statInfo: { size: number; mode: number },
+  transferMeta?: OverwriteDecision & { requestedPath?: string },
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const totalSize = Number(statInfo.size)
@@ -470,6 +543,15 @@ async function uploadFileDirect(
           finishOnce(() => resolve({
             success: true,
             path: remotePath,
+            finalPath: remotePath,
+            requestedPath: transferMeta?.requestedPath ?? remotePath,
+            sourcePath: localPath,
+            action: "uploaded",
+            targetType: "file",
+            overwriteStrategy: transferMeta?.strategy,
+            overwritten: transferMeta ? transferMeta.existed && !transferMeta.renamed && !transferMeta.backupPath : undefined,
+            renamed: transferMeta?.renamed,
+            backupPath: transferMeta?.backupPath,
             size: totalSize,
             duration,
           }))
@@ -495,34 +577,42 @@ export async function downloadFile(
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
+  const targetLocalPath = resolveLocalFileTarget(remotePath, localPath)
 
-  const dir = dirname(localPath)
+  const dir = dirname(targetLocalPath)
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
   }
 
-  if (existsSync(localPath)) {
+  if (existsSync(targetLocalPath)) {
     const strategy = options?.overwrite ?? "overwrite"
     switch (strategy) {
       case false:
       case "skip":
-        log("transfer", `Skipping existing file: ${localPath}`)
+        log("transfer", `Skipping existing file: ${targetLocalPath}`)
         return {
           success: true,
-          path: localPath,
+          path: targetLocalPath,
+          finalPath: targetLocalPath,
+          requestedPath: localPath,
+          sourcePath: remotePath,
+          action: "skipped",
+          targetType: "file",
+          overwriteStrategy: strategy,
+          skipped: true,
           size: 0,
           duration: Date.now() - startTime,
         }
       case "backup":
-        const backupPath = `${localPath}.bak`
-        log("transfer", `Backing up existing file: ${localPath} -> ${backupPath}`)
+        const backupPath = `${targetLocalPath}.bak`
+        log("transfer", `Backing up existing file: ${targetLocalPath} -> ${backupPath}`)
         try {
           if (existsSync(backupPath)) {
             const { unlinkSync } = await import("fs")
             unlinkSync(backupPath)
           }
           const { renameSync } = await import("fs")
-          renameSync(localPath, backupPath)
+          renameSync(targetLocalPath, backupPath)
         } catch (e) {
           log("transfer", `Backup failed, skipping: ${(e as Error).message}`)
         }
@@ -555,12 +645,19 @@ export async function downloadFile(
           const isSymlink = await remoteIsSymlink(client, remotePath)
           if (isSymlink) {
             log("transfer", `Skipping symbolic link: ${remotePath}`)
-            return resolve({
-              success: true,
-              path: localPath,
-              size: 0,
-              duration: Date.now() - startTime,
-            })
+              return resolve({
+                success: true,
+                path: targetLocalPath,
+                finalPath: targetLocalPath,
+                requestedPath: localPath,
+                sourcePath: remotePath,
+                action: "skipped",
+                targetType: "file",
+                overwriteStrategy: options?.overwrite,
+                skipped: true,
+                size: 0,
+                duration: Date.now() - startTime,
+              })
           }
         }
 
@@ -596,13 +693,18 @@ export async function downloadFile(
             }
           }
 
-          writeFileSync(localPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
+          writeFileSync(targetLocalPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
 
           const duration = Date.now() - startTime
-          log("transfer", `Download (direct) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+          log("transfer", `Download (direct) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
           return resolve({
             success: true,
-            path: localPath,
+            path: targetLocalPath,
+            finalPath: targetLocalPath,
+            requestedPath: localPath,
+            sourcePath: remotePath,
+            action: "downloaded",
+            targetType: "file",
             size: totalSize,
             duration,
           })
@@ -619,7 +721,7 @@ export async function downloadFile(
           })
         }
 
-        const writeStream = createWriteStream(localPath, {
+        const writeStream = createWriteStream(targetLocalPath, {
           mode: options?.mode ?? remoteMode,
         })
 
@@ -645,10 +747,15 @@ export async function downloadFile(
         }
 
         const duration = Date.now() - startTime
-        log("transfer", `Download (streaming) complete: ${remotePath} -> ${localPath} (${totalSize} bytes, ${duration}ms)`)
+        log("transfer", `Download (streaming) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
         resolve({
           success: true,
-          path: localPath,
+          path: targetLocalPath,
+          finalPath: targetLocalPath,
+          requestedPath: localPath,
+          sourcePath: remotePath,
+          action: "downloaded",
+          targetType: "file",
           size: totalSize,
           duration,
         })
@@ -685,12 +792,30 @@ export async function uploadFolder(
   const tmpFile = join(tmpdir(), `ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`)
   const remoteTmp = `/tmp/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
   let uploadResult: TransferResult | null = null
+  let targetDecision: OverwriteDecision | undefined
 
   try {
-    await remoteExec(client, `mkdir -p ${JSON.stringify(remotePath)}`, { timeout: 10000 })
+    targetDecision = await checkOverwrite(client, remotePath, options)
+    if (!targetDecision.proceed) {
+      return {
+        success: true,
+        path: remotePath,
+        finalPath: remotePath,
+        requestedPath: remotePath,
+        sourcePath: localPath,
+        action: "skipped",
+        targetType: "directory",
+        overwriteStrategy: targetDecision.strategy,
+        skipped: true,
+        size: 0,
+        duration: Date.now() - startTime,
+      }
+    }
+    const finalRemotePath = targetDecision.targetPath
+
+    await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000 })
 
     const { execSync } = await import("child_process")
-    const parentDir = dirname(localPath)
     
     let tarOptions = ""
     if (options?.skipSymlinks) {
@@ -700,7 +825,7 @@ export async function uploadFolder(
     }
     
     execSync(
-      `tar -czf ${JSON.stringify(tmpFile)} ${tarOptions} -C ${JSON.stringify(parentDir)} ${JSON.stringify(folderName)}`,
+      `tar -czf ${shellQuote(tmpFile)} ${tarOptions} -C ${shellQuote(localPath)} .`,
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
@@ -714,14 +839,23 @@ export async function uploadFolder(
       timeout,
     })
 
-    const extractCmd = `tar -xzf ${JSON.stringify(remoteTmp)} -C ${JSON.stringify(remotePath)} ${options?.overwrite ? "--overwrite" : ""}`
+    const extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
     await remoteExec(client, extractCmd, { timeout })
 
     const duration = Date.now() - startTime
-    log("transfer", `Folder upload complete: ${localPath} -> ${remotePath} (${duration}ms)`)
+    log("transfer", `Folder upload complete: ${localPath} -> ${finalRemotePath} (${duration}ms)`)
     return {
       success: true,
-      path: remotePath,
+      path: finalRemotePath,
+      finalPath: finalRemotePath,
+      requestedPath: remotePath,
+      sourcePath: localPath,
+      action: "uploaded",
+      targetType: "directory",
+      overwriteStrategy: targetDecision.strategy,
+      overwritten: targetDecision.existed && !targetDecision.renamed && !targetDecision.backupPath,
+      renamed: targetDecision.renamed,
+      backupPath: targetDecision.backupPath,
       size: uploadResult.size,
       duration,
     }
@@ -729,7 +863,13 @@ export async function uploadFolder(
     log("transfer", `Folder upload failed: ${err.message}`)
     return {
       success: false,
-      path: remotePath,
+      path: targetDecision?.targetPath ?? remotePath,
+      finalPath: targetDecision?.targetPath ?? remotePath,
+      requestedPath: remotePath,
+      sourcePath: localPath,
+      action: "failed",
+      targetType: "directory",
+      overwriteStrategy: targetDecision?.strategy ?? options?.overwrite,
       size: uploadResult?.size ?? 0,
       duration: Date.now() - startTime,
       error: err.message,
@@ -745,7 +885,7 @@ export async function uploadFolder(
     
     // 清理远程临时文件
     try {
-      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
+      await remoteExec(client, `rm -f ${shellQuote(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
     } catch {
       // 忽略远程删除错误
     }
@@ -785,10 +925,10 @@ export async function downloadFolder(
       tarOptions = "--dereference"
     }
     
-    const compressCmd = `tar -czf ${JSON.stringify(remoteTmp)} ${tarOptions} -C ${JSON.stringify(remoteParent)} ${JSON.stringify(folderName)}`
+    const compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
     await remoteExec(client, compressCmd, { timeout })
 
-    const sizeResult = await remoteExec(client, `stat -c %s ${JSON.stringify(remoteTmp)} 2>/dev/null || wc -c < ${JSON.stringify(remoteTmp)}`, { timeout: 10000 })
+    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000 })
     const remoteSize = parseInt(sizeResult.stdout.trim()) || 0
     log("transfer", `Compressed on remote: ${remotePath} -> ${remoteTmp} (${remoteSize} bytes)`)
 
@@ -804,7 +944,7 @@ export async function downloadFolder(
     }
     const { execSync } = await import("child_process")
     execSync(
-      `tar -xzf ${JSON.stringify(tmpFile)} -C ${JSON.stringify(localPath)}`,
+      `tar -xzf ${shellQuote(tmpFile)} -C ${shellQuote(localPath)}`,
       { timeout, maxBuffer: 10 * 1024 * 1024 },
     )
 
@@ -813,6 +953,12 @@ export async function downloadFolder(
     return {
       success: true,
       path: localPath,
+      finalPath: join(localPath, folderName),
+      requestedPath: localPath,
+      sourcePath: remotePath,
+      action: "downloaded",
+      targetType: "directory",
+      overwriteStrategy: options?.overwrite,
       size: downloadResult.size,
       duration,
     }
@@ -821,6 +967,12 @@ export async function downloadFolder(
     return {
       success: false,
       path: localPath,
+      finalPath: join(localPath, folderName),
+      requestedPath: localPath,
+      sourcePath: remotePath,
+      action: "failed",
+      targetType: "directory",
+      overwriteStrategy: options?.overwrite,
       size: downloadResult?.size ?? 0,
       duration: Date.now() - startTime,
       error: err.message,
@@ -836,7 +988,7 @@ export async function downloadFolder(
     
     // 清理远程临时文件
     try {
-      await remoteExec(client, `rm -f ${JSON.stringify(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
+      await remoteExec(client, `rm -f ${shellQuote(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
     } catch {
       // 忽略远程删除错误
     }

@@ -15,6 +15,15 @@ const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
 const memFs = new Map<string, Buffer>()
 const remoteExecResults = new Map<string, { stdout: string, stderr: string }>()
+const remoteExecQueue: Array<{ stdout: string, stderr?: string }> = []
+
+function enqueueExecResponse(stdout: string, stderr = "") {
+  remoteExecQueue.push({ stdout, stderr })
+}
+
+function unquoteShellSingle(value: string): string {
+  return value.slice(1, -1).replace(/'\\''/g, "'")
+}
 
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>
@@ -39,15 +48,21 @@ function createTestServer(): Promise<{
           })
           session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
             const stream = acceptExec()
+            const queuedResult = remoteExecQueue.shift()
             const testResult = remoteExecResults.get("test")
-            if (testResult) {
+            if (queuedResult) {
+              stream.write(queuedResult.stdout)
+              stream.write(queuedResult.stderr ?? "")
+            } else if (testResult) {
               stream.write(testResult.stdout)
               stream.write(testResult.stderr)
               remoteExecResults.delete("test")
             } else if (typeof info?.command === "string") {
-              const existsMatch = info.command.match(/test -e ("(?:\\.|[^"])*") && echo "YES" \|\| echo "NO"/)
+              const existsMatch = info.command.match(/test -e ('(?:'\\''|[^'])*'|"(?:\\.|[^"])*") && echo "YES" \|\| echo "NO"/)
               if (existsMatch) {
-                const remotePath = JSON.parse(existsMatch[1])
+                const remotePath = existsMatch[1].startsWith("'")
+                  ? unquoteShellSingle(existsMatch[1])
+                  : JSON.parse(existsMatch[1])
                 stream.write(memFs.has(remotePath) ? "YES\n" : "NO\n")
               } else {
                 stream.write("ok\n")
@@ -149,6 +164,22 @@ describe("File Transfer - Upload Basic", () => {
     assert.equal(memFs.get("/remote/test.txt")?.toString(), "Hello World")
   })
 
+  it("uploads a file into an existing remote directory using the local basename", async () => {
+    const localPath = join(tmpDir, "dir-target.txt")
+    writeFileSync(localPath, "directory target")
+    memFs.clear()
+    enqueueExecResponse("NO\n")
+
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/uploads/")
+
+    assert.equal(result.success, true)
+    assert.equal(result.path, "/remote/uploads/dir-target.txt")
+    assert.equal(result.finalPath, "/remote/uploads/dir-target.txt")
+    assert.equal(result.targetType, "file")
+    assert.equal(result.action, "uploaded")
+    assert.equal(memFs.get("/remote/uploads/dir-target.txt")?.toString(), "directory target")
+  })
+
   it("uploads binary content", async () => {
     const localPath = join(tmpDir, "binary.bin")
     const data = Buffer.from([0x00, 0x01, 0x02, 0xFF, 0xFE])
@@ -204,6 +235,9 @@ describe("File Transfer - Overwrite Strategies", () => {
     const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/skip.txt", { overwrite: "skip" })
     assert.equal(result.success, true)
     assert.equal(result.size, 0)
+    assert.equal(result.action, "skipped")
+    assert.equal(result.skipped, true)
+    assert.equal(result.finalPath, "/remote/skip.txt")
     assert.equal(memFs.get("/remote/skip.txt")?.toString(), "old content")
   })
 })
@@ -234,6 +268,7 @@ describe("File Transfer - Line Ending Conversion", () => {
     assert.equal(result.success, true)
     const content = memFs.get("/remote/lf.txt")?.toString()
     assert.ok(content?.includes("\r\n"))
+    assert.equal(content?.includes("\0"), false)
   })
 
   it("preserves binary mode", async () => {
@@ -302,6 +337,19 @@ describe("File Transfer - Download Basic", () => {
     const result = await downloadFile(conn.getFinalClient(), "/remote/download.txt", localPath)
     assert.equal(result.success, true)
     assert.ok(existsSync(localPath))
+  })
+
+  it("downloads a file into an existing local directory using the remote basename", async () => {
+    const localDir = join(tmpDir, "downloads")
+    mkdirSync(localDir, { recursive: true })
+    memFs.set("/remote/nested/report.txt", Buffer.from("report content"))
+
+    const result = await downloadFile(conn.getFinalClient(), "/remote/nested/report.txt", localDir)
+
+    const expectedPath = join(localDir, "report.txt")
+    assert.equal(result.success, true)
+    assert.equal(result.path, expectedPath)
+    assert.equal(readFileSync(expectedPath, "utf8"), "report content")
   })
 })
 
