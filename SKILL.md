@@ -94,6 +94,21 @@ ssh-tool/
 | `ssh_cd` | 设置当前 AI 会话在该 host 上的默认 cwd | `path` |
 | `ssh_get_cwd` | 查询当前 AI 会话在该 host 上的默认 cwd | 连接参数 |
 
+### 项目命令配方
+
+| 工具 | 功能 | 核心参数 |
+|------|------|----------|
+| `ssh_command_list` | 按 project 列出已保存命令，运行记忆里的命令前先查 | `project` |
+| `ssh_command_get` | 按 `project + name` 查询命令配方 | `project`, `name` |
+| `ssh_command_register` | 保存或覆盖可复用项目命令 | `project`, `name`, `command`, `cwd`, `execution` |
+| `ssh_command_update` | 局部修改命令、cwd、说明或执行模式 | `project`, `name` |
+| `ssh_command_delete` | 删除过期命令配方 | `project`, `name` |
+| `ssh_command_run` | 查询或托管运行命令；默认 managed，返回 taskId | `project`, `name`, `run_mode` |
+
+命令配方使用版本化 JSON envelope 保存，当前 `schemaVersion=1`，并兼容旧的数组格式。默认存储在 scheduler 状态目录（通常是 `~/.ssh-tool/scheduler/state/commands.json`）。保存、修改、删除会使用跨进程文件锁，并在写入前重新读取最新文件再合并，避免多个 MCP 会话互相覆盖。
+
+未显式设置 `execution.mode` 时默认 `background`，适合测试、构建、脚本、服务等长命令；短命令可显式设为 `exec`。`ssh_command_run(run_mode="managed")` 走共享 scheduler/background，不绕过同一台 VM 上其他人的任务，会按现有 `intent`、`cost`、`if_busy` 和锁规则排队或串行。`log.mode` 固定为 `managed`，日志由 scheduler/output store 托管，AI 用 `taskId` 调 `ssh_exec_status` 查看，不需要默认下载到本地。
+
 ### 文件传输
 
 | 工具 | 功能 | 核心参数 |
@@ -147,16 +162,19 @@ ssh-tool/
 
 ## 给 AI Agent 的默认操作规则
 
-1. 会很快结束的检查命令用 `ssh_exec`，例如 `pwd`、`ls`、`git status`、短 `rg`、短脚本。
-2. 服务启动、watch mode、`tail -f`、日志流、长时间运行的 dev server，第一次就用 `ssh_exec_background`，然后用 `ssh_exec_status` 查看。
-3. 测试、构建、安装、脚本、迁移、部署这类重任务，若不需要立即等完整结果，优先用 `ssh_schedule` 提交并保存 `taskId`。
-4. 读写普通文本文件优先用 `ssh_read_file` / `ssh_write_file`，不要用 `ssh_exec cat/sed/echo/base64` 代替；完整文件、二进制、大文件优先用 `ssh_upload` / `ssh_download`。
-5. 不要绕过调度器。只有确认两个任务互不竞争 CPU、端口、工作目录、依赖缓存、数据库或全局状态时，才使用 `if_busy: "run_anyway"`。
-6. `scheduler: "bypass"` 是紧急逃生口，不是常规并发开关。它仍会登记任务，但会跳过排队。
-7. 如果返回 `action: "queued"`，不要重复提交同一个命令。保存 `taskId`，先做不依赖该结果的读文件、搜索、方案整理，再用 `ssh_wait_task`、`ssh_exec_status` 或 `ssh_queue_status` 查询。
-8. 如果返回 `waitTimedOut: true`，命令没有失败，只是前台等待超时。用 `ssh_exec_status` 查看同一个 `taskId`，不要直接重跑；如果这是服务/watch/log 命令，下次一开始就用 `ssh_exec_background`。
-9. 如果返回 `result.truncated: true`，内联 stdout/stderr 只是 tail。完整输出在 `result.stdoutPath` / `result.stderrPath`，需要时读取文件或用 `ssh_exec_status(mode="full")`。
-10. 不要用远端 `cd` 期待跨工具调用保持目录。用 `ssh_cd` 设置当前 AI 会话的默认 cwd，或每次显式传 `cwd`；不确定时用 `ssh_get_cwd` 或读返回的 `cwdState`。
+1. 运行项目常用命令前，先用 `ssh_command_list` / `ssh_command_get` 查保存过的配方，不要靠对话记忆重构。
+2. 发现可复用项目命令时，用 `ssh_command_register` 保存；命令、cwd 或执行模式变化时用 `ssh_command_update`；过期时用 `ssh_command_delete`。
+3. 命令配方默认适合长命令：优先用 `ssh_command_run(run_mode="managed")`，它会托管给 scheduler/background 并返回 `taskId`；只想自己执行时用 `run_mode="lookup"`。
+4. 会很快结束的检查命令用 `ssh_exec`，例如 `pwd`、`ls`、`git status`、短 `rg`、短脚本。
+5. 服务启动、watch mode、`tail -f`、日志流、长时间运行的 dev server，第一次就用 `ssh_exec_background`，然后用 `ssh_exec_status` 查看。
+6. 测试、构建、安装、脚本、迁移、部署这类重任务，若不使用命令配方且不需要立即等完整结果，优先用 `ssh_schedule` 提交并保存 `taskId`。
+7. 读写普通文本文件优先用 `ssh_read_file` / `ssh_write_file`，不要用 `ssh_exec cat/sed/echo/base64` 代替；完整文件、二进制、大文件优先用 `ssh_upload` / `ssh_download`。
+8. 不要绕过调度器。只有确认两个任务互不竞争 CPU、端口、工作目录、依赖缓存、数据库或全局状态时，才使用 `if_busy: "run_anyway"`。
+9. `scheduler: "bypass"` 是紧急逃生口，不是常规并发开关。它仍会登记任务，但会跳过排队。
+10. 如果返回 `action: "queued"`，不要重复提交同一个命令。保存 `taskId`，先做不依赖该结果的读文件、搜索、方案整理，再用 `ssh_wait_task`、`ssh_exec_status` 或 `ssh_queue_status` 查询。
+11. 如果返回 `waitTimedOut: true`，命令没有失败，只是前台等待超时。用 `ssh_exec_status` 查看同一个 `taskId`，不要直接重跑；如果这是服务/watch/log 命令，下次一开始就用 `ssh_exec_background`。
+12. 如果返回 `result.truncated: true`，内联 stdout/stderr 只是 tail。完整输出在 `result.stdoutPath` / `result.stderrPath`，需要时读取文件或用 `ssh_exec_status(mode="full")`。
+13. 不要用远端 `cd` 期待跨工具调用保持目录。用 `ssh_cd` 设置当前 AI 会话的默认 cwd，或每次显式传 `cwd`；不确定时用 `ssh_get_cwd` 或读返回的 `cwdState`。
 
 ### 返回结构读取规则
 

@@ -9,6 +9,7 @@ export type McpResponseKind =
   | "cleanup_result"
   | "host_load"
   | "cwd_result"
+  | "command_result"
   | "dequeue_result"
   | "transfer_result"
   | "file_result"

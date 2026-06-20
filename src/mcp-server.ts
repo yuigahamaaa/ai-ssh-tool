@@ -51,6 +51,7 @@ import {
   handleMcpReadFile,
   handleMcpStat,
 } from "./mcp-file-tools.js"
+import { CommandRegistryStore, type CommandExecutionMode } from "./command-registry.js"
 
 interface HostConfig {
   host: string
@@ -121,6 +122,7 @@ async function main() {
 
   const profileManager = new ProfileManager()
   profileManager.load()
+  const commandRegistry = new CommandRegistryStore()
 
   // Client cache: profile name -> { client, forwardManager }
   const clientCache = new Map<string, ClientCacheEntry>()
@@ -399,6 +401,193 @@ async function main() {
     name: "ssh-tool",
     version: "2.0.0",
   })
+
+  function commandRegistryGuidance(extra: string[] = []): string[] {
+    return [
+      "Before running a remembered project command, call ssh_command_list or ssh_command_get instead of relying on conversation memory.",
+      "When you discover a reusable project command, store it with ssh_command_register so future agents can find it.",
+      "If a saved command changes, use ssh_command_update; if it is obsolete, use ssh_command_delete.",
+      "For long project commands, prefer ssh_command_run with run_mode=managed so logs stay scheduler-managed and you get a taskId.",
+      "Registry changes are persisted with a cross-process file lock, but avoid racing repeated writes to the same project + name.",
+      "Managed command runs use the shared VM scheduler; do not bypass queueing unless you are sure the work is independent.",
+      ...extra,
+    ]
+  }
+
+  function commandRegistryResponse(data: unknown, extraGuidance: string[] = []) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: jsonText(mcpEnvelope("command_result", data, commandRegistryGuidance(extraGuidance))),
+      }],
+    }
+  }
+
+  const commandExecutionSchema = z.object({
+    mode: z.enum(["exec", "schedule", "background"]).optional().describe("How to run this command by default: background (default), schedule, or exec"),
+    intent: z.enum(["inspect", "search", "test", "build", "install", "server", "deploy", "migration", "cleanup", "custom"]).optional().describe("Scheduler intent"),
+    cost: z.enum(["tiny", "small", "medium", "large", "exclusive"]).optional().describe("Estimated scheduler cost"),
+  })
+
+  // --- Project command registry ---
+  server.tool(
+    "ssh_command_list",
+    "List saved project command recipes. Use this before running remembered commands; commands are keyed by project + name.",
+    {
+      project: z.string().optional().describe("Project name to filter by"),
+    },
+    wrapTool("ssh_command_list", async ({ project }) => {
+      return commandRegistryResponse({
+        project: project ?? null,
+        commands: commandRegistry.list(project),
+      }, [
+        "If the command you need is missing, register it with ssh_command_register after you determine the right command/cwd/execution mode.",
+      ])
+    }),
+  )
+
+  server.tool(
+    "ssh_command_get",
+    "Get one saved project command recipe by project + name. After reading it, you may run it yourself with ssh_exec/ssh_schedule/ssh_exec_background or use ssh_command_run.",
+    {
+      project: z.string().describe("Project name"),
+      name: z.string().describe("Command recipe name"),
+    },
+    wrapTool("ssh_command_get", async ({ project, name }) => {
+      const command = commandRegistry.get(project, name)
+      if (!command) {
+        return commandRegistryResponse({ project, name, command: null }, [
+          "No saved command found. If you discover the correct command, save it with ssh_command_register.",
+        ])
+      }
+      return commandRegistryResponse({ command }, [
+        "You can run this yourself with the appropriate SSH tool, or call ssh_command_run with run_mode=managed to let ssh-tool submit it and manage logs.",
+      ])
+    }),
+  )
+
+  server.tool(
+    "ssh_command_register",
+    "Create or replace a saved project command recipe. Use this whenever you discover a reusable project command so future AI agents do not rely on memory.",
+    {
+      project: z.string().describe("Project name, e.g. repository or service name"),
+      name: z.string().describe("Stable command recipe name within the project"),
+      description: z.string().optional().describe("Short human-readable description"),
+      command: z.string().describe("Shell command to run"),
+      cwd: z.string().optional().describe("Working directory for this command"),
+      execution: commandExecutionSchema.optional().describe("Default execution metadata"),
+    },
+    wrapTool("ssh_command_register", async ({ project, name, description, command, cwd, execution }) => {
+      const saved = commandRegistry.register({ project, name, description, command, cwd, execution })
+      return commandRegistryResponse({ command: saved }, [
+        "Saved. Next time, call ssh_command_list or ssh_command_get before reconstructing this command from memory.",
+      ])
+    }),
+  )
+
+  server.tool(
+    "ssh_command_update",
+    "Patch an existing saved project command recipe. Use this when cwd, command text, description, or execution mode changes.",
+    {
+      project: z.string().describe("Project name"),
+      name: z.string().describe("Command recipe name"),
+      description: z.string().optional().describe("Replacement description"),
+      command: z.string().optional().describe("Replacement shell command"),
+      cwd: z.string().optional().describe("Replacement working directory"),
+      execution: commandExecutionSchema.optional().describe("Execution metadata patch"),
+    },
+    wrapTool("ssh_command_update", async ({ project, name, description, command, cwd, execution }) => {
+      const updated = commandRegistry.update(project, name, { description, command, cwd, execution })
+      if (!updated) {
+        return commandRegistryResponse({ project, name, command: null, updated: false }, [
+          "No saved command found to update. Use ssh_command_register to create it.",
+        ])
+      }
+      return commandRegistryResponse({ command: updated, updated: true }, [
+        "Updated. Future agents should use ssh_command_get/list rather than stale conversation memory.",
+      ])
+    }),
+  )
+
+  server.tool(
+    "ssh_command_delete",
+    "Delete an obsolete saved project command recipe.",
+    {
+      project: z.string().describe("Project name"),
+      name: z.string().describe("Command recipe name"),
+    },
+    wrapTool("ssh_command_delete", async ({ project, name }) => {
+      const deleted = commandRegistry.delete(project, name)
+      return commandRegistryResponse({ project, name, deleted }, [
+        deleted
+          ? "Deleted. If a replacement command exists, register it with ssh_command_register."
+          : "No saved command existed for this project + name.",
+      ])
+    }),
+  )
+
+  server.tool(
+    "ssh_command_run",
+    "Run or look up a saved project command recipe. Default run_mode=managed submits it through ssh-tool so taskId/logs are managed; run_mode=lookup only returns the recipe so the AI can execute it manually.",
+    {
+      project: z.string().describe("Project name"),
+      name: z.string().describe("Command recipe name"),
+      run_mode: z.enum(["managed", "lookup"]).optional().describe("managed (default) submits via scheduler/background/exec metadata; lookup only returns the command recipe"),
+      execution_mode: z.enum(["exec", "schedule", "background"]).optional().describe("Override the saved execution mode for this run"),
+      reason: z.string().optional().describe("Why you are running this saved command"),
+      urgency: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Urgency"),
+      if_busy: z.enum(["run_anyway", "wait", "queue", "fail"]).optional().describe("When host is busy"),
+      force: z.boolean().optional().describe("Force risky commands"),
+      timeout: z.number().optional().describe("Timeout in ms"),
+      profile_name: z.string().optional().describe("Profile name"),
+      profile_json: z.string().optional().describe("Profile JSON"),
+      profile_file: z.string().optional().describe("Profile file path"),
+    },
+    wrapTool("ssh_command_run", async (params) => {
+      const command = commandRegistry.get(params.project, params.name)
+      if (!command) {
+        return commandRegistryResponse({ project: params.project, name: params.name, command: null, run: null }, [
+          "No saved command found. Use ssh_command_list to inspect available commands or ssh_command_register after discovering the right command.",
+        ])
+      }
+      if (params.run_mode === "lookup") {
+        return commandRegistryResponse({ command, run: null }, [
+          "Lookup only. You may execute this manually with ssh_exec, ssh_schedule, or ssh_exec_background, or call ssh_command_run with run_mode=managed.",
+        ])
+      }
+
+      const executionMode = (params.execution_mode ?? command.execution.mode) as CommandExecutionMode
+      const decision = await scheduleCommand({
+        command: command.command,
+        cwd: command.cwd,
+        scheduler: "auto",
+        reason: params.reason ?? `Saved command ${command.project}/${command.name}: ${command.description ?? command.command}`,
+        intent: command.execution.intent,
+        cost: command.execution.cost,
+        urgency: params.urgency as TaskUrgency | undefined,
+        if_busy: params.if_busy,
+        force: params.force,
+        timeout: params.timeout,
+        background: executionMode === "background",
+        profile_name: params.profile_name,
+        profile_json: params.profile_json,
+        profile_file: params.profile_file,
+      })
+      const enrichedDecision = withDecisionCwdState(decision)
+      return commandRegistryResponse({
+        command,
+        run: {
+          mode: executionMode,
+          managed: true,
+          decision: enrichedDecision,
+          taskId: enrichedDecision.taskId ?? null,
+        },
+      }, [
+        "Managed run submitted. Do not rerun this command if it is queued or still running; use ssh_exec_status, ssh_wait_task, or ssh_queue_status with the taskId.",
+        "Logs are managed by ssh-tool scheduler output paths; use ssh_exec_status to inspect tails or full output.",
+      ])
+    }),
+  )
 
   // --- Remote execution ---
   server.tool(
