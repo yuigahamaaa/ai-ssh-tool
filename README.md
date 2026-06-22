@@ -359,6 +359,17 @@ All MCP file tools return a JSON envelope with `ok`, `kind`, `data`, `error`, an
 
 `ssh_read_file` reads metadata before content, refuses binary text rendering, and caps inline text at 1 MiB. Use `offset`/`limit` for another slice or `ssh_download` for lossless full-file transfer.
 
+### Transfer Tool Return Contract
+
+`ssh_upload` and `ssh_download` are binary-safe and lossless. Prefer them for full files, large files, archives, and binary data; do not use shell/base64 unless the user explicitly asks.
+
+- Both tools return `ok/kind/data/agentGuidance`, where `data` contains `success`, `action`, `targetType`, `sourcePath`, `requestedPath`, `finalPath`, `size`, `sourceBytes`, `bytesTransferred`, `checksum`, `verification`, `overwriteStrategy`, `skipped`, `overwritten`, `renamed`, and `backupPath` when applicable.
+- Overwrite strategies are non-interactive: `overwrite` (default), `skip`, `rename`, or `backup`. There is no `ask` mode in MCP.
+- File upload targets: pass `/dir/name.ext` for an exact remote filename, or `/dir/` / an existing remote directory to keep the local basename.
+- File download targets: pass an exact local file path, or an existing/local path ending in `/` to keep the remote basename.
+- Folder downloads treat `local_path` as the destination parent directory. If the extracted folder already exists, `skip`, `rename`, and `backup` are reflected in `action/finalPath/skipped/renamed/backupPath`.
+- Always use `data.finalPath` for follow-up operations; it may differ from `requestedPath` after directory-target resolution or `rename`.
+
 ---
 
 ### Configuration
@@ -846,6 +857,17 @@ node dist/cli/ssh-exec.js daemon bg-exec --config server.json \
 - `ssh_find`：`data.results[]` 包含 `path`、`type`、`sizeBytes`、`mtime`，并带 `count`、`noResults`。
 
 `ssh_read_file` 会先读取元数据，不把二进制当文本返回，并把内联文本限制在 1 MiB。需要继续读时用 `offset`/`limit` 分片；需要完整无损文件时用 `ssh_download`。
+
+### 传输工具返回契约
+
+`ssh_upload` 和 `ssh_download` 是二进制安全、无损传输路径。完整文件、大文件、压缩包、二进制数据应优先使用它们；除非用户明确要求，不要用 shell/base64 自己搬运。
+
+- 两个工具都返回 `ok/kind/data/agentGuidance`，其中 `data` 包含 `success`、`action`、`targetType`、`sourcePath`、`requestedPath`、`finalPath`、`size`、`sourceBytes`、`bytesTransferred`、`checksum`、`verification`、`overwriteStrategy`、`skipped`、`overwritten`、`renamed`、`backupPath` 等字段。
+- 覆盖策略是非交互式：`overwrite`（默认）、`skip`、`rename`、`backup`。MCP 里没有 `ask`。
+- 上传文件目标：传 `/dir/name.ext` 表示精确远端文件名；传 `/dir/` 或已存在远端目录表示保留本地 basename。
+- 下载文件目标：传精确本地文件路径；或传已存在目录 / 以 `/` 结尾路径表示保留远端 basename。
+- 下载文件夹时，`local_path` 是目标父目录。若解压后的同名文件夹已存在，`skip`、`rename`、`backup` 会体现在 `action/finalPath/skipped/renamed/backupPath`。
+- 后续操作始终使用 `data.finalPath`；它可能因目录目标识别或 `rename` 与 `requestedPath` 不同。
 
 ---
 

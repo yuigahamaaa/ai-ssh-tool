@@ -231,6 +231,11 @@ describe("Smart Transfer (upload/download auto-detect)", () => {
         // If the local tar somehow succeeded, we still must have hit
         // uploadFolder (size > 0 because the archive is non-empty)
         assert.ok(result.size > 0, "successful folder upload should report non-zero size")
+        assert.equal(result.sourceBytes, result.size)
+        assert.equal(result.bytesTransferred, result.size)
+        assert.equal(result.checksum?.algorithm, "sha256")
+        assert.ok(result.checksum?.source, "successful folder upload should report archive checksum")
+        assert.equal(result.verification?.sizeMatched, true)
       } else {
         assert.ok(result.error, "error should be present on failure")
         // uploadFolder is the only path that would have produced this result
@@ -277,6 +282,45 @@ describe("Smart Transfer (upload/download auto-detect)", () => {
       // The first queued response was consumed (otherwise it would
       // pollute later tests).
       assert.equal(execResponses.length < 5, true, "exec queue should be partially drained")
+    })
+
+    it("skips folder download when extracted destination exists and overwrite=skip", async () => {
+      resetMemFs()
+      enqueueExecResponse("DIR\n")
+      enqueueExecResponse("DIR\n")
+      const localPath = join(tmpDir, "folder-skip-parent")
+      const existingExtractedDir = join(localPath, "some-folder")
+      mkdirSync(existingExtractedDir, { recursive: true })
+      writeFileSync(join(existingExtractedDir, "keep.txt"), "keep")
+
+      const result = await download(conn.getFinalClient(), "/remote/some-folder", localPath, { overwrite: "skip" })
+
+      assert.equal(result.success, true)
+      assert.equal(result.action, "skipped")
+      assert.equal(result.skipped, true)
+      assert.equal(result.targetType, "directory")
+      assert.equal(result.finalPath, existingExtractedDir)
+      assert.equal(execResponses.length, 0, "should not run tar/stat/download after skip")
+    })
+
+    it("renames folder download target when extracted destination exists and overwrite=rename", async () => {
+      resetMemFs()
+      enqueueExecResponse("DIR\n")
+      enqueueExecResponse("DIR\n")
+      enqueueExecResponse("ok\n")
+      enqueueExecResponse("0\n")
+      enqueueExecResponse("ok\n")
+      enqueueExecResponse("ok\n")
+      const localPath = join(tmpDir, "folder-rename-parent")
+      const existingExtractedDir = join(localPath, "some-folder")
+      mkdirSync(existingExtractedDir, { recursive: true })
+
+      const result = await download(conn.getFinalClient(), "/remote/some-folder", localPath, { overwrite: "rename" })
+
+      assert.equal(result.finalPath, `${existingExtractedDir}.1`)
+      assert.equal(result.requestedPath, localPath)
+      assert.equal(result.renamed, true)
+      assert.equal(result.overwriteStrategy, "rename")
     })
 
     it("dispatches to downloadFile when test -d returns FILE", async () => {

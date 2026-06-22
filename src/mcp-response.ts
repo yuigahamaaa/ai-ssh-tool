@@ -43,6 +43,29 @@ export interface CancelTaskPayload {
   cancelled: boolean
 }
 
+export interface TransferGuidancePayload {
+  success: boolean
+  path: string
+  finalPath?: string
+  requestedPath?: string
+  sourcePath?: string
+  action?: string
+  targetType?: string
+  size: number
+  sourceBytes?: number
+  bytesTransferred?: number
+  checksum?: {
+    algorithm?: string
+    source?: string
+    destination?: string
+  }
+  verification?: {
+    sizeMatched?: boolean
+    checksumMatched?: boolean
+  }
+  error?: string
+}
+
 export function guidanceForScheduleDecision(decision: ScheduleDecision): string[] {
   const guidance: string[] = []
 
@@ -95,6 +118,43 @@ export function guidanceForWaitResult(task: ScheduledTask, waitTimedOut: boolean
     ]
   }
   return guidanceForTaskStatus(task, output)
+}
+
+export function guidanceForTransferResult(direction: "upload" | "download", result: TransferGuidancePayload): string[] {
+  if (!result.success) {
+    return [
+      `${direction === "upload" ? "Upload" : "Download"} failed: ${result.error ?? "unknown error"}. Inspect the error and adjust paths/options first.`,
+      "Do not retry with manual shell/base64 unless the user explicitly asks; ssh_upload/ssh_download are the binary-safe transfer path.",
+    ]
+  }
+
+  const finalPath = result.finalPath ?? result.path
+  const action = result.action ?? (direction === "upload" ? "uploaded" : "downloaded")
+  const guidance = [
+    `${direction === "upload" ? "Upload" : "Download"} ${action}. Final ${direction === "upload" ? "remote" : "local"} path: ${finalPath}.`,
+  ]
+
+  if (result.requestedPath && result.requestedPath !== finalPath) {
+    guidance.push(`Requested destination was ${result.requestedPath}; use finalPath for follow-up operations.`)
+  }
+
+  if (result.bytesTransferred !== undefined || result.sourceBytes !== undefined) {
+    guidance.push(`Transferred ${result.bytesTransferred ?? result.size} bytes from ${result.sourceBytes ?? result.size} source bytes.`)
+  }
+
+  if (result.verification?.sizeMatched === true) {
+    guidance.push("Size verification passed.")
+  } else if (result.verification?.sizeMatched === false) {
+    guidance.push("Size verification did not match; inspect the transfer result before using the file.")
+  }
+
+  const checksum = result.checksum?.destination ?? result.checksum?.source
+  if (checksum && result.checksum?.algorithm) {
+    guidance.push(`${result.checksum.algorithm} checksum: ${checksum}.`)
+  }
+
+  guidance.push("This transfer path is binary-safe and lossless; do not use shell/base64 as a workaround.")
+  return guidance
 }
 
 export function mcpEnvelope<T>(

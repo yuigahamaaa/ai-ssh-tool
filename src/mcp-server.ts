@@ -33,6 +33,7 @@ import type { AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency, Sc
 import { createMcpScheduleRequest, profileToLegacyConfigJson } from "./mcp-scheduler-contract.js"
 import {
   guidanceForTaskStatus,
+  guidanceForTransferResult,
   guidanceForWaitResult,
   jsonText,
   mcpEnvelope,
@@ -562,12 +563,12 @@ async function main() {
   // --- File transfer ---
   server.tool(
     "ssh_upload",
-    "Upload a local file or folder to the remote server. Automatically detects file/folder type. For files, remote_path may be either a full destination file path or an existing/explicit directory path ending with '/'; directory targets use the local basename. Default overwrite strategy is overwrite. Do not set line_ending or encoding for binary files.",
+    "Upload a local file or folder to the remote server using a binary-safe transfer path. Automatically detects file/folder type. For files, remote_path may be either a full destination file path or an existing/explicit directory path ending with '/'; directory targets use the local basename. Default overwrite strategy is overwrite. Do not use shell/base64 for file transfer unless explicitly requested.",
     {
       local_path: z.string().describe("Local file/folder path to upload"),
       remote_path: z.string().describe("Destination path on remote server. For file uploads, pass '/dir/name.ext' for an exact filename or '/dir/' to keep the local filename."),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
-      overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
+      overwrite: z.enum(["skip", "overwrite", "rename", "backup"]).optional().describe("Non-interactive overwrite strategy (default: overwrite). Use rename or backup when preserving existing files."),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
       encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
@@ -587,11 +588,7 @@ async function main() {
       return {
         content: [{
           type: "text" as const,
-          text: jsonText(mcpEnvelope("transfer_result", result, [
-            result.success
-              ? `Upload completed. Final remote path: ${result.path}.`
-              : `Upload failed: ${result.error ?? "unknown error"}. Do not retry with manual base64 unless the user explicitly asks; inspect the error and adjust paths/options first.`,
-          ])),
+          text: jsonText(mcpEnvelope("transfer_result", result, guidanceForTransferResult("upload", result))),
         }],
       }
     },
@@ -599,12 +596,12 @@ async function main() {
 
   server.tool(
     "ssh_download",
-    "Download a remote file or folder to the local machine. Automatically detects file/folder type. For files, local_path may be either a full destination file path or an existing/explicit directory path ending with the local path separator; directory targets use the remote basename. For folders, local_path is the destination parent/extract directory. Default overwrite strategy is overwrite. Do not set line_ending or encoding for binary files.",
+    "Download a remote file or folder to the local machine using a binary-safe transfer path. Automatically detects file/folder type. For files, local_path may be either a full destination file path or an existing/explicit directory path ending with the local path separator; directory targets use the remote basename. For folders, local_path is the destination parent/extract directory. Default overwrite strategy is overwrite. Do not use shell/base64 for file transfer unless explicitly requested.",
     {
       remote_path: z.string().describe("Remote file/folder path to download"),
       local_path: z.string().describe("Local destination path. For file downloads, pass an exact local file path or an existing directory to keep the remote filename; for folder downloads this is the extract directory."),
       compression_level: z.number().optional().describe("Compression level 1-9 (default: 6)"),
-      overwrite: z.enum(["ask", "skip", "overwrite", "rename", "backup"]).optional().describe("Overwrite strategy (default: overwrite)"),
+      overwrite: z.enum(["skip", "overwrite", "rename", "backup"]).optional().describe("Non-interactive overwrite strategy (default: overwrite). Use rename or backup when preserving existing files."),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
       encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
@@ -624,11 +621,7 @@ async function main() {
       return {
         content: [{
           type: "text" as const,
-          text: jsonText(mcpEnvelope("transfer_result", result, [
-            result.success
-              ? `Download completed. Final local path: ${result.path}.`
-              : `Download failed: ${result.error ?? "unknown error"}. Do not retry with manual base64 unless the user explicitly asks; inspect the error and adjust paths/options first.`,
-          ])),
+          text: jsonText(mcpEnvelope("transfer_result", result, guidanceForTransferResult("download", result))),
         }],
       }
     },

@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { writeFileSync, unlinkSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
+import { createHash } from "crypto"
 import ssh2 from "ssh2"
 import { SSHConnection } from "../connection.js"
 import { uploadFile, downloadFile } from "../file-transfer.js"
@@ -159,6 +160,11 @@ describe("File Transfer - Upload Basic", () => {
     const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/test.txt")
     assert.equal(result.success, true)
     assert.equal(result.size, 11)
+    assert.equal(result.sourceBytes, 11)
+    assert.equal(result.bytesTransferred, 11)
+    assert.equal(result.verification?.sizeMatched, true)
+    assert.equal(result.checksum?.algorithm, "sha256")
+    assert.equal(result.checksum?.source, createHash("sha256").update("Hello World").digest("hex"))
     assert.ok(result.duration >= 0)
     assert.ok(memFs.has("/remote/test.txt"))
     assert.equal(memFs.get("/remote/test.txt")?.toString(), "Hello World")
@@ -239,6 +245,22 @@ describe("File Transfer - Overwrite Strategies", () => {
     assert.equal(result.skipped, true)
     assert.equal(result.finalPath, "/remote/skip.txt")
     assert.equal(memFs.get("/remote/skip.txt")?.toString(), "old content")
+  })
+
+  it("reports resolved finalPath when skipping upload into a directory target", async () => {
+    const localPath = join(tmpDir, "skip-dir-target.txt")
+    writeFileSync(localPath, "new content")
+    memFs.set("/remote/uploads/skip-dir-target.txt", Buffer.from("old content"))
+
+    const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/uploads/", { overwrite: "skip" })
+
+    assert.equal(result.success, true)
+    assert.equal(result.action, "skipped")
+    assert.equal(result.skipped, true)
+    assert.equal(result.path, "/remote/uploads/skip-dir-target.txt")
+    assert.equal(result.finalPath, "/remote/uploads/skip-dir-target.txt")
+    assert.equal(result.requestedPath, "/remote/uploads/")
+    assert.equal(memFs.get("/remote/uploads/skip-dir-target.txt")?.toString(), "old content")
   })
 })
 
@@ -336,6 +358,11 @@ describe("File Transfer - Download Basic", () => {
     const localPath = join(tmpDir, "download.txt")
     const result = await downloadFile(conn.getFinalClient(), "/remote/download.txt", localPath)
     assert.equal(result.success, true)
+    assert.equal(result.sourceBytes, "downloaded content".length)
+    assert.equal(result.bytesTransferred, "downloaded content".length)
+    assert.equal(result.verification?.sizeMatched, true)
+    assert.equal(result.checksum?.algorithm, "sha256")
+    assert.equal(result.checksum?.destination, createHash("sha256").update("downloaded content").digest("hex"))
     assert.ok(existsSync(localPath))
   })
 
@@ -350,6 +377,62 @@ describe("File Transfer - Download Basic", () => {
     assert.equal(result.success, true)
     assert.equal(result.path, expectedPath)
     assert.equal(readFileSync(expectedPath, "utf8"), "report content")
+  })
+})
+
+describe("File Transfer - Download Overwrite Strategies", () => {
+  let srv: Awaited<ReturnType<typeof createTestServer>>
+  let conn: SSHConnection
+  let tmpDir: string
+
+  before(async () => {
+    srv = await createTestServer()
+    conn = new SSHConnection()
+    await conn.connect({ chain: [{ id: "t1", ...srv.hostConfig }], timeout: 5000 })
+    tmpDir = join(tmpdir(), "ssh-tool-test-download-overwrite")
+    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
+  })
+
+  after(async () => {
+    await conn.disconnect()
+    await srv.cleanup()
+  })
+
+  it("renames local download target when requested", async () => {
+    const localPath = join(tmpDir, "rename.txt")
+    writeFileSync(localPath, "old local content")
+    try { unlinkSync(`${localPath}.1`) } catch {}
+    memFs.set("/remote/rename.txt", Buffer.from("new remote content"))
+
+    const result = await downloadFile(conn.getFinalClient(), "/remote/rename.txt", localPath, { overwrite: "rename" })
+
+    assert.equal(result.success, true)
+    assert.equal(result.action, "downloaded")
+    assert.equal(result.overwriteStrategy, "rename")
+    assert.equal(result.renamed, true)
+    assert.equal(result.requestedPath, localPath)
+    assert.equal(result.finalPath, `${localPath}.1`)
+    assert.equal(result.path, `${localPath}.1`)
+    assert.equal(readFileSync(localPath, "utf8"), "old local content")
+    assert.equal(readFileSync(`${localPath}.1`, "utf8"), "new remote content")
+  })
+
+  it("reports backup metadata when backing up local download target", async () => {
+    const localPath = join(tmpDir, "backup.txt")
+    const backupPath = `${localPath}.bak`
+    writeFileSync(localPath, "old local content")
+    try { unlinkSync(backupPath) } catch {}
+    memFs.set("/remote/backup.txt", Buffer.from("new remote content"))
+
+    const result = await downloadFile(conn.getFinalClient(), "/remote/backup.txt", localPath, { overwrite: "backup" })
+
+    assert.equal(result.success, true)
+    assert.equal(result.action, "downloaded")
+    assert.equal(result.overwriteStrategy, "backup")
+    assert.equal(result.backupPath, backupPath)
+    assert.equal(result.overwritten, false)
+    assert.equal(readFileSync(backupPath, "utf8"), "old local content")
+    assert.equal(readFileSync(localPath, "utf8"), "new remote content")
   })
 })
 

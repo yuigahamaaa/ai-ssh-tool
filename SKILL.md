@@ -100,6 +100,16 @@ ssh-tool/
 | `ssh_upload` | 上传文件/文件夹 | `local_path`, `remote_path` |
 | `ssh_download` | 下载文件/文件夹 | `remote_path`, `local_path` |
 
+#### 传输工具使用契约
+
+- `ssh_upload` / `ssh_download` 是二进制安全、无损传输路径。完整文件、大文件、压缩包、二进制文件必须优先用它们；不要自行 `base64`、`cat`、`echo` 传输，除非用户明确要求。
+- 返回值是统一 envelope：读取 `data.success`、`action`、`targetType`、`sourcePath`、`requestedPath`、`finalPath`、`sourceBytes`、`bytesTransferred`、`checksum`、`verification`、`overwriteStrategy`、`skipped`、`overwritten`、`renamed`、`backupPath`。
+- 后续读写、执行、解压、校验时用 `data.finalPath`，不要猜目标路径；`rename` 或目录目标识别会让它不同于 `requestedPath`。
+- 覆盖策略只有非交互式 `overwrite`（默认）、`skip`、`rename`、`backup`；没有 `ask`。
+- 上传文件：`remote_path=/dir/name.ext` 表示精确文件名，`/dir/` 或已存在远端目录表示保留本地 basename。
+- 下载文件：`local_path=/dir/name.ext` 表示精确文件名，已有目录或以 `/` 结尾表示保留远端 basename。
+- 下载文件夹：`local_path` 是父目录；若解压出的同名目录存在，按 `skip/rename/backup` 处理，并查看 `finalPath`。
+
 ### 后台任务
 
 | 工具 | 功能 | 核心参数 |

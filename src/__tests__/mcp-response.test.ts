@@ -2,6 +2,7 @@ import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import {
   guidanceForTaskStatus,
+  guidanceForTransferResult,
   guidanceForWaitResult,
   mcpEnvelope,
   scheduleDecisionEnvelope,
@@ -102,5 +103,28 @@ describe("MCP response envelopes", () => {
       data: { taskId: "t_1", cancelled: false },
       agentGuidance: ["check status"],
     })
+  })
+
+  it("gives transfer results binary-safe guidance with bytes and checksum", () => {
+    const guidance = guidanceForTransferResult("download", {
+      success: true,
+      path: "/tmp/requested.txt.1",
+      finalPath: "/tmp/requested.txt.1",
+      requestedPath: "/tmp/requested.txt",
+      action: "downloaded",
+      targetType: "file",
+      size: 5,
+      sourceBytes: 5,
+      bytesTransferred: 5,
+      checksum: { algorithm: "sha256", destination: "abc123" },
+      verification: { sizeMatched: true },
+    })
+
+    assert.ok(guidance.some(g => g.includes("Final local path: /tmp/requested.txt.1")))
+    assert.ok(guidance.some(g => g.includes("Requested destination was /tmp/requested.txt")))
+    assert.ok(guidance.some(g => g.includes("Transferred 5 bytes from 5 source bytes")))
+    assert.ok(guidance.some(g => g.includes("sha256 checksum: abc123")))
+    assert.ok(guidance.some(g => g.includes("binary-safe")))
+    assert.ok(guidance.some(g => g.includes("do not use shell/base64")))
   })
 })
