@@ -239,6 +239,10 @@ export class DaemonClient {
     return this.send(createRequest("setCwd", { agent, host, cwd }))
   }
 
+  async getCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }): Promise<IPCResponse> {
+    return this.send(createRequest("getCwd", { agent, host }))
+  }
+
   private async startDaemon(opts?: { debug?: boolean; label?: string }): Promise<void> {
     const daemonScript = this.findDaemonScript()
     const args = [daemonScript]

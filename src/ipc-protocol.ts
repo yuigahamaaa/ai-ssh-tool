@@ -69,6 +69,7 @@ export type IPCRequest =
   | { id: string; action: "cleanupOutputs"; params: Record<string, never> }
   | { id: string; action: "abortActiveTasks"; params: { reason: string } }
   | { id: string; action: "setCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }; cwd: string } }
+  | { id: string; action: "getCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string } } }
   | { id: string; action: "list" }
   | { id: string; action: "ping" }
   | { id: string; action: "shutdown" }
@@ -283,7 +284,7 @@ export function createRequest(
   params?: Record<string, unknown>,
 ): IPCRequest {
   const id = randomUUID()
-  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec" || action === "portForward" || action === "schedule" || action === "queueStatus" || action === "waitTask" || action === "dequeueTask" || action === "cancelTask" || action === "getTaskOutput" || action === "getTaskStatus" || action === "cleanupOutputs" || action === "abortActiveTasks" || action === "setCwd") {
+  if (action === "connect" || action === "connectJson" || action === "exec" || action === "disconnect" || action === "transfer" || action === "bgExec" || action === "portForward" || action === "schedule" || action === "queueStatus" || action === "waitTask" || action === "dequeueTask" || action === "cancelTask" || action === "getTaskOutput" || action === "getTaskStatus" || action === "cleanupOutputs" || action === "abortActiveTasks" || action === "setCwd" || action === "getCwd") {
     return { id, action, params: params as any }
   }
   return { id, action } as IPCRequest

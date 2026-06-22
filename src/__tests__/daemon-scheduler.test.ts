@@ -65,6 +65,15 @@ describe("IPC Scheduler Actions", () => {
     assert.equal((req as any).params.cwd, "/repo")
   })
 
+  it("createRequest supports getCwd action", () => {
+    const req = createRequest("getCwd", {
+      agent: { id: "a1", clientType: "mcp" },
+      host: { id: "h1", profileKey: "pk1", targetHost: "host", targetUser: "user", displayName: "host" },
+    })
+    assert.equal(req.action, "getCwd")
+    assert.equal((req as any).params.host.targetHost, "host")
+  })
+
   it("encode/decode new request preserves action and params", () => {
     const req = createRequest("schedule", {
       agent: { id: "a1", clientType: "mcp" },

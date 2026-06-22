@@ -4,14 +4,19 @@
 
 ## 默认原则
 
-1. 默认使用 `ssh_exec`。它已经接入共享调度器。
-2. 测试、构建、安装、脚本、部署、迁移、服务启动默认串行。
-3. `if_busy="run_anyway"` 只在确认任务彼此独立时使用。
-4. `scheduler="bypass"` 是紧急逃生口，少用。
-5. queued 不是失败，不要重复提交同一命令。
-6. wait timeout 不是失败，用同一个 `taskId` 查状态。
-7. 输出被截断时读 `stdoutPath` / `stderrPath`，不要重跑命令。
-8. 跨调用保持目录用 `ssh_cd` 或显式 `cwd`，不要依赖远端 shell 的 `cd`。
+1. 运行项目常用命令前，先用 `ssh_command_list` / `ssh_command_get` 查配方。
+2. 发现可复用命令就用 `ssh_command_register` 保存；变化用 `ssh_command_update`；过期用 `ssh_command_delete`。
+3. 已保存命令默认用 `ssh_command_run(run_mode="managed")` 托管执行，拿 `taskId` 查进度和日志。
+4. 只想查命令自己执行时，用 `ssh_command_run(run_mode="lookup")` 或 `ssh_command_get`。
+5. `ssh_command_run(run_mode="managed")` 走共享 scheduler/background，不绕过同一台 VM 上其他人的任务。
+6. 命令配方保存、修改、删除是持久化操作，内部有跨进程文件锁；仍然不要反复并发写同一个 `project + name`。
+7. 测试、构建、安装、脚本、部署、迁移、服务启动默认串行。
+8. `if_busy="run_anyway"` 只在确认任务彼此独立时使用。
+9. `scheduler="bypass"` 是紧急逃生口，少用。
+10. queued 不是失败，不要重复提交同一命令。
+11. wait timeout 不是失败，用同一个 `taskId` 查状态。
+12. 输出被截断时读 `stdoutPath` / `stderrPath`，不要重跑命令。
+13. 跨调用保持目录用 `ssh_cd` 或显式 `cwd`，不要依赖远端 shell 的 `cd`。
 
 ## 返回结构读取规则
 
@@ -177,7 +182,7 @@
 
 ## 虚拟工作目录
 
-`ssh_cd` 不是远端 shell 的持久 `cd`。它只是在调度器里按 `AI agent + host` 保存一个虚拟 cwd；后续未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会自动使用这个目录。
+`ssh_cd` 不是远端 shell 的持久 `cd`。它会在调度器里按 `AI agent + host` 保存默认 cwd；后续未显式传 `cwd` 的 `ssh_exec` / `ssh_schedule` 会自动使用这个目录。
 
 设置当前 AI 会话在某个 host 上的默认目录：
 
@@ -193,6 +198,12 @@
 
 这个 cwd 按 `AI agent + host` 隔离，不影响其他 AI，也不会改变共享 SSH 会话的真实 shell 状态。
 
+如果不确定当前默认目录，先调用 `ssh_get_cwd`。同时，执行相关返回会带 `cwdState`，其中：
+
+- `effectiveCwd`：本次命令实际运行目录
+- `virtualCwd`：当前 AI 会话在该 host 上保存的默认目录
+- `source`：cwd 来源是 `explicit`、`virtual` 或 `none`
+
 ## 常见错误
 
 | 错误做法 | 正确做法 |
@@ -202,12 +213,22 @@
 | 日志 tail 不够就重跑测试 | 读取 `stdoutPath` / `stderrPath` |
 | 为了快给测试加 bypass | 默认排队；确认独立才 `run_anyway` |
 | 多次调用里依赖 `cd` 状态 | 用 `ssh_cd` 或显式 `cwd` |
+| 服务/watch/log 命令先用前台跑到超时 | 一开始用 `ssh_exec_background`，再用 `ssh_exec_status` |
+| 普通读写文件用 shell cat/echo/base64 | 用 `ssh_read_file` / `ssh_write_file`，完整或二进制文件用传输工具 |
+| 凭记忆重构项目常用命令 | 先用 `ssh_command_list` / `ssh_command_get` 查配方 |
+| 发现常用命令但不保存 | 用 `ssh_command_register` 存起来，变化时用 `ssh_command_update` |
 
 ## 快速判断表
 
 | 命令类型 | 建议 |
 |---|---|
-| `pwd`, `ls`, `cat`, `rg`, `git status` | 直接 `ssh_exec` |
+| `pwd`, `ls`, `rg`, `git status` | 直接 `ssh_exec` |
+| 读取/写入文本文件 | `ssh_read_file` / `ssh_write_file` |
+| 完整文件、大文件、二进制、压缩包 | `ssh_upload` / `ssh_download` |
+| 已保存的项目常用命令 | `ssh_command_run(run_mode="managed")`，默认返回 `taskId` 且日志托管 |
+| 只想查命令自己执行 | `ssh_command_run(run_mode="lookup")` 或 `ssh_command_get` |
+| `npm run dev`, `tail -f`, watch/server/log stream | `ssh_exec_background` + `ssh_exec_status` |
+| 测试、构建、安装、迁移、部署且可以稍后看结果 | `ssh_schedule` + `ssh_wait_task` / `ssh_exec_status` |
 | `npm test`, `pytest`, `go test`, `cargo test` | `intent="test"`, 默认串行 |
 | `npm run build`, `make`, `cargo build` | `intent="build"`, 默认串行 |
 | `npm install`, `pip install`, `apt install` | `intent="install"`, 默认串行 |

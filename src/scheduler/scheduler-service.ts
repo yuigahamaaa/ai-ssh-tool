@@ -1,6 +1,7 @@
 
 import { randomUUID } from "crypto"
 import type {
+  CwdSource,
   ScheduleRequest,
   ScheduleDecision,
   ScheduledTask,
@@ -671,6 +672,10 @@ export class SchedulerService {
     return state.cwd
   }
 
+  getCwdState(agentId: string, hostId: string) {
+    return this.virtualCwdStore.get(agentId, hostId)
+  }
+
   resolveCwd(agentId: string, hostId: string, explicitCwd?: string): string | undefined {
     return this.virtualCwdStore.resolve(agentId, hostId, explicitCwd)
   }
@@ -722,6 +727,7 @@ export class SchedulerService {
   }
 
   private createTask(req: ScheduleRequest, effectiveCwd: string | undefined, classification: CommandClassification): ScheduledTask {
+    const cwdSource: CwdSource = req.cwd ? "explicit" : effectiveCwd ? "virtual" : "none"
     return {
       id: req.id ?? `t_${randomUUID().slice(0, 10)}`,
       agentId: req.agent.id,
@@ -731,6 +737,7 @@ export class SchedulerService {
       sessionId: req.sessionId,
       command: req.command,
       effectiveCwd,
+      cwdSource,
       reason: req.reason,
       classification,
       scheduler: req.scheduler ?? "auto",
