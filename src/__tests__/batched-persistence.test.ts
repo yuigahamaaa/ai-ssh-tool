@@ -128,7 +128,7 @@ describe("BatchedPersistenceStore", () => {
   })
 
   it("shares on-disk layout with the inner store (no path duplication)", () => {
-    // The wrapper must not create a second ~/.ssh-tool/scheduler directory
+    // The wrapper must not create a second scheduler directory
     // on top of the inner one. Verifying with a shared baseDir: a file
     // written via the inner is visible to batch.loadTask, and vice versa.
     batch.saveTask(makeTask("shared"))

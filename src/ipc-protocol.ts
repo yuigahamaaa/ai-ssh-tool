@@ -6,8 +6,7 @@
 
 import type { Socket } from "net"
 import { randomUUID } from "crypto"
-import { join } from "path"
-import { homedir } from "os"
+import { getDaemonSocketPath, getDaemonPidPath } from "./paths.js"
 
 /**
  * Debug logger for malformed-frame diagnostics. We intentionally avoid
@@ -22,28 +21,14 @@ function debugLog(channel: string, message: string): void {
   }
 }
 
-/**
- * Get user data directory with cross-platform support.
- */
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
-
 // --- Transport paths ---
 
 export function getPipePath(): string {
-  if (process.platform === "win32") {
-    return "\\\\.\\pipe\\ssh-exec-daemon"
-  }
-  return join(getUserDataDir(), ".ssh-exec-daemon.sock")
+  return getDaemonSocketPath()
 }
 
 export function getPidPath(): string {
-  return join(getUserDataDir(), ".ssh-exec-daemon.pid")
+  return getDaemonPidPath()
 }
 
 import type { ScheduleRequest } from "./scheduler/types.js"

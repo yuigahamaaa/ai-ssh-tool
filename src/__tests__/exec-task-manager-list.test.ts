@@ -14,22 +14,23 @@ import { rmSync, mkdirSync, existsSync, readdirSync, writeFileSync, unlinkSync }
 import { join } from "path"
 import { tmpdir } from "os"
 
-// Override HOME before importing the module so the storage dir is temp-scoped.
-const testHome = join(tmpdir(), `etm-list-test-${Date.now()}-${process.pid}`)
-const origHome = process.env.HOME
+// Override SSH_TOOL_DATA_DIR before importing the module so the storage dir is temp-scoped.
+const testDataDir = join(tmpdir(), `etm-list-test-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
 
 function setup() {
-  mkdirSync(testHome, { recursive: true })
-  process.env.HOME = testHome
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
 }
 
 function teardown() {
-  process.env.HOME = origHome
-  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+  if (origDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+  else process.env.SSH_TOOL_DATA_DIR = origDataDir
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
 }
 
 function writeDiskTask(task: { id: string; hostname: string; startedAt: number; status: string; command: string; stdout?: string; stderr?: string }): void {
-  const dir = join(testHome, ".ssh-tool", "exec-tasks")
+  const dir = join(testDataDir, "exec-tasks")
   mkdirSync(dir, { recursive: true })
   // Use real-time timestamps so the manager's retention sweep (24h after
   // finishedAt) does not delete freshly-written fixtures.

@@ -153,7 +153,7 @@ async function main() {
     } else if (profileFile) {
       profile = profileManager.loadFromFile(profileFile)
       if (!profile) {
-        throw new Error(`Profile file not found: ${profileFile}. Searched in: current dir profiles/, project root profiles/, ~/.ssh-tool/profiles/`)
+        throw new Error(`Profile file not found: ${profileFile}. Searched in: current dir profiles/, project root profiles/, platform data dir profiles/`)
       }
     } else if (profileJson) {
       profile = JSON.parse(profileJson) as SSHProfile

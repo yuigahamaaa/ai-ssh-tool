@@ -2,11 +2,12 @@
  * RemoteShell Tests
  * Tests remoteExec with mocked ssh2 Client.
  *
- * HOME redirect: remoteExec() lazily constructs a global ExecTaskManager,
- * which builds a SchedulerService that writes under `~/.ssh-tool/...`. In
- * sandboxed CI environments writes to the real $HOME may fail with EPERM,
- * so we point HOME at a tmpdir before the module is first evaluated and
- * use a dynamic `import()` to bind the functions under that env.
+ * SSH_TOOL_DATA_DIR redirect: remoteExec() lazily constructs a global
+ * ExecTaskManager, which builds a SchedulerService that writes under the
+ * platform data dir. In sandboxed CI environments writes to the real
+ * data dir may fail with EPERM, so we redirect SSH_TOOL_DATA_DIR at a
+ * tmpdir before the module is first evaluated and use a dynamic `import()`
+ * to bind the functions under that env.
  */
 
 import { describe, it, before, after } from "node:test"
@@ -16,22 +17,23 @@ import { rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 
-const testHome = join(tmpdir(), `remote-shell-${Date.now()}-${process.pid}`)
-const origHome = process.env.HOME
+const testDataDir = join(tmpdir(), `remote-shell-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
 let remoteExec: typeof import("../remote-shell.js").remoteExec
 let execOnChain: typeof import("../remote-shell.js").execOnChain
 
 before(async () => {
-  mkdirSync(testHome, { recursive: true })
-  process.env.HOME = testHome
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
   const mod = await import(`../remote-shell.js?t=${Date.now()}`)
   remoteExec = mod.remoteExec
   execOnChain = mod.execOnChain
 })
 
 after(() => {
-  process.env.HOME = origHome
-  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+  if (origDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+  else process.env.SSH_TOOL_DATA_DIR = origDataDir
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
 })
 
 // Mock ssh2 stream

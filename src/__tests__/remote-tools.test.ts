@@ -3,10 +3,10 @@
  * Tests tool definitions (readFile, writeFile, exec, listDir, exists, stat, grep, find, cd)
  * Uses mock SFTP and mock ssh2 exec.
  *
- * HOME redirect: createRemoteTools imports remote-shell which lazily builds
- * a global ExecTaskManager → SchedulerService that writes under
- * `~/.ssh-tool/...`. We redirect HOME to a tmpdir before first module
- * evaluation so sandboxed environments don't EPERM.
+ * SSH_TOOL_DATA_DIR redirect: createRemoteTools imports remote-shell which
+ * lazily builds a global ExecTaskManager → SchedulerService that writes
+ * under the platform data dir. We redirect SSH_TOOL_DATA_DIR to a tmpdir
+ * before first module evaluation so sandboxed environments don't EPERM.
  */
 
 import { describe, it, beforeEach, before, after, mock } from "node:test"
@@ -17,20 +17,21 @@ import { join } from "path"
 import { tmpdir } from "os"
 import { MAX_READ_FILE_BYTES } from "../remote-file-tools.js"
 
-const testHome = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
-const origHome = process.env.HOME
+const testDataDir = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
 let createRemoteTools: typeof import("../remote-tools.js").createRemoteTools
 
 before(async () => {
-  mkdirSync(testHome, { recursive: true })
-  process.env.HOME = testHome
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
   const mod = await import(`../remote-tools.js?t=${Date.now()}`)
   createRemoteTools = mod.createRemoteTools
 })
 
 after(() => {
-  process.env.HOME = origHome
-  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+  if (origDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+  else process.env.SSH_TOOL_DATA_DIR = origDataDir
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
 })
 
 // --- Mock SFTP ---

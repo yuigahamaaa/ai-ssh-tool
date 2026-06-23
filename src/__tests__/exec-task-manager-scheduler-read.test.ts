@@ -18,12 +18,12 @@ import { OutputStore } from "../scheduler/output-store.js"
 import { EventLog } from "../scheduler/event-log.js"
 import type { ScheduleRequest, TaskRunner } from "../scheduler/types.js"
 
-// Override HOME before importing exec-task-manager so its module-level
+// Override SSH_TOOL_DATA_DIR before importing exec-task-manager so its module-level
 // getTaskStorageDir() picks up a temp dir. Otherwise it would scan the
-// developer's real ~/.ssh-tool/exec-tasks/ and accumulate unrelated tasks.
-const testHome = mkdtempSync(join(tmpdir(), "etm-read-home-"))
-const origHome = process.env.HOME
-process.env.HOME = testHome
+// developer's real data dir and accumulate unrelated tasks.
+const testDataDir = mkdtempSync(join(tmpdir(), "etm-read-home-"))
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
+process.env.SSH_TOOL_DATA_DIR = testDataDir
 
 function instantRunner(): TaskRunner {
   return {

@@ -13,8 +13,8 @@ import {
   writeFileSync,
 } from "fs"
 import { join, relative, resolve } from "path"
-import { homedir } from "os"
 import type { TaskOutputFiles, TaskOutputResult } from "./types.js"
+import { getSchedulerOutputsDir, ensureDir } from "../paths.js"
 
 export const OUTPUT_TAIL_LIMIT = 64 * 1024
 export const DEFAULT_OUTPUT_RETURN_LIMIT = 16 * 1024
@@ -50,14 +50,6 @@ export interface OutputCleanupResult {
   keptFiles: number
 }
 
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
-
 function safeTaskId(taskId: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(taskId)) {
     throw new Error(`Invalid task id for output path: ${taskId}`)
@@ -90,7 +82,7 @@ export class OutputStore {
   private inMemory = new Map<string, OutputEntry>()
 
   constructor(baseDir?: string, opts?: { maxOutputFileSize?: number }) {
-    this.baseDir = resolve(baseDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "outputs"))
+    this.baseDir = resolve(baseDir ?? getSchedulerOutputsDir())
     this.maxOutputFileSize = opts?.maxOutputFileSize ?? DEFAULT_MAX_OUTPUT_FILE_SIZE
     if (!existsSync(this.baseDir)) {
       mkdirSync(this.baseDir, { recursive: true, mode: 0o700 })

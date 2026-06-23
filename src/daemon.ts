@@ -36,6 +36,7 @@ import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persisten
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
 import { shellQuote } from "./shell-quote.js"
+import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 
 interface DaemonSession {
   sessionId: string
@@ -318,12 +319,11 @@ export class SSHDaemon {
     // One-shot migration of legacy exec-tasks → scheduler layout. Idempotent;
     // counts are logged so operators can see the first-boot migration size.
     try {
-      const homedir = process.env.HOME || process.env.USERPROFILE || ""
-      const srcDir = `${homedir}/.ssh-tool/exec-tasks`
-      const schedulerBase = `${homedir}/.ssh-tool/scheduler`
-      const destTaskDir = `${schedulerBase}/tasks`
-      const destOutputDir = `${schedulerBase}/outputs`
-      const migration = migrateExecTasks({ srcDir, destTaskDir, destOutputDir })
+      const migration = migrateExecTasks({
+        srcDir: getLegacyExecTasksDir(),
+        destTaskDir: getSchedulerTasksDir(),
+        destOutputDir: getSchedulerOutputsDir(),
+      })
       if (migration.migrated > 0 || migration.failed > 0) {
         log("daemon", `migrated ${migration.migrated} legacy tasks (skipped=${migration.skipped}, failed=${migration.failed})`)
       }

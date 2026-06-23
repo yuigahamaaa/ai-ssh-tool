@@ -6,20 +6,24 @@ import { join } from "path"
 import { tmpdir } from "os"
 
 // We need to override the task storage dir before importing ExecTaskManager.
-// The module uses getUserDataDir() to derive storage path. We set HOME env var
+// The module uses paths.ts to derive storage path. We set SSH_TOOL_DATA_DIR
 // so it picks up our temp dir.
 
-const testHome = join(tmpdir(), `etm-test-${Date.now()}-${process.pid}`)
-const origHome = process.env.HOME
+const testDataDir = join(tmpdir(), `etm-test-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
 
 function setup() {
-  mkdirSync(testHome, { recursive: true })
-  process.env.HOME = testHome
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
 }
 
 function teardown() {
-  process.env.HOME = origHome
-  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+  if (origDataDir === undefined) {
+    delete process.env.SSH_TOOL_DATA_DIR
+  } else {
+    process.env.SSH_TOOL_DATA_DIR = origDataDir
+  }
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
 }
 
 class FakeChannel extends EventEmitter {

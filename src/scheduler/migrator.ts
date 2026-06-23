@@ -1,6 +1,6 @@
 /**
  * Migrator: imports legacy exec-task files (~/.ssh-tool/exec-tasks/*.json)
- * into the new scheduler storage layout (~/.ssh-tool/scheduler/tasks/ + outputs/).
+ * into the new scheduler storage layout (scheduler/tasks/ + outputs/).
  *
  * Idempotent: if task metadata already exists in the scheduler store, missing
  * output files are backfilled, then the old file is removed. Failed files stay
@@ -9,20 +9,12 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, rmdirSync, renameSync } from "fs"
 import { join } from "path"
-import { homedir } from "os"
 import { log } from "../logger.js"
 import type { ScheduledTask, ScheduledTaskStatus } from "./types.js"
+import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir, ensureDir } from "../paths.js"
 
 const OUTPUT_TAIL_LIMIT = 64 * 1024
 const SAFE_TASK_ID = /^[A-Za-z0-9_-]+$/
-
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
 
 /** Legacy exec-task shape (from exec-task-manager.ts) */
 interface LegacyExecTask {
@@ -159,9 +151,9 @@ export function migrateExecTasks(
     destOutputDir = opts?.destOutputDir ?? destOutputDir
   }
 
-  const src = srcDir ?? join(getUserDataDir(), ".ssh-tool", "exec-tasks")
-  const destTasks = destTasksDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "tasks")
-  const destOutputs = destOutputDir ?? join(getUserDataDir(), ".ssh-tool", "scheduler", "outputs")
+  const src = srcDir ?? getLegacyExecTasksDir()
+  const destTasks = destTasksDir ?? getSchedulerTasksDir()
+  const destOutputs = destOutputDir ?? getSchedulerOutputsDir()
 
   const result: MigrateResult = { migrated: 0, skipped: 0, failed: 0 }
 

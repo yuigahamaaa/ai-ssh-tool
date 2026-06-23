@@ -12,25 +12,10 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync } from "fs"
 import { dirname, join } from "path"
 import { randomUUID } from "crypto"
-import { homedir } from "os"
 import type { SSHHostConfig, SSHProfile } from "./types.js"
+import { getProfilesDir, getLegacyProfilesDir, ensureDir } from "./paths.js"
 
-/**
- * Get user data directory with cross-platform support.
- */
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
-
-const DEFAULT_PROFILES_DIR = join(
-  getUserDataDir(),
-  ".opencode",
-  "ssh",
-)
+const DEFAULT_PROFILES_DIR = getProfilesDir()
 
 /**
  * LRU cache for loadFromFile().
@@ -198,7 +183,8 @@ export class ProfileManager {
    * 1. 绝对路径直接查找
    * 2. 当前目录下的 profiles/ 文件夹
    * 3. 项目根目录（ssh-tool 上一级）的 profiles/ 文件夹
-   * 4. 用户主目录的 .ssh-tool/profiles/
+   * 4. 新规范路径 (平台对应数据目录)/profiles/
+   * 5. 旧版路径 ~/.opencode/ssh/
    *
    * 命中后按文件路径 mtime 做 LRU 缓存：MCP 每个工具调用都会走这里，
    * 同样的 profileName 反复加载时跳过 readFileSync + JSON.parse。
@@ -208,7 +194,8 @@ export class ProfileManager {
       profileFile,
       join(process.cwd(), "profiles", profileFile),
       join(process.cwd(), "..", "profiles", profileFile),
-      join(homedir(), ".ssh-tool", "profiles", profileFile),
+      join(getProfilesDir(), profileFile),
+      join(getLegacyProfilesDir(), profileFile),
     ]
 
     for (const searchPath of searchPaths) {

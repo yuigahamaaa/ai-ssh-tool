@@ -17,14 +17,14 @@ import { PersistenceStore } from "../scheduler/persistence-store.js"
 import { OutputStore } from "../scheduler/output-store.js"
 import { EventLog } from "../scheduler/event-log.js"
 
-// Override HOME before importing exec-task-manager so its module-level
-// getTaskStorageDir() picks up a temp dir.
-const testHome = mkdtempSync(join(tmpdir(), "etm-delegate-home-"))
-const origHome = process.env.HOME
-process.env.HOME = testHome
+// Override SSH_TOOL_DATA_DIR before importing exec-task-manager so its
+// module-level getTaskStorageDir() picks up a temp dir.
+const testDataDir = mkdtempSync(join(tmpdir(), "etm-delegate-"))
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
+process.env.SSH_TOOL_DATA_DIR = testDataDir
 
 function legacyTaskFiles(): string[] {
-  const dir = join(testHome, ".ssh-tool", "exec-tasks")
+  const dir = join(testDataDir, "exec-tasks")
   return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")) : []
 }
 

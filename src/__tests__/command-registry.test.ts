@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { CommandRegistryStore } from "../command-registry.js"
+import { _resetPathsForTest } from "../paths.js"
 
 describe("CommandRegistryStore", () => {
   let tmpDir: string
@@ -138,28 +139,22 @@ describe("CommandRegistryStore", () => {
   })
 
   it("uses the scheduler state directory when no baseDir override is supplied", () => {
-    const originalHome = process.env.HOME
-    const originalUserProfile = process.env.USERPROFILE
-    const originalHomePath = process.env.HOMEPATH
-    const isolatedHome = mkdtempSync(join(tmpdir(), "command-registry-home-"))
+    const originalDataDir = process.env.SSH_TOOL_DATA_DIR
+    const isolatedDataDir = mkdtempSync(join(tmpdir(), "command-registry-data-"))
 
     try {
-      process.env.HOME = isolatedHome
-      delete process.env.USERPROFILE
-      delete process.env.HOMEPATH
+      _resetPathsForTest()
+      process.env.SSH_TOOL_DATA_DIR = isolatedDataDir
 
       const defaultStore = new CommandRegistryStore()
       defaultStore.register({ project: "ssh-tool", name: "test", command: "npm test" })
 
-      assert.equal(existsSync(join(isolatedHome, ".ssh-tool", "scheduler", "state", "commands.json")), true)
+      assert.equal(existsSync(join(isolatedDataDir, "scheduler", "state", "commands.json")), true)
     } finally {
-      if (originalHome === undefined) delete process.env.HOME
-      else process.env.HOME = originalHome
-      if (originalUserProfile === undefined) delete process.env.USERPROFILE
-      else process.env.USERPROFILE = originalUserProfile
-      if (originalHomePath === undefined) delete process.env.HOMEPATH
-      else process.env.HOMEPATH = originalHomePath
-      rmSync(isolatedHome, { recursive: true, force: true })
+      if (originalDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+      else process.env.SSH_TOOL_DATA_DIR = originalDataDir
+      _resetPathsForTest()
+      rmSync(isolatedDataDir, { recursive: true, force: true })
     }
   })
 

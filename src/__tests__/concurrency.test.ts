@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from "node:test"
+import { describe, it, beforeEach, afterEach, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { SchedulerService } from "../scheduler/scheduler-service.js"
 import { PersistenceStore } from "../scheduler/persistence-store.js"
@@ -6,9 +6,23 @@ import { OutputStore } from "../scheduler/output-store.js"
 import { EventLog } from "../scheduler/event-log.js"
 import { LockManager } from "../scheduler/lock-manager.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, ScheduledTask, TaskRunner } from "../scheduler/types.js"
-import { mkdtempSync } from "fs"
+import { mkdtempSync, mkdirSync, rmSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
+
+const testDataDir = join(tmpdir(), `concurrency-test-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
+
+before(() => {
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
+})
+
+after(() => {
+  if (origDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+  else process.env.SSH_TOOL_DATA_DIR = origDataDir
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
+})
 
 function makeAgent(id: string): AgentIdentity {
   return { id, name: `agent-${id}`, clientType: "mcp" }

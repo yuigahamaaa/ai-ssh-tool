@@ -11,30 +11,31 @@ import { tmpdir } from "os"
  * enough of the Client shape to exercise the host resolution path and
  * asserts that the explicit value wins.
  *
- * HOME redirect: ExecTaskManager's constructor builds a SchedulerService
- * which writes to `~/.ssh-tool/scheduler/...`. Some sandboxes don't allow
- * writing under the real $HOME, so we point HOME at a tmpdir before any
- * import + construction. We use a dynamic `import()` so the module is
- * (re-)evaluated AFTER the HOME swap.
+ * SSH_TOOL_DATA_DIR redirect: ExecTaskManager's constructor builds a
+ * SchedulerService which writes under the platform data dir. Some
+ * sandboxes don't allow writing under the real data dir, so we redirect
+ * SSH_TOOL_DATA_DIR at a tmpdir before any import + construction. We use
+ * a dynamic `import()` so the module is (re-)evaluated AFTER the swap.
  */
 
 import type { Client } from "ssh2"
 
-const testHome = join(tmpdir(), `etm-host-${Date.now()}-${process.pid}`)
-const origHome = process.env.HOME
+const testDataDir = join(tmpdir(), `etm-host-${Date.now()}-${process.pid}`)
+const origDataDir = process.env.SSH_TOOL_DATA_DIR
 let ExecTaskManager: typeof import("../exec-task-manager.js").ExecTaskManager
 
 before(async () => {
-  mkdirSync(testHome, { recursive: true })
-  process.env.HOME = testHome
-  // Cache-bust so the module is re-evaluated under the new HOME.
+  mkdirSync(testDataDir, { recursive: true })
+  process.env.SSH_TOOL_DATA_DIR = testDataDir
+  // Cache-bust so the module is re-evaluated under the new data dir.
   const mod = await import(`../exec-task-manager.js?t=${Date.now()}`)
   ExecTaskManager = mod.ExecTaskManager
 })
 
 after(() => {
-  process.env.HOME = origHome
-  try { rmSync(testHome, { recursive: true, force: true }) } catch {}
+  if (origDataDir === undefined) delete process.env.SSH_TOOL_DATA_DIR
+  else process.env.SSH_TOOL_DATA_DIR = origDataDir
+  try { rmSync(testDataDir, { recursive: true, force: true }) } catch {}
 })
 
 function makeFakeClient(): Client {

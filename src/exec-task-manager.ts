@@ -10,22 +10,11 @@ import type { Client, ClientChannel } from "ssh2"
 import { randomUUID } from "crypto"
 import { join } from "path"
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync } from "fs"
-import { homedir } from "os"
 import { log } from "./logger.js"
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import type { ScheduleRequest, TaskRunner } from "./scheduler/types.js"
 import { assertEnvName, shellQuote } from "./shell-quote.js"
-
-/**
- * Get user data directory with cross-platform support.
- */
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
+import { getExecTasksDir, ensureDir } from "./paths.js"
 
 export type TaskType = "exec" | "background"
 export type TaskStatus = "running" | "completed" | "failed" | "cancelled" | "timeout"
@@ -63,10 +52,8 @@ export interface RunningTaskEntry {
 }
 
 function getTaskStorageDir(): string {
-  const storageDir = join(getUserDataDir(), ".ssh-tool", "exec-tasks")
-  if (!existsSync(storageDir)) {
-    mkdirSync(storageDir, { recursive: true, mode: 0o700 })
-  }
+  const storageDir = getExecTasksDir()
+  ensureDir(storageDir)
   return storageDir
 }
 
@@ -97,7 +84,7 @@ export class ExecTaskManager {
    * Scheduler-owned source of truth for new tasks. ExecTaskManager keeps
    * the old public API, but start()/cancel()/read paths delegate lifecycle,
    * output persistence, listing, and cancellation to SchedulerService.
-   * The local `tasks` map and `~/.ssh-tool/exec-tasks` readers remain only
+   * The local `tasks` map and exec-tasks readers remain only
    * as fallback compatibility for old runtime/disk snapshots.
    */
   private scheduler: SchedulerService

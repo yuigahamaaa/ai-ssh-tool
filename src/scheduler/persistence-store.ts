@@ -1,35 +1,21 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, renameSync } from "fs"
 import { join } from "path"
-import { homedir } from "os"
 import type { ScheduledTask, ScheduledTaskStatus, VirtualCwdState } from "./types.js"
-
-/**
- * Get user data directory with cross-platform support.
- * Windows: uses USERPROFILE or HOMEPATH, falls back to homedir()
- * Unix/macOS: uses homedir()
- */
-function getUserDataDir(): string {
-  // Windows support: try USERPROFILE first, then HOMEPATH
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
+import { getSchedulerDir, getSchedulerTasksDir, getSchedulerStateDir, ensureDir } from "../paths.js"
 
 function getBaseDir(): string {
-  return join(getUserDataDir(), ".ssh-tool", "scheduler")
+  return getSchedulerDir()
 }
 
 function getTasksDir(): string {
-  const dir = join(getBaseDir(), "tasks")
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const dir = getSchedulerTasksDir()
+  ensureDir(dir)
   return dir
 }
 
 function getStateDir(): string {
-  const dir = join(getBaseDir(), "state")
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const dir = getSchedulerStateDir()
+  ensureDir(dir)
   return dir
 }
 

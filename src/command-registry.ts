@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
 import { join } from "node:path"
 import type { TaskCost, TaskIntent } from "./scheduler/types.js"
+import { getSchedulerDir, getSchedulerStateDir } from "./paths.js"
 
 export const COMMAND_REGISTRY_SCHEMA_VERSION = 1
 const COMMAND_REGISTRY_LOCK_TIMEOUT_MS = 5000
@@ -54,14 +54,6 @@ interface CommandRegistryEnvelope {
   commands: RegisteredCommand[]
 }
 
-function getUserDataDir(): string {
-  if (process.platform === "win32") {
-    const userProfile = process.env.USERPROFILE || process.env.HOMEPATH
-    if (userProfile) return userProfile
-  }
-  return homedir()
-}
-
 function atomicWrite(filePath: string, data: string): void {
   const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   try {
@@ -78,7 +70,7 @@ function sleepSync(ms: number): void {
 }
 
 function defaultBaseDir(): string {
-  return join(getUserDataDir(), ".ssh-tool", "scheduler")
+  return getSchedulerDir()
 }
 
 function key(project: string, name: string): string {
