@@ -9,6 +9,7 @@ import { resolve, dirname } from "path"
 import { fileURLToPath } from "url"
 import {
   getPipePath,
+  getPipePathCandidates,
   createRequest,
   IPCSocket,
   type IPCRequest,
@@ -18,9 +19,11 @@ import { log, logError } from "./logger.js"
 
 export class DaemonClient {
   private pipePath: string
+  private pipePathCandidates: string[]
   private socket: Socket | null = null
   private ipc: IPCSocket | null = null
   private connecting: Promise<void> | null = null
+  private connectCancelled = false
   /**
    * If a connect() is in flight, disconnect() can settle that promise
    * explicitly with a "disconnected" error so the awaiter never hangs.
@@ -29,14 +32,20 @@ export class DaemonClient {
   private connectingReject: ((err: Error) => void) | null = null
   private ensuring: Promise<void> | null = null
 
-  constructor(pipePath?: string) {
-    this.pipePath = pipePath ?? getPipePath()
+  constructor(pipePath?: string | string[]) {
+    this.pipePathCandidates = Array.isArray(pipePath)
+      ? pipePath
+      : pipePath
+        ? [pipePath]
+        : getPipePathCandidates()
+    this.pipePath = this.pipePathCandidates[0] ?? getPipePath()
   }
 
   async connect(): Promise<void> {
     if (this.ipc && this.socket && !this.socket.destroyed) return
     if (this.connecting) return this.connecting
 
+    this.connectCancelled = false
     this.connecting = this._connect()
     try {
       await this.connecting
@@ -47,8 +56,24 @@ export class DaemonClient {
   }
 
   private async _connect(): Promise<void> {
-    this.disconnect()
+    this.closeTransport()
 
+    let lastError: Error | undefined
+    for (const candidate of this.pipePathCandidates) {
+      this.pipePath = candidate
+      try {
+        await this.connectToCurrentPath()
+        return
+      } catch (err) {
+        lastError = err as Error
+        this.closeTransport()
+        if (this.connectCancelled) throw lastError
+      }
+    }
+    throw lastError ?? new Error("No daemon pipe paths configured")
+  }
+
+  private async connectToCurrentPath(): Promise<void> {
     log("client", `Connecting to daemon at ${this.pipePath}`)
     this.socket = connect(this.pipePath)
     await new Promise<void>((resolve, reject) => {
@@ -78,6 +103,11 @@ export class DaemonClient {
   }
 
   disconnect(): void {
+    this.connectCancelled = true
+    this.closeTransport()
+  }
+
+  private closeTransport(): void {
     // If a connect() is in flight, settle it before tearing the socket
     // down — otherwise the awaiter would hang forever (we're about to
     // remove all listeners and destroy the only transport the connect

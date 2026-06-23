@@ -6,7 +6,12 @@
 
 import type { Socket } from "net"
 import { randomUUID } from "crypto"
-import { getDaemonSocketPath, getDaemonPidPath } from "./paths.js"
+import {
+  getDaemonSocketPath,
+  getDaemonPidPath,
+  getDaemonSocketPathCandidates,
+  getDaemonPidPathCandidates,
+} from "./paths.js"
 
 /**
  * Debug logger for malformed-frame diagnostics. We intentionally avoid
@@ -29,6 +34,14 @@ export function getPipePath(): string {
 
 export function getPidPath(): string {
   return getDaemonPidPath()
+}
+
+export function getPipePathCandidates(): string[] {
+  return getDaemonSocketPathCandidates()
+}
+
+export function getPidPathCandidates(): string[] {
+  return getDaemonPidPathCandidates()
 }
 
 import type { ScheduleRequest } from "./scheduler/types.js"

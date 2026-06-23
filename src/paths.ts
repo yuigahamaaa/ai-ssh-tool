@@ -6,11 +6,15 @@
  *   macOS    - ~/Library/Application Support/ssh-tool
  *   Linux    - $XDG_DATA_HOME/ssh-tool  (fallback: ~/.local/share/ssh-tool)
  *
- * Every path can be overridden via SSH_TOOL_DATA_DIR (or SSH_TOOL_SOCKET_DIR
- * for the daemon socket/pid).  Legacy ~/.ssh-tool paths are kept as fallback
- * candidates for backward-compatible reads.
+ * Data paths can be overridden via SSH_TOOL_DATA_DIR. Cache paths can be
+ * overridden via SSH_TOOL_CACHE_DIR, falling back to SSH_TOOL_DATA_DIR for
+ * compatibility with older test/user isolation setups. Daemon socket/pid paths
+ * can be overridden via SSH_TOOL_SOCKET_DIR on Unix-like systems. Legacy
+ * ~/.ssh-tool and daemon IPC paths are kept as fallback candidates for
+ * backward-compatible reads and upgrades.
  */
 
+import { createHash } from "node:crypto"
 import { existsSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
@@ -66,7 +70,7 @@ export function getDataDir(): string {
 
 export function getCacheDir(): string {
   if (!_cacheDir) {
-    const override = process.env.SSH_TOOL_DATA_DIR
+    const override = process.env.SSH_TOOL_CACHE_DIR ?? process.env.SSH_TOOL_DATA_DIR
     _cacheDir = override ? resolve(override) : platformCacheDir()
   }
   return _cacheDir
@@ -101,7 +105,7 @@ export function getSchedulerStateDir(): string {
 }
 
 export function getDaemonSocketPath(): string {
-  if (process.platform === "win32") return "\\\\.\\pipe\\ssh-exec-daemon"
+  if (process.platform === "win32") return `\\\\.\\pipe\\ssh-exec-daemon-${pathSuffix(getDataDir())}`
   const override = process.env.SSH_TOOL_SOCKET_DIR
   const dir = override ? resolve(override) : getCacheDir()
   return join(dir, "daemon.sock")
@@ -112,6 +116,23 @@ export function getDaemonPidPath(): string {
   const override = process.env.SSH_TOOL_SOCKET_DIR
   const dir = override ? resolve(override) : getCacheDir()
   return join(dir, "daemon.pid")
+}
+
+export function getLegacyDaemonSocketPath(): string {
+  if (process.platform === "win32") return "\\\\.\\pipe\\ssh-exec-daemon"
+  return join(homedir(), ".ssh-exec-daemon.sock")
+}
+
+export function getLegacyDaemonPidPath(): string {
+  return join(homedir(), ".ssh-exec-daemon.pid")
+}
+
+export function getDaemonSocketPathCandidates(): string[] {
+  return uniquePaths(getDaemonSocketPath(), getLegacyDaemonSocketPath())
+}
+
+export function getDaemonPidPathCandidates(): string[] {
+  return uniquePaths(getDaemonPidPath(), getLegacyDaemonPidPath())
 }
 
 export function getLegacyDataDir(): string {
@@ -151,4 +172,12 @@ export function resolveOrCreate(
 export function _resetPathsForTest(): void {
   _dataDir = undefined
   _cacheDir = undefined
+}
+
+function pathSuffix(value: string): string {
+  return createHash("sha1").update(value).digest("hex").slice(0, 12)
+}
+
+function uniquePaths(...paths: string[]): string[] {
+  return Array.from(new Set(paths))
 }

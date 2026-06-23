@@ -25,6 +25,7 @@ import { enableDebug, log, logError } from "./logger.js"
 import {
   getPipePath,
   getPidPath,
+  getPidPathCandidates,
   encodeMessage,
   IPCMessageParser,
   type IPCRequest,
@@ -1063,20 +1064,22 @@ export class SSHDaemon {
   }
 
   private isExistingDaemonAlive(): boolean {
-    try {
-      const pidPath = getPidPath()
-      if (!existsSync(pidPath)) return false
-      const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10)
-      if (isNaN(pid) || pid <= 0) return false
-      // The current process may have just written its own PID via writePid().
-      // A daemon should never consider itself a duplicate of itself.
-      if (pid === process.pid) return false
-      // process.kill(pid, 0) checks if process is alive without sending a signal
-      process.kill(pid, 0)
-      return true
-    } catch {
-      return false
+    for (const pidPath of getPidPathCandidates()) {
+      try {
+        if (!existsSync(pidPath)) continue
+        const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10)
+        if (isNaN(pid) || pid <= 0) continue
+        // The current process may have just written its own PID via writePid().
+        // A daemon should never consider itself a duplicate of itself.
+        if (pid === process.pid) continue
+        // process.kill(pid, 0) checks if process is alive without sending a signal
+        process.kill(pid, 0)
+        return true
+      } catch {
+        continue
+      }
     }
+    return false
   }
 
   private writePid(): void {
@@ -1088,17 +1091,18 @@ export class SSHDaemon {
   }
 
   private removePid(): void {
-    try {
-      const pidPath = getPidPath()
-      if (!existsSync(pidPath)) return
-      const content = readFileSync(pidPath, "utf-8").trim()
-      const recordedPid = parseInt(content, 10)
-      // Only delete if PID matches current process to avoid removing another daemon's PID file
-      if (recordedPid === process.pid) {
-        unlinkSync(pidPath)
+    for (const pidPath of getPidPathCandidates()) {
+      try {
+        if (!existsSync(pidPath)) continue
+        const content = readFileSync(pidPath, "utf-8").trim()
+        const recordedPid = parseInt(content, 10)
+        // Only delete if PID matches current process to avoid removing another daemon's PID file
+        if (recordedPid === process.pid) {
+          unlinkSync(pidPath)
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
     }
   }
 

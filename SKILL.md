@@ -51,7 +51,8 @@ ssh-tool/
 1. **绝对路径** → 直接读取
 2. **当前工作目录的 `profiles/`** → `./profiles/<name>.json`
 3. **项目根目录的 `profiles/`** → `../profiles/<name>.json`（ssh-tool 上一级）
-4. **用户主目录** → `~/.ssh-tool/profiles/<name>.json`
+4. **平台数据目录** → `<platform-data-dir>/profiles/<name>.json`（可用 `SSH_TOOL_DATA_DIR` 覆盖）
+5. **旧版目录** → `~/.opencode/ssh/<name>.json`
 
 > 💡 最简单的方式：把 `.json` 配置文件放到项目根目录的 `profiles/` 文件夹，然后传文件名即可。
 
@@ -105,7 +106,7 @@ ssh-tool/
 | `ssh_command_delete` | 删除过期命令配方 | `project`, `name` |
 | `ssh_command_run` | 查询或托管运行命令；默认 managed，返回 taskId | `project`, `name`, `run_mode` |
 
-命令配方使用版本化 JSON envelope 保存，当前 `schemaVersion=1`，并兼容旧的数组格式。默认存储在 scheduler 状态目录（通常是 `~/.ssh-tool/scheduler/state/commands.json`）。保存、修改、删除会使用跨进程文件锁，并在写入前重新读取最新文件再合并，避免多个 MCP 会话互相覆盖。
+命令配方使用版本化 JSON envelope 保存，当前 `schemaVersion=1`，并兼容旧的数组格式。默认存储在 scheduler 状态目录（通常是 `<platform-data-dir>/scheduler/state/commands.json`；可用 `SSH_TOOL_DATA_DIR` 覆盖）。保存、修改、删除会使用跨进程文件锁，并在写入前重新读取最新文件再合并，避免多个 MCP 会话互相覆盖。
 
 未显式设置 `execution.mode` 时默认 `background`，适合测试、构建、脚本、服务等长命令；短命令可显式设为 `exec`。`ssh_command_run(run_mode="managed")` 走共享 scheduler/background，不绕过同一台 VM 上其他人的任务，会按现有 `intent`、`cost`、`if_busy` 和锁规则排队或串行。`log.mode` 固定为 `managed`，日志由 scheduler/output store 托管，AI 用 `taskId` 调 `ssh_exec_status` 查看，不需要默认下载到本地。
 
@@ -228,8 +229,8 @@ AI 优先读 `ok`、`kind`、`data`、`agentGuidance`。`ssh_exec` / `ssh_schedu
     "truncated": false,
     "stdoutBytes": 20,
     "stderrBytes": 0,
-    "stdoutPath": "~/.ssh-tool/scheduler/outputs/t_xxx.stdout",
-    "stderrPath": "~/.ssh-tool/scheduler/outputs/t_xxx.stderr"
+    "stdoutPath": "<platform-data-dir>/scheduler/outputs/t_xxx.stdout",
+    "stderrPath": "<platform-data-dir>/scheduler/outputs/t_xxx.stderr"
   }
 }
 ```
