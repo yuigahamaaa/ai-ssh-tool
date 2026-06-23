@@ -4,6 +4,20 @@
   "description": "SSH multi-hop tool for AI agents - MCP support, daemon, file transfer, background exec",
   "type": "module",
   "main": "./dist/gateway.js",
+  "files": [
+    "dist/*.d.ts",
+    "dist/*.js",
+    "dist/*.js.map",
+    "dist/cli/",
+    "dist/scheduler/",
+    "docs/",
+    "profiles/",
+    "README.md",
+    "SKILL.md",
+    "setup.sh",
+    "setup.bat",
+    "run-tests.sh"
+  ],
   "bin": {
     "ssh-exec": "./dist/cli/ssh-exec.js",
     "ssh-daemon": "./dist/daemon.js",
