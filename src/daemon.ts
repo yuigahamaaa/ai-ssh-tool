@@ -922,6 +922,19 @@ export class SSHDaemon {
     if (!connection) {
       return { id: req.id, ok: false, error: `Session ${sessionId} not found` }
     }
+    // Guard against half-open sessions the same way handleExec does: if the
+    // SSHConnection already knows it's disconnected, don't even try the
+    // transfer — just clean up so the next connectHostJson recreates the
+    // session.
+    if (!connection.isConnected()) {
+      try {
+        await this.gateway.disconnect(sessionId)
+        this.cleanupSession(sessionId)
+      } catch {
+        // ignore cleanup errors
+      }
+      return { id: req.id, ok: false, error: `Session ${sessionId} is not connected` }
+    }
     const client = connection.getFinalClient()
     try {
       let result
@@ -937,6 +950,14 @@ export class SSHDaemon {
       }
       return { id: req.id, ok: true, data: result }
     } catch (err: any) {
+      // Connection might be dead, clean up so the next connectHostJson
+      // call recreates the session instead of reusing a stale one.
+      try {
+        await this.gateway.disconnect(sessionId)
+        this.cleanupSession(sessionId)
+      } catch {
+        // ignore cleanup errors
+      }
       return { id: req.id, ok: false, error: err.message }
     }
   }

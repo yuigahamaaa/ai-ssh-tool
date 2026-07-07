@@ -106,6 +106,7 @@ function loadConfig(): SshConfig | null {
 interface ClientCacheEntry {
   client: any
   forwardManager: PortForwardManager
+  sessionId: string
 }
 
 const MCP_AGENT_ID = `mcp-${randomUUID().slice(0, 8)}`
@@ -190,9 +191,28 @@ async function main() {
 
     const cacheKey = profileName || JSON.stringify(profile)
 
+    // Check cached entry health before reusing. When the underlying SSH
+    // session drops (network blip, server restart, idle timeout from the
+    // remote side), SSHConnection marks itself disconnected. Without this
+    // check we'd hand back a dead client and every subsequent file op
+    // (upload/download/read_file/...) would fail until the MCP server is
+    // restarted — unlike ssh_exec which goes through the daemon and
+    // reconnects on every call via connectHostJson.
     if (clientCache.has(cacheKey)) {
       const cached = clientCache.get(cacheKey)!
-      return cached
+      const cachedSession = gw.sessions.getSession(cached.sessionId)
+      const cachedConnection = gw.sessions.getConnection(cached.sessionId)
+      if (cachedSession?.status === "connected" && cachedConnection?.isConnected()) {
+        return cached
+      }
+      // Stale cache entry — evict and reconnect.
+      log("mcp", `Cached session ${cached.sessionId.slice(0, 8)} is not connected (status: ${cachedSession?.status ?? "unknown"}), reconnecting...`)
+      clientCache.delete(cacheKey)
+      try {
+        await gw.disconnect(cached.sessionId)
+      } catch {
+        // best-effort cleanup; the session may already be gone
+      }
     }
 
     const currentProfile = profile
@@ -222,8 +242,79 @@ async function main() {
     const forwardManager = new PortForwardManager(client)
     log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
 
-    clientCache.set(cacheKey, { client, forwardManager })
+    clientCache.set(cacheKey, { client, forwardManager, sessionId: session.id })
     return { client, forwardManager }
+  }
+
+  /**
+   * Evict a cached client entry so the next getClientForProfile call
+   * reconnects. Used after a connection error mid-operation so a single
+   * retry can succeed with a fresh session.
+   */
+  function evictClientCache(profileName: string | undefined, profileJson: string | undefined, profileFile: string | undefined): string {
+    let key: string | undefined
+    if (profileName) {
+      key = profileName
+    } else {
+      let profile: SSHProfile | undefined
+      if (profileFile) {
+        profile = profileManager.loadFromFile(profileFile)
+      } else if (profileJson) {
+        profile = JSON.parse(profileJson) as SSHProfile
+      } else if (initialConfig) {
+        profile = { id: "default", name: "default", chain: [] } as SSHProfile
+      }
+      key = profile ? JSON.stringify(profile) : undefined
+    }
+    if (key && clientCache.has(key)) {
+      const cached = clientCache.get(key)!
+      log("mcp", `Evicting stale client cache entry for ${key.slice(0, 40)} (session ${cached.sessionId.slice(0, 8)})`)
+      clientCache.delete(key)
+    }
+    return key ?? ""
+  }
+
+  /**
+   * Heuristic check for errors that indicate the SSH connection is dead
+   * (as opposed to e.g. "remote file not found" which is a normal failure
+   * that should NOT trigger a reconnect+retry).
+   */
+  function isConnectionError(err: unknown): boolean {
+    const msg = (err as Error)?.message ?? String(err)
+    return /socket closed|EPIPE|ECONNRESET|ECONNREFUSED|ETIMEDOUT|connection lost|not connected|Failed to open SFTP|Stream error|connect ENOTSOCK|write EPIPE|read ECONNRESET/i.test(msg)
+  }
+
+  /**
+   * Run a file-transfer operation (upload/download) with one automatic retry
+   * on connection errors. The health check in getClientForProfile already
+   * covers sessions that the SSHConnection has marked as disconnected, but
+   * a TCP half-open connection can still pass that check and fail mid-stream.
+   * Evicting the cache and retrying once with a fresh session matches the
+   * "auto-reconnect when not connected" behaviour ssh_exec gets for free
+   * via the daemon's connectHostJson.
+   */
+  async function transferWithReconnect<T>(
+    profileName: string | undefined,
+    profileJson: string | undefined,
+    profileFile: string | undefined,
+    fn: (client: any) => Promise<T>,
+  ): Promise<T> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { client } = await getClientForProfile(profileName, profileJson, profileFile)
+      try {
+        return await fn(client)
+      } catch (err: unknown) {
+        lastError = err
+        if (attempt === 0 && isConnectionError(err)) {
+          log("mcp", `Transfer failed with connection error on attempt ${attempt + 1}, evicting cache and retrying: ${(err as Error).message}`)
+          evictClientCache(profileName, profileJson, profileFile)
+          continue
+        }
+        throw err
+      }
+    }
+    throw lastError
   }
 
   const daemonClient = new DaemonClient()
@@ -784,14 +875,15 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await upload(client, local_path, remote_path, {
-        compressionLevel: compression_level,
-        overwrite: overwrite as any,
-        skipSymlinks: skip_symlinks,
-        lineEnding: line_ending as any,
-        encoding: encoding as any,
-      })
+      const result = await transferWithReconnect(profile_name, profile_json, profile_file, (client) =>
+        upload(client, local_path, remote_path, {
+          compressionLevel: compression_level,
+          overwrite: overwrite as any,
+          skipSymlinks: skip_symlinks,
+          lineEnding: line_ending as any,
+          encoding: encoding as any,
+        }),
+      )
       return {
         content: [{
           type: "text" as const,
@@ -817,14 +909,15 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await download(client, remote_path, local_path, {
-        compressionLevel: compression_level,
-        overwrite: overwrite as any,
-        skipSymlinks: skip_symlinks,
-        lineEnding: line_ending as any,
-        encoding: encoding as any,
-      })
+      const result = await transferWithReconnect(profile_name, profile_json, profile_file, (client) =>
+        download(client, remote_path, local_path, {
+          compressionLevel: compression_level,
+          overwrite: overwrite as any,
+          skipSymlinks: skip_symlinks,
+          lineEnding: line_ending as any,
+          encoding: encoding as any,
+        }),
+      )
       return {
         content: [{
           type: "text" as const,

@@ -582,60 +582,91 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
   try {
     await client.ensureDaemon({ debug })
 
-    let connectResp
-    if (configJson) {
-      connectResp = await client.connectHostJson(configJson)
-    } else if (profileJson) {
-      // 将 profile 转换为旧格式的 config json
-      const config = loadConfigFromProfileJson(profileJson)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else if (profileName) {
-      const config = loadConfigFromProfileName(profileName)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else {
-      connectResp = await client.connectHost(resolve(configPath!))
+    // Helper to (re)connect to the host. Returns a fresh sessionId.
+    // The daemon's connectHostJson already evicts dead sessions and creates
+    // new ones, so calling this again is the "auto-reconnect" path.
+    const doConnect = async (): Promise<string> => {
+      let connectResp
+      if (configJson) {
+        connectResp = await client.connectHostJson(configJson)
+      } else if (profileJson) {
+        // 将 profile 转换为旧格式的 config json
+        const config = loadConfigFromProfileJson(profileJson)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else if (profileName) {
+        const config = loadConfigFromProfileName(profileName)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else {
+        connectResp = await client.connectHost(resolve(configPath!))
+      }
+      if (!connectResp.ok) {
+        throw new Error(`Connection failed: ${(connectResp as any).error}`)
+      }
+      return (connectResp.data as any).sessionId as string
     }
 
-    if (!connectResp.ok) {
-      console.error(`Connection failed: ${(connectResp as any).error}`)
-      process.exitCode = 1
-      return
+    // Connect → validate → transfer, with one retry on connection errors.
+    // Mirrors the resilience ssh_exec gets from going through the scheduler
+    // (which calls connectHostJson on every invocation).
+    let lastError: Error | undefined
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sessionId = await doConnect()
+
+      // Validate the session is actually alive before attempting the
+      // (potentially large) transfer.
+      const execResp = await client.exec(sessionId, "echo ok", 5000)
+      if (!execResp.ok) {
+        lastError = new Error(`Session validation failed: ${(execResp as any).error}`)
+        if (attempt === 0) {
+          console.error(`[ssh-exec] Session validation failed, reconnecting...`)
+          continue
+        }
+        break
+      }
+
+      if (attempt === 0) {
+        console.error(`[ssh-exec] Connected, starting ${action}...`)
+      } else {
+        console.error(`[ssh-exec] Reconnected, retrying ${action}...`)
+      }
+
+      const result = await client.send(
+        createRequest("transfer", {
+          sessionId,
+          action,
+          localPath,
+          remotePath,
+          options: {
+            compressionLevel,
+            overwrite,
+            skipSymlinks,
+            lineEnding,
+            encoding,
+          },
+        }),
+        300000,
+      )
+
+      if (result.ok) {
+        const data = result.data as any
+        console.log(JSON.stringify(data, null, 2))
+        return
+      }
+
+      const errMsg = (result as any).error ?? "unknown error"
+      // Retry only on connection-class errors; a "file not found" or
+      // "permission denied" should surface immediately.
+      const isConnErr = /not connected|socket closed|EPIPE|ECONNRESET|connection lost|Session .* is not connected/i.test(errMsg)
+      lastError = new Error(`Transfer failed: ${errMsg}`)
+      if (attempt === 0 && isConnErr) {
+        console.error(`[ssh-exec] Transfer failed with connection error, reconnecting...`)
+        continue
+      }
+      break
     }
 
-    const { sessionId } = connectResp.data as any
-    const execResp = await client.exec(sessionId, "echo ok", 5000)
-    if (!execResp.ok) {
-      console.error(`Session validation failed: ${(execResp as any).error}`)
-      process.exitCode = 1
-      return
-    }
-
-    console.error(`[ssh-exec] Connected, starting ${action}...`)
-
-    const result = await client.send(
-      createRequest("transfer", {
-        sessionId,
-        action,
-        localPath,
-        remotePath,
-        options: {
-          compressionLevel,
-          overwrite,
-          skipSymlinks,
-          lineEnding,
-          encoding,
-        },
-      }),
-      300000,
-    )
-
-    if (result.ok) {
-      const data = result.data as any
-      console.log(JSON.stringify(data, null, 2))
-    } else {
-      console.error(`Transfer failed: ${(result as any).error}`)
-      process.exitCode = 1
-    }
+    console.error(lastError?.message ?? "Transfer failed")
+    process.exitCode = 1
   } catch (err: any) {
     console.error(`Error: ${err.message}`)
     process.exitCode = 1
