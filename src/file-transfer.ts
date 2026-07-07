@@ -150,61 +150,28 @@ async function remoteIsSymlink(client: Client, remotePath: string): Promise<bool
   }
 }
 
-/** Convert line endings in text */
-function convertLineEndings(content: Buffer, fromEol: string, toEol: string): Buffer<ArrayBufferLike> {
+/** 在已 decode 的 Unicode 字符串上转换换行符（安全，无编码损坏风险） */
+function convertLineEndingsString(text: string, fromEol: string, toEol: string): string {
   if (fromEol === toEol || fromEol === "binary" || toEol === "binary") {
-    return content
+    return text
   }
-  // 字节级操作，不经过 toString，避免非 utf-8 编码损坏。
-  // \r = 0x0d, \n = 0x0a。gbk/latin1 中 0x0d/0x0a 不会出现在多字节序列内部，安全。
-  // mixed 来源也走同一路径：任何来源都先归一化成纯 lf，再按目标转换。
+  // 任何来源都先归一化成纯 \n：\r\n -> \n，孤立 \r（老 Mac CR）-> \n
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
   if (toEol === "lf") {
-    // \r\n -> \n，孤立 \r（老 Mac CR）-> \n
-    const noCrlf = replaceBytes(content, Buffer.from([0x0d, 0x0a]), Buffer.from([0x0a]))
-    return replaceBytes(noCrlf, Buffer.from([0x0d]), Buffer.from([0x0a]))
+    return normalized
   }
   if (toEol === "crlf") {
-    // 先 \r\n -> \n，孤立 \r -> \n，再 \n -> \r\n
-    const noCrlf = replaceBytes(content, Buffer.from([0x0d, 0x0a]), Buffer.from([0x0a]))
-    const noCr = replaceBytes(noCrlf, Buffer.from([0x0d]), Buffer.from([0x0a]))
-    return replaceBytes(noCr, Buffer.from([0x0a]), Buffer.from([0x0d, 0x0a]))
+    return normalized.replace(/\n/g, "\r\n")
   }
-  return content
+  return text
 }
 
-/** 字节级替换 helper：把 content 中所有 from 序列替换为 to 序列 */
-function replaceBytes(content: Buffer, from: Buffer, to: Buffer): Buffer {
-  if (from.length === 0) return content
-  const result: number[] = []
-  let i = 0
-  while (i < content.length) {
-    let match = true
-    for (let j = 0; j < from.length; j++) {
-      if (content[i + j] !== from[j]) { match = false; break }
-    }
-    if (match) {
-      for (let j = 0; j < to.length; j++) result.push(to[j])
-      i += from.length
-    } else {
-      result.push(content[i])
-      i++
-    }
-  }
-  return Buffer.from(result)
-}
-
-/** Detect line ending style in text */
-function detectLineEnding(content: Buffer): "lf" | "crlf" | "mixed" {
-  // 字节级检测，避免 toString 对非 utf-8 编码的损坏。
-  // i===0 时（行首 \n）走 else 分支算 lf-only，修了行首 \n 漏检。
-  let crlfCount = 0
-  let lfOnlyCount = 0
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] === 0x0a) {
-      if (i > 0 && content[i - 1] === 0x0d) crlfCount++
-      else lfOnlyCount++
-    }
-  }
+/** 检测文本的换行符风格，用于 direct 路径。接受 string 或 Buffer */
+function detectLineEnding(content: Buffer | string): "lf" | "crlf" | "mixed" {
+  const text = typeof content === "string" ? content : content.toString("utf-8")
+  // (?<!\r)\n 用 lookbehind 统计真正的 lf-only，天然处理行首 \n
+  const crlfCount = (text.match(/\r\n/g) || []).length
+  const lfOnlyCount = (text.match(/(?<!\r)\n/g) || []).length
   if (crlfCount > 0 && lfOnlyCount > 0) return "mixed"
   if (crlfCount > lfOnlyCount) return "crlf"
   return "lf"
@@ -224,110 +191,111 @@ function convertEncoding(content: Buffer, fromEncoding: string, toEncoding: stri
   }
 }
 
-/** Transform stream for encoding and line ending conversion (true streaming) */
-class FileTransformStream extends Transform {
-  private lineEnding?: "auto" | "lf" | "crlf" | "binary"
-  private encoding?: "auto" | "utf8" | "gbk" | "latin1"
-  private sourceEncoding?: "auto" | "utf8" | "gbk" | "latin1"
-  private targetLineEnding?: "lf" | "crlf" | "binary"
-  private targetEncoding?: "utf8" | "gbk" | "latin1" | undefined
-  private sourceEncodingResolved: "utf8" | "gbk" | "latin1" = "utf8"
+/** string → string 的换行符转换 Transform，配合 iconv.decodeStream/encodeStream 使用 */
+class LineEndingTransform extends Transform {
+  private targetLineEnding: "lf" | "crlf" | "binary"
   private detectedSourceLineEnding: "lf" | "crlf" | "mixed" | null = null
-  private detectionSample: Buffer = Buffer.alloc(0)
+  private detectionSample = ""
   private readonly detectionSampleLimit = 256 * 1024
-  private leftover: Buffer = Buffer.alloc(0)
-  private needsConversion: boolean
+  private leftover = ""
+  private readonly needsConversion: boolean
 
-  constructor(options?: {
-    lineEnding?: "auto" | "lf" | "crlf" | "binary"
-    encoding?: "auto" | "utf8" | "gbk" | "latin1"
-    sourceEncoding?: "auto" | "utf8" | "gbk" | "latin1"
-  }) {
-    super()
-    this.lineEnding = options?.lineEnding
-    this.encoding = options?.encoding
-    this.sourceEncoding = options?.sourceEncoding ?? "auto"
-    if (this.lineEnding === "auto") {
-      this.targetLineEnding = process.platform === "win32" ? "crlf" : "lf"
-    } else {
-      this.targetLineEnding = this.lineEnding
-    }
-    if (this.encoding && this.encoding !== "auto") {
-      this.targetEncoding = this.encoding
-    }
-    if (this.sourceEncoding && this.sourceEncoding !== "auto") {
-      this.sourceEncodingResolved = this.sourceEncoding
-    }
-    const hasTargetEncoding = this.targetEncoding !== undefined && this.targetEncoding !== "utf8"
-    const hasTargetLineEnding = this.targetLineEnding !== undefined && this.targetLineEnding !== "binary"
-    this.needsConversion = Boolean(hasTargetEncoding || hasTargetLineEnding)
+  constructor(targetLineEnding: "lf" | "crlf" | "binary") {
+    // iconv.decodeStream 输出 string，Transform 默认会把 string 输入 decode 成 Buffer。
+    // 设置 decodeStrings: false 让 string chunk 保持原样传入 _transform。
+    super({ objectMode: false, decodeStrings: false })
+    this.targetLineEnding = targetLineEnding
+    this.needsConversion = targetLineEnding !== "binary"
   }
 
-  _transform(chunk: Buffer, encoding: any, callback: any) {
-    // If no conversion needed, just pass through (true streaming)
+  _transform(chunk: any, encoding: any, callback: any) {
+    // iconv.decodeStream 输出 string chunk
+    const str: string = typeof chunk === "string" ? chunk : chunk.toString("utf-8")
     if (!this.needsConversion) {
-      this.push(chunk)
+      this.push(str)
       callback()
       return
     }
 
-    // 累积检测样本（前 256KB），用于更可靠地判定源换行符
+    // 累积检测样本（前 256KB），crlf/mixed 一旦发现就锁定
     if (this.detectionSample.length < this.detectionSampleLimit) {
       const remaining = this.detectionSampleLimit - this.detectionSample.length
-      this.detectionSample = Buffer.concat([this.detectionSample, chunk.slice(0, remaining)])
-      // 每次累积后重新检测，crlf 优先于 lf（lf 可能是 crlf 被 chunk 切断的假象）
+      this.detectionSample += str.slice(0, remaining)
       const detected = detectLineEnding(this.detectionSample)
       if (detected === "crlf" || detected === "mixed") {
-        // 一旦发现 crlf 或 mixed 就锁定，不再被后续 lf-only 干扰
         this.detectedSourceLineEnding = detected
       } else if (!this.detectedSourceLineEnding) {
         this.detectedSourceLineEnding = detected
       }
     }
 
-    // 拼接 leftover + chunk，处理跨 chunk 的 \r\n
-    let data = Buffer.concat([this.leftover, chunk])
-    this.leftover = Buffer.alloc(0)
-
-    // 缓冲末尾的 \r，避免 \r\n 被切断
-    if (this.targetLineEnding && this.targetLineEnding !== "binary" && data.length > 0) {
-      if (data[data.length - 1] === 0x0d) {
-        this.leftover = Buffer.from([0x0d])
-        data = data.slice(0, data.length - 1)
-      }
+    // 拼接 leftover + chunk，处理跨 chunk 的 \r\n（\r 在一个 chunk 末尾）
+    let data = this.leftover + str
+    this.leftover = ""
+    if (data.length > 0 && data[data.length - 1] === "\r") {
+      this.leftover = "\r"
+      data = data.slice(0, -1)
     }
 
-    let output: Buffer<ArrayBufferLike> = data
-
-    // 先做 line ending 转换（字节级，在源编码字节上安全）
-    if (this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
-      output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
+    if (this.detectedSourceLineEnding) {
+      data = convertLineEndingsString(data, this.detectedSourceLineEnding, this.targetLineEnding)
     }
-
-    // 后做 encoding 转换（源编码 -> 目标编码）
-    if (this.targetEncoding && this.targetEncoding !== "utf8") {
-      output = convertEncoding(output, this.sourceEncodingResolved, this.targetEncoding)
-    }
-
-    this.push(output as unknown as Buffer)
+    this.push(data)
     callback()
   }
 
   _flush(callback: any) {
-    // Flush any remaining leftover
-    if (this.leftover.length > 0) {
-      let output: Buffer<ArrayBufferLike> = this.leftover
-      // 先 line ending 后 encoding，与 _transform 保持一致
-      if (this.detectedSourceLineEnding && this.targetLineEnding && this.targetLineEnding !== "binary") {
-        output = convertLineEndings(output, this.detectedSourceLineEnding, this.targetLineEnding)
-      }
-      if (this.targetEncoding && this.targetEncoding !== "utf8") {
-        output = convertEncoding(output, this.sourceEncodingResolved, this.targetEncoding)
-      }
-      this.push(output as unknown as Buffer)
+    if (this.leftover.length > 0 && this.detectedSourceLineEnding) {
+      const output = convertLineEndingsString(this.leftover, this.detectedSourceLineEnding, this.targetLineEnding)
+      this.push(output)
     }
     callback()
   }
+}
+
+/**
+ * 根据转码选项构建 streaming transform 链。
+ * 链路：[iconv.decodeStream(src)] → [LineEndingTransform] → [iconv.encodeStream(dst)]
+ * 不需要的阶段跳过。返回 Transform 数组（可能为空，表示 passthrough）。
+ */
+function buildTransformChain(options?: FileTransferOptions): Transform[] {
+  const chain: Transform[] = []
+  if (!options?.lineEnding && !options?.encoding) {
+    return chain
+  }
+
+  let lineEnding = options.lineEnding ?? "auto"
+  const encoding = options.encoding ?? "auto"
+  const sourceEncoding = options.sourceEncoding ?? "auto"
+
+  if (lineEnding === "auto") {
+    lineEnding = process.platform === "win32" ? "crlf" : "lf"
+  }
+
+  const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
+  const dstEnc = encoding === "auto" ? srcEnc : encoding
+  const needEncodingConvert = srcEnc !== dstEnc
+  const needLineEnding = lineEnding !== "binary"
+
+  // 编码转换：如果需要把源编码 decode 成 string（用于换行符转换或目标编码不同）
+  // 用 iconv.decodeStream。注意：即使只是换行符转换且源=目标=utf-8，我们也
+  // 可以不 decode 直接在 Buffer 上做——但为统一走 string 路径，这里在
+  // needLineEnding 或 needEncodingConvert 时都 decode。
+  const needDecode = needEncodingConvert || needLineEnding
+  if (needDecode) {
+    // iconv 流的 TS 类型是 NodeJS.ReadWriteStream，运行时是 Transform 子类，需 cast。
+    chain.push(iconv.decodeStream(srcEnc as any) as unknown as Transform)
+  }
+  if (needLineEnding) {
+    chain.push(new LineEndingTransform(lineEnding as "lf" | "crlf" | "binary"))
+  }
+  if (needEncodingConvert) {
+    chain.push(iconv.encodeStream(dstEnc as any) as unknown as Transform)
+  } else if (needDecode && !needEncodingConvert) {
+    // decode 了但不需要编码转换（源=目标），需要 encode 回原编码
+    chain.push(iconv.encodeStream(srcEnc as any) as unknown as Transform)
+  }
+  return chain
 }
 
 /** Check overwrite strategy and decide action */
@@ -529,15 +497,7 @@ export async function uploadFile(
 
       try {
         const readStream = createReadStream(localPath)
-        let transformStream: Transform | null = null
-
-        if (options?.lineEnding || options?.encoding) {
-          transformStream = new FileTransformStream({
-            lineEnding: options.lineEnding,
-            encoding: options.encoding,
-            sourceEncoding: options.sourceEncoding,
-          })
-        }
+        const chain = buildTransformChain(options)
 
         const writeStream = sftp.createWriteStream(finalRemotePath, {
           mode: options?.mode ?? statInfo.mode,
@@ -558,8 +518,9 @@ export async function uploadFile(
           }
         })
 
-        if (transformStream) {
-          await pipelineAsync(readStream, transformStream, writeStream)
+        if (chain.length > 0) {
+          // promisify(pipeline) 的 TS overload 对 spread 不友好，cast 成 any 调用
+          await (pipelineAsync as any)(readStream, ...chain, writeStream)
         } else {
           await pipelineAsync(readStream, writeStream)
         }
@@ -615,21 +576,23 @@ async function uploadFileDirect(
 
   if (options?.lineEnding || options?.encoding) {
     let lineEnding = options.lineEnding ?? "auto"
-    let encoding = options.encoding ?? "auto"
+    const encoding = options.encoding ?? "auto"
     const sourceEncoding = options.sourceEncoding ?? "auto"
 
-    // 先在原始字节上做 lineEnding 转换（字节级实现，对源编码安全）
     if (lineEnding === "auto") {
       lineEnding = process.platform === "win32" ? "crlf" : "lf"
     }
-    if (lineEnding !== "binary") {
-      data = convertLineEndings(data, detectLineEnding(data), lineEnding)
-    }
 
-    // 后做 encoding 转换（源编码 -> 目标编码）
-    if (encoding !== "auto") {
-      const fromEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
-      data = convertEncoding(data, fromEnc, encoding)
+    const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
+    const dstEnc = encoding === "auto" ? srcEnc : encoding
+
+    // 先 decode 成 string 做换行符转换（绝对安全），再 encode 成目标编码
+    if (lineEnding !== "binary") {
+      const text = iconv.decode(data, srcEnc as any)
+      const converted = convertLineEndingsString(text, detectLineEnding(text), lineEnding)
+      data = iconv.encode(converted, dstEnc as any)
+    } else if (srcEnc !== dstEnc) {
+      data = convertEncoding(data, srcEnc, dstEnc)
     }
   }
 
@@ -792,22 +755,23 @@ export async function downloadFile(
 
           if (options?.lineEnding || options?.encoding) {
             let lineEnding = options.lineEnding ?? "auto"
-            let encoding = options.encoding ?? "auto"
+            const encoding = options.encoding ?? "auto"
             const sourceEncoding = options.sourceEncoding ?? "auto"
 
             if (lineEnding === "auto") {
               lineEnding = process.platform === "win32" ? "crlf" : "lf"
             }
 
-            // 先做 lineEnding 转换（字节级，对源编码安全）
-            if (lineEnding !== "binary") {
-              data = convertLineEndings(data, detectLineEnding(data), lineEnding)
-            }
+            const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
+            const dstEnc = encoding === "auto" ? srcEnc : encoding
 
-            // 后做 encoding 转换（源编码 -> 目标编码）
-            if (encoding !== "auto") {
-              const fromEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
-              data = convertEncoding(data, fromEnc, encoding)
+            // 先 decode 成 string 做换行符转换（绝对安全），再 encode 成目标编码
+            if (lineEnding !== "binary") {
+              const text = iconv.decode(data, srcEnc as any)
+              const converted = convertLineEndingsString(text, detectLineEnding(text), lineEnding)
+              data = iconv.encode(converted, dstEnc as any)
+            } else if (srcEnc !== dstEnc) {
+              data = convertEncoding(data, srcEnc, dstEnc)
             }
           }
 
@@ -838,15 +802,7 @@ export async function downloadFile(
 
         // Streaming download with pipeline for large files
         const readStream = sftp.createReadStream(remotePath)
-        let transformStream: Transform | null = null
-
-        if (options?.lineEnding || options?.encoding) {
-          transformStream = new FileTransformStream({
-            lineEnding: options.lineEnding,
-            encoding: options.encoding,
-            sourceEncoding: options.sourceEncoding,
-          })
-        }
+        const chain = buildTransformChain(options)
 
         const writeStream = createWriteStream(targetLocalPath, {
           mode: options?.mode ?? remoteMode,
@@ -867,8 +823,9 @@ export async function downloadFile(
           }
         })
 
-        if (transformStream) {
-          await pipelineAsync(readStream, transformStream, writeStream)
+        if (chain.length > 0) {
+          // promisify(pipeline) 的 TS overload 对 spread 不友好，cast 成 any 调用
+          await (pipelineAsync as any)(readStream, ...chain, writeStream)
         } else {
           await pipelineAsync(readStream, writeStream)
         }
