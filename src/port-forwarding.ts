@@ -52,9 +52,40 @@ export class PortForwardManager {
   // stop and caused multiple forwards to interfere with each other.
   private remoteRoutes = new Map<string, RemoteRoute>()
   private tcpConnectionBound = false
+  // Set to true when the underlying SSH client has disconnected. Once set,
+  // new forward creation is rejected and existing forwards are marked "error".
+  private clientClosed = false
 
   constructor(client: Client) {
     this.client = client
+    // Subscribe to client disconnect events for self-healing. Guard with a
+    // typeof check so mock clients without an `.on` method (e.g. in tests)
+    // don't blow up during construction.
+    if (typeof (this.client as any).on === "function") {
+      this.client.on("close", () => this.handleClientDisconnect())
+      this.client.on("error", () => this.handleClientDisconnect())
+    }
+  }
+
+  /**
+   * Called when the underlying SSH client disconnects (close/error events).
+   * Idempotent: subsequent events are no-ops. Marks all forwards as "error"
+   * so list() reflects real status, and best-effort stops local servers to
+   * release the bound ports.
+   */
+  private handleClientDisconnect(): void {
+    if (this.clientClosed) return
+    this.clientClosed = true
+    log("portforward", `SSH client disconnected, stopping all forwards and marking as error`)
+    // Mark all forwards as error so list()/get() reflect real status instead of
+    // pretending they are still "active".
+    for (const entry of this.forwards.values()) {
+      entry.forward.status = "error"
+    }
+    // stopAll() closes local net.Server instances (releasing ports). For
+    // remote forwards it calls client.unforwardIn() which will throw on a
+    // dead client - stop() already guards that call with try/catch.
+    this.stopAll().catch(() => { /* best-effort cleanup */ })
   }
 
   /** Ensure the single "tcp connection" dispatcher is installed on the client. */
@@ -117,6 +148,9 @@ export class PortForwardManager {
     remoteDstAddr: string,
     remoteDstPort: number,
   ): Promise<PortForward> {
+    if (this.clientClosed) {
+      throw new Error("SSH client is disconnected, cannot create forward. Please reconnect first.")
+    }
     const id = randomUUID().slice(0, 12)
     const forward: PortForward = {
       id,
@@ -202,6 +236,9 @@ export class PortForwardManager {
     localDstAddr: string,
     localDstPort: number,
   ): Promise<PortForward> {
+    if (this.clientClosed) {
+      throw new Error("SSH client is disconnected, cannot create forward. Please reconnect first.")
+    }
     const id = randomUUID().slice(0, 12)
     const forward: PortForward = {
       id,
@@ -249,7 +286,14 @@ export class PortForwardManager {
       })
     } else {
       const remoteEntry = entry as ActiveRemoteForward
-      this.client.unforwardIn(entry.forward.bindAddr, entry.forward.bindPort, () => {})
+      // unforwardIn will throw if the underlying SSH client is already dead
+      // (e.g. after handleClientDisconnect fired). Guard it so stopAll() can
+      // complete cleanup without bubbling the error up.
+      try {
+        this.client.unforwardIn(entry.forward.bindAddr, entry.forward.bindPort, () => {})
+      } catch (e) {
+        log("portforward", `[${id}] unforwardIn failed (client likely disconnected): ${(e as Error).message}`)
+      }
       if (remoteEntry.routeKey) {
         this.remoteRoutes.delete(remoteEntry.routeKey)
         this.unbindTcpConnection()

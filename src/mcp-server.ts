@@ -208,6 +208,13 @@ async function main() {
       // Stale cache entry — evict and reconnect.
       log("mcp", `Cached session ${cached.sessionId.slice(0, 8)} is not connected (status: ${cachedSession?.status ?? "unknown"}), reconnecting...`)
       clientCache.delete(cacheKey)
+      // 必须先停掉 forwardManager 持有的本地 net.Server，否则端口会被孤儿
+      // server 占住，重建同端口的 forward 会失败，用户只能重启 MCP 才能恢复。
+      try {
+        await cached.forwardManager.stopAll()
+      } catch {
+        // best-effort cleanup
+      }
       try {
         await gw.disconnect(cached.sessionId)
       } catch {
@@ -250,8 +257,13 @@ async function main() {
    * Evict a cached client entry so the next getClientForProfile call
    * reconnects. Used after a connection error mid-operation so a single
    * retry can succeed with a fresh session.
+   *
+   * 必须做完整清理：先停 forwardManager（释放本地端口），再 disconnect
+   * session（从 gw.sessions 移除）。只删 cache 会导致：
+   *  - 本地 net.Server 孤儿监听，重建同端口 forward 失败 → 必须重启 MCP
+   *  - gw.sessions 累积死 session，最终撑爆 maxSessions
    */
-  function evictClientCache(profileName: string | undefined, profileJson: string | undefined, profileFile: string | undefined): string {
+  async function evictClientCache(profileName: string | undefined, profileJson: string | undefined, profileFile: string | undefined): Promise<string> {
     let key: string | undefined
     if (profileName) {
       key = profileName
@@ -270,6 +282,16 @@ async function main() {
       const cached = clientCache.get(key)!
       log("mcp", `Evicting stale client cache entry for ${key.slice(0, 40)} (session ${cached.sessionId.slice(0, 8)})`)
       clientCache.delete(key)
+      try {
+        await cached.forwardManager.stopAll()
+      } catch {
+        // best-effort cleanup
+      }
+      try {
+        await gw.disconnect(cached.sessionId)
+      } catch {
+        // best-effort cleanup; the session may already be gone
+      }
     }
     return key ?? ""
   }
@@ -285,15 +307,20 @@ async function main() {
   }
 
   /**
-   * Run a file-transfer operation (upload/download) with one automatic retry
+   * Run an operation against a cached SSH client with one automatic retry
    * on connection errors. The health check in getClientForProfile already
    * covers sessions that the SSHConnection has marked as disconnected, but
    * a TCP half-open connection can still pass that check and fail mid-stream.
    * Evicting the cache and retrying once with a fresh session matches the
    * "auto-reconnect when not connected" behaviour ssh_exec gets for free
    * via the daemon's connectHostJson.
+   *
+   * 适用于所有走 getClientForProfile 的工具（upload/download/read_file/
+   * write_file/list_dir/exists/stat/grep/find/get_host_load），让它们在
+   * 半开 TCP 窗口（ssh2 keepalive 约 90s 才发现连接死）内也能立即自愈，
+   * 而不是反复把死 client 交回去导致一串失败。
    */
-  async function transferWithReconnect<T>(
+  async function withReconnect<T>(
     profileName: string | undefined,
     profileJson: string | undefined,
     profileFile: string | undefined,
@@ -307,8 +334,8 @@ async function main() {
       } catch (err: unknown) {
         lastError = err
         if (attempt === 0 && isConnectionError(err)) {
-          log("mcp", `Transfer failed with connection error on attempt ${attempt + 1}, evicting cache and retrying: ${(err as Error).message}`)
-          evictClientCache(profileName, profileJson, profileFile)
+          log("mcp", `Operation failed with connection error on attempt ${attempt + 1}, evicting cache and retrying: ${(err as Error).message}`)
+          await evictClientCache(profileName, profileJson, profileFile)
           continue
         }
         throw err
@@ -737,8 +764,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await handleMcpReadFile({ client, remoteExec, path, offset, limit })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        handleMcpReadFile({ client, remoteExec, path, offset, limit }),
+      )
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -755,16 +783,21 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_write_file", async ({ path, content, mode, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
-      await remoteExec(client, dirCmd, { timeout: 10000 })
-      const b64 = Buffer.from(content).toString("base64")
-      const writeCmd = mode
-        ? `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)} && chmod ${assertOctalMode(mode)} ${shellQuote(path)}`
-        : `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)}`
-      const result = await remoteExec(client, writeCmd, { timeout: 30000 })
-      if (result.code !== 0) {
-        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error writing file: ${result.stderr}`)) }] }
+      const outcome = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
+        await remoteExec(client, dirCmd, { timeout: 10000 })
+        const b64 = Buffer.from(content).toString("base64")
+        const writeCmd = mode
+          ? `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)} && chmod ${assertOctalMode(mode)} ${shellQuote(path)}`
+          : `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)}`
+        const result = await remoteExec(client, writeCmd, { timeout: 30000 })
+        if (result.code !== 0) {
+          return { ok: false as const, stderr: result.stderr }
+        }
+        return { ok: true as const }
+      })
+      if (!outcome.ok) {
+        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error writing file: ${outcome.stderr}`)) }] }
       }
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, bytes: Buffer.byteLength(content), mode, message: `Written ${content.length} bytes to ${path}` })) }] }
     },
@@ -781,8 +814,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await handleMcpListDir({ client, remoteExec, path, showHidden: Boolean(show_hidden) })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        handleMcpListDir({ client, remoteExec, path, showHidden: Boolean(show_hidden) }),
+      )
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -797,8 +831,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 }),
+      )
       const exists = result.stdout.trim() === "exists"
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, exists, raw: result.stdout.trim() })) }] }
     },
@@ -814,8 +849,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await handleMcpStat({ client, remoteExec, path })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        handleMcpStat({ client, remoteExec, path }),
+      )
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -833,8 +869,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_grep", async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await handleMcpGrep({ client, remoteExec, pattern, path, glob, caseInsensitive: Boolean(case_insensitive) })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        handleMcpGrep({ client, remoteExec, pattern, path, glob, caseInsensitive: Boolean(case_insensitive) }),
+      )
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -852,8 +889,9 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
-      const { client } = await getClientForProfile(profile_name, profile_json, profile_file)
-      const result = await handleMcpFind({ client, remoteExec, path, name, type, maxDepth: max_depth })
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
+        handleMcpFind({ client, remoteExec, path, name, type, maxDepth: max_depth }),
+      )
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -869,19 +907,21 @@ async function main() {
       overwrite: z.enum(["skip", "overwrite", "rename", "backup"]).optional().describe("Non-interactive overwrite strategy (default: overwrite). Use rename or backup when preserving existing files."),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
-      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion (target encoding). Omit for normal/binary transfers."),
+      source_encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Source file encoding for text-only conversion. For upload: local file encoding; for download: remote file encoding. Default auto=utf8. Set when the source is not utf-8 (e.g. remote gbk file) to avoid data corruption."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
-      const result = await transferWithReconnect(profile_name, profile_json, profile_file, (client) =>
+    wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         upload(client, local_path, remote_path, {
           compressionLevel: compression_level,
           overwrite: overwrite as any,
           skipSymlinks: skip_symlinks,
           lineEnding: line_ending as any,
           encoding: encoding as any,
+          sourceEncoding: source_encoding as any,
         }),
       )
       return {
@@ -903,19 +943,21 @@ async function main() {
       overwrite: z.enum(["skip", "overwrite", "rename", "backup"]).optional().describe("Non-interactive overwrite strategy (default: overwrite). Use rename or backup when preserving existing files."),
       skip_symlinks: z.boolean().optional().describe("Skip symbolic links (default: false)"),
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
-      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion. Omit for normal/binary transfers."),
+      encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion (target encoding). Omit for normal/binary transfers."),
+      source_encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Source file encoding for text-only conversion. For upload: local file encoding; for download: remote file encoding. Default auto=utf8. Set when the source is not utf-8 (e.g. remote gbk file) to avoid data corruption."),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, profile_name, profile_json, profile_file }) => {
-      const result = await transferWithReconnect(profile_name, profile_json, profile_file, (client) =>
+    wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         download(client, remote_path, local_path, {
           compressionLevel: compression_level,
           overwrite: overwrite as any,
           skipSymlinks: skip_symlinks,
           lineEnding: line_ending as any,
           encoding: encoding as any,
+          sourceEncoding: source_encoding as any,
         }),
       )
       return {
@@ -1057,23 +1099,24 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_get_host_load", async ({ profile_name, profile_json, profile_file }) => {
-      const entry = await getClientForProfile(profile_name, profile_json, profile_file)
-      const clientObj = entry.client as Record<string, unknown>
-      const innerClient = clientObj._client as Record<string, unknown> | undefined
-      const config = innerClient?._config as Record<string, unknown> | undefined
-      const hostname = config?.host as string | undefined
-      
-      const uptimeResult = await remoteExec(entry.client, "uptime", { timeout: 10000 })
-      const memResult = await remoteExec(entry.client, "free -h", { timeout: 10000 })
-      const procResult = await remoteExec(entry.client, "ps aux --no-headers | wc -l", { timeout: 10000 })
-      const queueResp = await daemonClient.queueStatus({ hostId: hostname })
-      const loadInfo = {
-        hostname: hostname ?? "unknown",
-        uptime: uptimeResult.stdout.trim(),
-        memory: memResult.stdout.trim(),
-        processCount: procResult.stdout.trim(),
-        scheduler: queueResp.ok ? queueResp.data : { error: (queueResp as any).error },
-      }
+      const loadInfo = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        const clientObj = client as Record<string, unknown>
+        const innerClient = clientObj._client as Record<string, unknown> | undefined
+        const config = innerClient?._config as Record<string, unknown> | undefined
+        const hostname = config?.host as string | undefined
+
+        const uptimeResult = await remoteExec(client, "uptime", { timeout: 10000 })
+        const memResult = await remoteExec(client, "free -h", { timeout: 10000 })
+        const procResult = await remoteExec(client, "ps aux --no-headers | wc -l", { timeout: 10000 })
+        const queueResp = await daemonClient.queueStatus({ hostId: hostname })
+        return {
+          hostname: hostname ?? "unknown",
+          uptime: uptimeResult.stdout.trim(),
+          memory: memResult.stdout.trim(),
+          processCount: procResult.stdout.trim(),
+          scheduler: queueResp.ok ? queueResp.data : { error: (queueResp as any).error },
+        }
+      })
       return { content: [{ type: "text", text: jsonText(mcpEnvelope("host_load", loadInfo)) }] }
     },
   ))
@@ -1500,14 +1543,44 @@ async function main() {
   await server.connect(transport)
   log("mcp", "MCP server started on stdio")
 
+  // Idle sweeper: daemon 有 sweepIdle 定期清理空闲 session，MCP 端原本没有。
+  // 后果是：session 因网络问题死了但 getClientForProfile 没被再次调用（用户
+  // 切到别的 profile）时，死 session 永远留在 gw.sessions 里累积，最终撑爆
+  // maxSessions 导致新连接被拒。这里每 60s 扫一次，清理已断开的死 session
+  // 及其对应的 forwardManager（释放本地端口）。
+  const sweepTimer = setInterval(async () => {
+    try {
+      const sessions = gw.listSessions()
+      for (const s of sessions) {
+        if (s.status !== "connected") {
+          // 找到对应的 cache 条目，先停 forwardManager 释放本地端口
+          for (const [, cached] of clientCache.entries()) {
+            if (cached.sessionId === s.id) {
+              try { await cached.forwardManager.stopAll() } catch { /* best-effort */ }
+              clientCache.delete([...clientCache.entries()].find(([, c]) => c.sessionId === s.id)?.[0] ?? "")
+              break
+            }
+          }
+          try { await gw.disconnect(s.id) } catch { /* best-effort */ }
+          log("mcp", `Idle sweeper cleaned up disconnected session ${s.id.slice(0, 8)} (status: ${s.status})`)
+        }
+      }
+    } catch (err: any) {
+      log("mcp", `Idle sweeper error: ${err.message}`)
+    }
+  }, 60_000)
+  sweepTimer.unref?.()
+
   // Graceful shutdown
   process.on("SIGTERM", async () => {
     log("mcp", "Shutting down...")
+    clearInterval(sweepTimer)
     await gw.disconnectAll()
     process.exit(0)
   })
   process.on("SIGINT", async () => {
     log("mcp", "Shutting down...")
+    clearInterval(sweepTimer)
     await gw.disconnectAll()
     process.exit(0)
   })

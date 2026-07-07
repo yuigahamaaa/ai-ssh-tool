@@ -202,7 +202,20 @@ export class SSHDaemon {
             onClose(code, signal)
           }
 
+          // exec 启动超时：在死 client 上 client.exec 的回调可能永远不触发，
+          // 原本要等 5 分钟 hard timeout。这里加 30s 短超时，回调未触发就
+          // 立即 finalize，让用户尽快看到失败而不是假死。
+          let execStartTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            if (closed) return
+            if (!stream) {
+              log("daemon", `Background task ${task.id} exec did not start within 30s, force-stopping (likely dead session)`)
+              onOutput("", "exec did not start within 30s (session may be disconnected)")
+              finalize(1, "SIGKILL")
+            }
+          }, 30_000)
+
           client.exec(wrappedCommand, (err, s) => {
+            if (execStartTimeout) { clearTimeout(execStartTimeout); execStartTimeout = null }
             if (err) {
               logError("daemon", `Failed to start background task ${task.id}`, err)
               onOutput("", err.message)
@@ -603,7 +616,7 @@ export class SSHDaemon {
       this.sessionMap.delete(configHash)
       if (session) {
         this.gateway.disconnect(existing.sessionId).catch((err) => log("daemon", `disconnect stale session ${existing.sessionId.slice(0, 8)} failed: ${err.message}`))
-        this.forwardManagers.delete(existing.sessionId)
+        void this.cleanupSession(existing.sessionId)
       }
     }
 
@@ -638,13 +651,13 @@ export class SSHDaemon {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
           this.gateway.disconnect(entry.sessionId).catch((e) => log("daemon", `disconnect error session ${entry.sessionId.slice(0, 8)} failed: ${e.message}`))
-          this.cleanupSession(entry.sessionId)
+          void this.cleanupSession(entry.sessionId)
         }
       }
       // Also clean up error sessions not in sessionMap (freshly created ones)
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
         this.gateway.disconnect(s.id).catch((e) => log("daemon", `disconnect error session ${s.id.slice(0, 8)} failed: ${e.message}`))
-        this.forwardManagers.delete(s.id)
+        void this.cleanupSession(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
     }
@@ -666,7 +679,7 @@ export class SSHDaemon {
       this.sessionMap.delete(configHash)
       if (session) {
         this.gateway.disconnect(existing.sessionId).catch((err) => log("daemon", `disconnect stale session ${existing.sessionId.slice(0, 8)} failed: ${err.message}`))
-        this.forwardManagers.delete(existing.sessionId)
+        void this.cleanupSession(existing.sessionId)
       }
     }
 
@@ -702,12 +715,12 @@ export class SSHDaemon {
         const s = this.gateway.sessions.getSession(entry.sessionId)
         if (s && s.status === "error") {
           this.gateway.disconnect(entry.sessionId).catch((e) => log("daemon", `disconnect error session ${entry.sessionId.slice(0, 8)} failed: ${e.message}`))
-          this.cleanupSession(entry.sessionId)
+          void this.cleanupSession(entry.sessionId)
         }
       }
       for (const s of this.gateway.sessions.getSessionsByStatus("error")) {
         this.gateway.disconnect(s.id).catch((e) => log("daemon", `disconnect error session ${s.id.slice(0, 8)} failed: ${e.message}`))
-        this.forwardManagers.delete(s.id)
+        void this.cleanupSession(s.id)
       }
       return { id: req.id, ok: false, error: err.message }
     }
@@ -929,7 +942,7 @@ export class SSHDaemon {
     if (!connection.isConnected()) {
       try {
         await this.gateway.disconnect(sessionId)
-        this.cleanupSession(sessionId)
+        await this.cleanupSession(sessionId)
       } catch {
         // ignore cleanup errors
       }
@@ -954,7 +967,7 @@ export class SSHDaemon {
       // call recreates the session instead of reusing a stale one.
       try {
         await this.gateway.disconnect(sessionId)
-        this.cleanupSession(sessionId)
+        await this.cleanupSession(sessionId)
       } catch {
         // ignore cleanup errors
       }
@@ -968,6 +981,20 @@ export class SSHDaemon {
       switch (subcommand) {
         case "start": {
           if (!command) return { id: req.id, ok: false, error: "command is required" }
+          // 预检 session 是否还连着。死 session 上启动的 background task 会在
+          // scheduler 的 startBackground runner 里 client.exec 失败，但回调可能
+          // 不触发导致 task 卡 5 分钟才超时。这里提前拦截并清理，让 CLI 端
+          // 触发重连。
+          const bgConn = this.gateway.sessions.getConnection(sessionId)
+          if (!bgConn || !bgConn.isConnected()) {
+            try {
+              await this.gateway.disconnect(sessionId)
+              await this.cleanupSession(sessionId)
+            } catch {
+              // ignore cleanup errors
+            }
+            return { id: req.id, ok: false, error: `Session ${sessionId} is not connected` }
+          }
           // Use scheduler's background task mechanism
           const entry = this.sessionMap.get(sessionId) ?? Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)
           const hId = entry?.configHash ?? sessionId.slice(0, 16)
@@ -1020,6 +1047,17 @@ export class SSHDaemon {
     if (!connection) {
       return { id: req.id, ok: false, error: `Session ${sessionId} not found` }
     }
+    // 预检 session 是否还连着，避免在死 client 上 localForward 静默"成功"
+    // （server.listen 是本地操作，必然成功，但每个进来的连接都会失败）。
+    if (!connection.isConnected()) {
+      try {
+        await this.gateway.disconnect(sessionId)
+        await this.cleanupSession(sessionId)
+      } catch {
+        // ignore cleanup errors
+      }
+      return { id: req.id, ok: false, error: `Session ${sessionId} is not connected` }
+    }
     const client = connection.getFinalClient()
     try {
       let manager = this.forwardManagers.get(sessionId)
@@ -1054,6 +1092,17 @@ export class SSHDaemon {
           return { id: req.id, ok: false, error: `Unknown portForward subcommand: ${subcommand}` }
       }
     } catch (err: any) {
+      // 连接类错误时清理死 session（含 forwardManager.stopAll 释放本地端口），
+      // 让下一次 connectHostJson 重建 session 而不是复用僵尸。
+      const msg = err.message ?? ""
+      if (/socket closed|EPIPE|ECONNRESET|not connected|Failed to open|connection lost/i.test(msg)) {
+        try {
+          await this.gateway.disconnect(sessionId)
+          await this.cleanupSession(sessionId)
+        } catch {
+          // ignore cleanup errors
+        }
+      }
       return { id: req.id, ok: false, error: err.message }
     }
   }
@@ -1074,8 +1123,18 @@ export class SSHDaemon {
    * on every path that disconnects a session so the maps don't grow unbounded
    * over the daemon's lifetime.
    */
-  private cleanupSession(sessionId: string): void {
-    this.forwardManagers.delete(sessionId)
+  private async cleanupSession(sessionId: string): Promise<void> {
+    // 必须先停 forwardManager 持有的本地 net.Server，否则端口会被孤儿
+    // server 占住，重建同端口的 forward 会失败，用户只能重启 daemon 才能恢复。
+    const manager = this.forwardManagers.get(sessionId)
+    if (manager) {
+      try {
+        await manager.stopAll()
+      } catch (err: any) {
+        log("daemon", `stopAll forwards for session ${sessionId.slice(0, 8)} failed: ${err.message}`)
+      }
+      this.forwardManagers.delete(sessionId)
+    }
     for (const [hash, entry] of this.sessionMap) {
       if (entry.sessionId === sessionId) {
         this.sessionMap.delete(hash)

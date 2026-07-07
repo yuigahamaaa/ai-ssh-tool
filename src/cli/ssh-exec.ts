@@ -712,38 +712,51 @@ export async function handleDaemonBgExec(args: string[]): Promise<void> {
   try {
     await client.ensureDaemon({ debug })
 
-    let connectResp
-    if (configJson) {
-      connectResp = await client.connectHostJson(configJson)
-    } else if (profileJson) {
-      const config = loadConfigFromProfileJson(profileJson)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else if (profileName) {
-      const config = loadConfigFromProfileName(profileName)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else {
-      connectResp = await client.connectHost(resolve(configPath!))
+    // connect → bgExec，连接类错误时重连重试一次。daemon 的 connectHostJson
+    // 会自动驱逐死 session 并重建，所以重新 connect 即可拿到新 sessionId。
+    const doConnect = async (): Promise<string> => {
+      let connectResp
+      if (configJson) {
+        connectResp = await client.connectHostJson(configJson)
+      } else if (profileJson) {
+        const config = loadConfigFromProfileJson(profileJson)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else if (profileName) {
+        const config = loadConfigFromProfileName(profileName)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else {
+        connectResp = await client.connectHost(resolve(configPath!))
+      }
+      if (!connectResp.ok) {
+        throw new Error(`Connection failed: ${(connectResp as any).error}`)
+      }
+      return (connectResp.data as any).sessionId as string
     }
 
-    if (!connectResp.ok) {
-      console.error(`Connection failed: ${(connectResp as any).error}`)
-      process.exitCode = 1
-      return
+    let lastError: Error | undefined
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sessionId = await doConnect()
+      const result = await client.send(
+        createRequest("bgExec", { sessionId, subcommand, command, taskId: command }),
+        60000,
+      )
+      if (result.ok) {
+        console.log(JSON.stringify(result.data, null, 2))
+        return
+      }
+      const errMsg = (result as any).error ?? "unknown error"
+      lastError = new Error(`Error: ${errMsg}`)
+      // 仅连接类错误重试；start 子命令的 daemon 端 isConnected 预检会在
+      // 真正启动 task 前拒绝，所以重试不会产生重复 task。
+      if (attempt === 0 && /not connected|socket closed|EPIPE|ECONNRESET|connection lost|Session .* is not connected/i.test(errMsg)) {
+        console.error(`[ssh-exec] bgExec failed with connection error, reconnecting...`)
+        continue
+      }
+      break
     }
 
-    const { sessionId } = connectResp.data as any
-
-    const result = await client.send(
-      createRequest("bgExec", { sessionId, subcommand, command, taskId: command }),
-      60000,
-    )
-
-    if (result.ok) {
-      console.log(JSON.stringify(result.data, null, 2))
-    } else {
-      console.error(`Error: ${(result as any).error}`)
-      process.exitCode = 1
-    }
+    console.error(lastError?.message ?? "bgExec failed")
+    process.exitCode = 1
   } catch (err: any) {
     console.error(`Error: ${err.message}`)
     process.exitCode = 1
@@ -802,37 +815,51 @@ export async function handleDaemonPortForward(args: string[]): Promise<void> {
   try {
     await client.ensureDaemon({ debug })
 
-    let connectResp
-    if (configJson) {
-      connectResp = await client.connectHostJson(configJson)
-    } else if (profileJson) {
-      const config = loadConfigFromProfileJson(profileJson)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else if (profileName) {
-      const config = loadConfigFromProfileName(profileName)
-      connectResp = await client.connectHostJson(JSON.stringify(config))
-    } else {
-      connectResp = await client.connectHost(resolve(configPath!))
+    // connect → portForward，连接类错误时重连重试一次。daemon 的
+    // handlePortForward 在 isConnected 预检失败或 catch 连接类错误时会
+    // cleanupSession（含 forwardManager.stopAll 释放本地端口），所以重试
+    // 时端口已被释放，重建 forward 不会冲突。
+    const doConnect = async (): Promise<string> => {
+      let connectResp
+      if (configJson) {
+        connectResp = await client.connectHostJson(configJson)
+      } else if (profileJson) {
+        const config = loadConfigFromProfileJson(profileJson)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else if (profileName) {
+        const config = loadConfigFromProfileName(profileName)
+        connectResp = await client.connectHostJson(JSON.stringify(config))
+      } else {
+        connectResp = await client.connectHost(resolve(configPath!))
+      }
+      if (!connectResp.ok) {
+        throw new Error(`Connection failed: ${(connectResp as any).error}`)
+      }
+      return (connectResp.data as any).sessionId as string
     }
 
-    if (!connectResp.ok) {
-      console.error(`Connection failed: ${(connectResp as any).error}`)
-      process.exitCode = 1
-      return
+    let lastError: Error | undefined
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sessionId = await doConnect()
+      const result = await client.send(
+        createRequest("portForward", { sessionId, subcommand, type, bindAddr, bindPort, dstAddr, dstPort, forwardId }),
+        30000,
+      )
+      if (result.ok) {
+        console.log(JSON.stringify(result.data, null, 2))
+        return
+      }
+      const errMsg = (result as any).error ?? "unknown error"
+      lastError = new Error(`Error: ${errMsg}`)
+      if (attempt === 0 && /not connected|socket closed|EPIPE|ECONNRESET|connection lost|Session .* is not connected|EADDRINUSE/i.test(errMsg)) {
+        console.error(`[ssh-exec] portForward failed with connection error, reconnecting...`)
+        continue
+      }
+      break
     }
 
-    const { sessionId } = connectResp.data as any
-    const result = await client.send(
-      createRequest("portForward", { sessionId, subcommand, type, bindAddr, bindPort, dstAddr, dstPort, forwardId }),
-      30000,
-    )
-
-    if (result.ok) {
-      console.log(JSON.stringify(result.data, null, 2))
-    } else {
-      console.error(`Error: ${(result as any).error}`)
-      process.exitCode = 1
-    }
+    console.error(lastError?.message ?? "portForward failed")
+    process.exitCode = 1
   } catch (err: any) {
     console.error(`Error: ${err.message}`)
     process.exitCode = 1
