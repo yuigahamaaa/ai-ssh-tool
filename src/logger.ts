@@ -139,6 +139,14 @@ export function logError(category: string, context: string, err: Error): void {
   }
 }
 
+/**
+ * Returns the debug logs directory. Used by the Janitor to clean up
+ * stale debug log files.
+ */
+export function getLogsDir(): string {
+  return LOGS_DIR
+}
+
 export function printErrorAndLogPath(message: string): void {
   console.error(`[ssh-exec] 错误: ${message}`)
   if (debugEnabled) {

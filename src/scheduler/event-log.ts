@@ -19,6 +19,11 @@ export class EventLog {
   private buffer: string[] = []
   private flushTimer: ReturnType<typeof setTimeout> | null = null
 
+  /** Returns the on-disk directory where event log files are stored. */
+  getBaseDir(): string {
+    return this.baseDir
+  }
+
   constructor(baseDir?: string) {
     this.baseDir = baseDir ?? getSchedulerEventsDir()
     if (!existsSync(this.baseDir)) {

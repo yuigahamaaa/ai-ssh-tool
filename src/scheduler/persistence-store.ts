@@ -66,6 +66,11 @@ export class PersistenceStore {
     // no-op in the base class
   }
 
+  /** Returns the on-disk directory where task JSON files are stored. */
+  getTasksDir(): string {
+    return this.tasksDir
+  }
+
   saveTask(task: ScheduledTask): void {
     const taskPath = join(this.tasksDir, `${task.id}.json`)
     // Machine-read format: no indentation. Drops write size ~30-40% and

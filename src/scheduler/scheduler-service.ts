@@ -25,6 +25,8 @@ import { VirtualCwdStore } from "./virtual-cwd-store.js"
 import { OutputStore } from "./output-store.js"
 import { EventLog } from "./event-log.js"
 import { LockManager } from "./lock-manager.js"
+import { Janitor } from "./janitor.js"
+import { getLogsDir } from "../logger.js"
 
 const FINISHED_TASK_TTL_MS = 60 * 60 * 1000
 const EVICT_BATCH_SIZE = 100
@@ -39,6 +41,8 @@ export interface SchedulerServiceOptions {
   maxTotalRunning?: number
   maxLargeRunning?: number
   outputCleanupThrottleMs?: number
+  /** Janitor for periodic disk cleanup. Pass null to disable. */
+  janitor?: Janitor | null
   /**
    * Lifecycle hooks for cross-system integration (e.g. the legacy
    * ExecTaskManager facade listens to these so its read paths can
@@ -96,6 +100,9 @@ export class SchedulerService {
   // runner.start. This lets scheduler-owned cancellation stop foreground
   // streams without relying on the older optional runner.cancel hook.
   private foregroundTaskControllers = new Map<string, { stop: () => void }>()
+  // Janitor: periodic cleanup of stale task JSONs, event logs, debug logs.
+  // Runs on a slow timer (default 30 min) and is entirely best-effort.
+  private janitor: Janitor | null
 
   constructor(opts?: SchedulerServiceOptions) {
     this.persistence = opts?.persistence ?? new PersistenceStore()
@@ -133,6 +140,40 @@ export class SchedulerService {
         }
       }
     }, LOCK_RENEW_INTERVAL_MS)
+
+    // Janitor: periodic cleanup of stale on-disk artifacts (task JSONs,
+    // event logs, debug logs, legacy dir). Runs on a slow timer so it
+    // doesn't interfere with normal operation. Pass janitor: null to
+    // disable (used in unit tests that don't want background cleanup).
+    if (opts?.janitor === null) {
+      this.janitor = null
+    } else if (opts?.janitor) {
+      this.janitor = opts.janitor
+      this.janitor.start()
+    } else {
+      this.janitor = new Janitor({
+        tasksDir: this.persistence.getTasksDir(),
+        eventsDir: this.eventLog.getBaseDir(),
+        logsDir: getLogsDir(),
+        protectedTaskIds: () => this.getProtectedTaskIds(),
+      })
+      this.janitor.start()
+    }
+  }
+
+  /**
+   * Collect IDs of all running and queued tasks — these must never be
+   * deleted by the Janitor.
+   */
+  private getProtectedTaskIds(): string[] {
+    const ids: string[] = []
+    for (const [, set] of this.runningByHost) {
+      for (const id of set) ids.push(id)
+    }
+    for (const [, set] of this.queuedByHost) {
+      for (const id of set) ids.push(id)
+    }
+    return ids
   }
 
   /**
@@ -149,6 +190,10 @@ export class SchedulerService {
     if (this.lockRenewTimer) {
       clearInterval(this.lockRenewTimer)
       this.lockRenewTimer = null
+    }
+    if (this.janitor) {
+      this.janitor.stop()
+      this.janitor = null
     }
     // Stop any foreground/background streams started by the runner. Each
     // controller.stop() is best-effort and must not throw — we loop through
