@@ -1,5 +1,5 @@
 
-import { existsSync, mkdirSync, appendFileSync, readFileSync } from "fs"
+import { existsSync, mkdirSync, appendFileSync, readFileSync, readdirSync, unlinkSync, statSync } from "fs"
 import { openSync, readSync, closeSync, fstatSync } from "fs"
 import { join } from "path"
 import type { SchedulerEvent, EventType } from "./types.js"
@@ -7,10 +7,12 @@ import { getSchedulerEventsDir, ensureDir } from "../paths.js"
 
 const MAX_EVENTS_PER_FILE = 1000
 const FLUSH_INTERVAL_MS = 200
+const DEFAULT_EVENT_RETENTION_DAYS = 30
 
 export class EventLog {
   private baseDir: string
   private currentFile = ""
+  private currentDate = ""
   private eventCount = 0
   // Batched-write buffer. Multiple log() calls within FLUSH_INTERVAL_MS are
   // coalesced into a single appendFileSync, eliminating the per-event disk
@@ -24,14 +26,111 @@ export class EventLog {
     if (!existsSync(this.baseDir)) {
       mkdirSync(this.baseDir, { recursive: true, mode: 0o700 })
     }
-    this.rotateFile()
+    this.initCurrentFile()
+    this.cleanupOldFiles()
   }
 
+  /**
+   * Find or create the current event file for today. If today's base file
+   * (events-YYYY-MM-DD.jsonl) already has >= MAX_EVENTS_PER_FILE lines,
+   * advance to the next numbered suffix (events-YYYY-MM-DD.1.jsonl, etc.).
+   */
+  private initCurrentFile(): void {
+    const now = new Date()
+    const dateStr = now.toISOString().slice(0, 10)
+    this.currentDate = dateStr
+    const baseName = `events-${dateStr}.jsonl`
+    const basePath = join(this.baseDir, baseName)
+
+    if (!existsSync(basePath)) {
+      this.currentFile = basePath
+      this.eventCount = 0
+      return
+    }
+
+    const baseCount = this.countLines(basePath)
+    if (baseCount < MAX_EVENTS_PER_FILE) {
+      this.currentFile = basePath
+      this.eventCount = baseCount
+      return
+    }
+
+    // Base file is full, find the next available numbered suffix
+    let seq = 1
+    while (existsSync(join(this.baseDir, `events-${dateStr}.${seq}.jsonl`))) {
+      const seqCount = this.countLines(join(this.baseDir, `events-${dateStr}.${seq}.jsonl`))
+      if (seqCount < MAX_EVENTS_PER_FILE) {
+        this.currentFile = join(this.baseDir, `events-${dateStr}.${seq}.jsonl`)
+        this.eventCount = seqCount
+        return
+      }
+      seq++
+    }
+    this.currentFile = join(this.baseDir, `events-${dateStr}.${seq}.jsonl`)
+    this.eventCount = 0
+  }
+
+  /**
+   * Rotate to a new file when the current one hits MAX_EVENTS_PER_FILE.
+   * If the date has changed, start a new base file for the new day.
+   * Otherwise, advance to the next numbered suffix for the current day.
+   */
   private rotateFile(): void {
     const now = new Date()
     const dateStr = now.toISOString().slice(0, 10)
-    this.currentFile = join(this.baseDir, `events-${dateStr}.jsonl`)
-    this.eventCount = 0
+    if (dateStr !== this.currentDate) {
+      // New day: reset to base file
+      this.currentDate = dateStr
+      this.currentFile = join(this.baseDir, `events-${dateStr}.jsonl`)
+      this.eventCount = 0
+    } else {
+      // Same day: advance to next numbered suffix
+      let seq = 1
+      while (existsSync(join(this.baseDir, `events-${dateStr}.${seq}.jsonl`))) {
+        seq++
+      }
+      this.currentFile = join(this.baseDir, `events-${dateStr}.${seq}.jsonl`)
+      this.eventCount = 0
+    }
+  }
+
+  private countLines(filePath: string): number {
+    try {
+      const content = readFileSync(filePath, "utf8")
+      let count = 0
+      for (let i = 0; i < content.length; i++) {
+        if (content.charCodeAt(i) === 10) count++
+      }
+      // If the file doesn't end with a newline, count the last line too
+      if (content.length > 0 && content.charCodeAt(content.length - 1) !== 10) count++
+      return count
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * Delete event files older than `retentionDays`. Called once at
+   * construction to prevent unbounded accumulation of historical logs.
+   */
+  cleanupOldFiles(retentionDays: number = DEFAULT_EVENT_RETENTION_DAYS): number {
+    const now = Date.now()
+    const retentionMs = retentionDays * 24 * 60 * 60 * 1000
+    let deleted = 0
+    try {
+      const files = readdirSync(this.baseDir)
+      for (const file of files) {
+        if (!file.startsWith("events-") || !file.endsWith(".jsonl")) continue
+        const filePath = join(this.baseDir, file)
+        try {
+          const stat = statSync(filePath)
+          if (now - stat.mtimeMs > retentionMs) {
+            try { unlinkSync(filePath); deleted++ } catch {}
+          }
+        } catch {}
+      }
+    } catch {}
+    return deleted
   }
 
   log(

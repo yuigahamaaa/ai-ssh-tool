@@ -115,6 +115,11 @@ export class SchedulerService {
     this.outputCleanupThrottleMs = opts?.outputCleanupThrottleMs ?? 5 * 60 * 1000
 
     this.restore()
+    // P0-2: Sweep stale task files left behind by previous daemon runs.
+    // evictOldTasks only runs while the daemon is alive; without this
+    // sweep, files from crashed/killed sessions would accumulate forever.
+    this.persistence.cleanupOldTaskFiles()
+    this.persistence.cleanupTempFiles()
     this.cleanupOutputs()
 
     // Idle eviction: periodically clean up finished tasks even when scheduler is idle.
@@ -1274,6 +1279,12 @@ export class SchedulerService {
       // (queueStatus, getTask) will return undefined and callers handle it.
       this.tasks.delete(head.id)
       this.streamedOutputTasks.delete(head.id)
+      // Delete the on-disk task file and output files so they don't
+      // accumulate forever. Previously evictOldTasks only cleared the
+      // in-memory Map, leaving tasks/<id>.json and stdout/stderr files
+      // on disk indefinitely.
+      try { this.persistence.deleteTask(head.id) } catch { /* best-effort */ }
+      try { this.outputStore.remove(head.id) } catch { /* best-effort */ }
       evicted++
     }
   }

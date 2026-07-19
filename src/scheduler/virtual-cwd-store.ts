@@ -2,6 +2,7 @@ import type { VirtualCwdState } from "./types.js"
 import type { PersistenceStore } from "./persistence-store.js"
 
 const DEBOUNCE_MS = 1000
+const CWD_ENTRY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 
 export class VirtualCwdStore {
   private map = new Map<string, VirtualCwdState>()
@@ -18,9 +19,21 @@ export class VirtualCwdStore {
 
   private loadFromDisk(): void {
     const data = this.persistence.loadVirtualCwdMap()
+    const now = Date.now()
+    let pruned = false
     for (const [key, value] of Object.entries(data)) {
+      // Prune entries that haven't been accessed for > 30 days. This
+      // prevents the virtual-cwd.json file from growing unboundedly as
+      // agents and hosts come and go across daemon restarts.
+      if (typeof value.updatedAt === "number" && now - value.updatedAt > CWD_ENTRY_RETENTION_MS) {
+        pruned = true
+        continue
+      }
       this.map.set(key, value)
     }
+    // If we pruned any entries, persist the trimmed map immediately so
+    // the stale entries don't reappear on the next reload.
+    if (pruned) this.schedulePersist()
   }
 
   /**

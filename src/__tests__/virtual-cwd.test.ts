@@ -86,4 +86,41 @@ describe("VirtualCwdStore", () => {
     store.flushNow()
     assert.equal(writes, 1, "all three sets should coalesce into a single write")
   })
+
+  it("prunes entries older than 30 days on load", () => {
+    // Write a virtual-cwd.json with a stale entry (updatedAt = 60 days ago)
+    // and a fresh entry (updatedAt = now).
+    const oldTime = Date.now() - 60 * 24 * 60 * 60 * 1000
+    persistence.saveVirtualCwdMap({
+      "agentOld:host1": {
+        key: "agentOld:host1",
+        agentId: "agentOld",
+        hostId: "host1",
+        cwd: "/old-path",
+        updatedAt: oldTime,
+      },
+      "agentNew:host1": {
+        key: "agentNew:host1",
+        agentId: "agentNew",
+        hostId: "host1",
+        cwd: "/new-path",
+        updatedAt: Date.now(),
+      },
+    })
+
+    // Dispose the old store and create a new one that will load from disk
+    store.dispose()
+    store = new VirtualCwdStore(persistence)
+    store.flushNow()
+
+    // Stale entry should be pruned
+    assert.equal(store.resolve("agentOld", "host1"), undefined, "stale entry should be pruned")
+    // Fresh entry should survive
+    assert.equal(store.resolve("agentNew", "host1"), "/new-path", "fresh entry should survive")
+
+    // Verify the persisted map no longer contains the stale entry
+    const persisted = persistence.loadVirtualCwdMap()
+    assert.equal("agentOld:host1" in persisted, false, "stale entry should be removed from disk")
+    assert.equal("agentNew:host1" in persisted, true, "fresh entry should remain on disk")
+  })
 })

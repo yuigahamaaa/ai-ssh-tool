@@ -108,6 +108,65 @@ export class PersistenceStore {
     }
   }
 
+  /**
+   * Scan the tasks directory and delete .json files for tasks that have
+   * been in a terminal state (completed/failed/cancelled/timeout/stale)
+   * for longer than `retentionMs`. Called at startup to prevent files
+   * from accumulating across daemon restarts — evictOldTasks only runs
+   * every 5 minutes while the daemon is alive, so files from crashed
+   * sessions would otherwise persist forever.
+   *
+   * Corrupted (unparseable) .json files are also deleted.
+   *
+   * Returns the number of deleted files.
+   */
+  cleanupOldTaskFiles(retentionMs: number = 24 * 60 * 60 * 1000): number {
+    if (!existsSync(this.tasksDir)) return 0
+    const now = Date.now()
+    const terminalStatuses: ScheduledTaskStatus[] = ["completed", "failed", "cancelled", "timeout", "stale"]
+    let deleted = 0
+    try {
+      const files = readdirSync(this.tasksDir)
+      for (const file of files) {
+        if (!file.endsWith(".json")) continue
+        // Skip temp files from atomic-write crashes; those are cleaned
+        // separately by cleanupTempFiles().
+        if (file.includes(".tmp-")) continue
+        const filePath = join(this.tasksDir, file)
+        try {
+          const content = readFileSync(filePath, "utf8")
+          const task = JSON.parse(content) as ScheduledTask
+          if (!terminalStatuses.includes(task.status)) continue
+          const ts = task.finishedAt ?? task.updatedAt ?? 0
+          if (ts > 0 && now - ts > retentionMs) {
+            try { unlinkSync(filePath); deleted++ } catch {}
+          }
+        } catch {
+          // Corrupted file: delete to prevent accumulation
+          try { unlinkSync(filePath); deleted++ } catch {}
+        }
+      }
+    } catch {}
+    return deleted
+  }
+
+  /**
+   * Remove leftover .tmp-* files from atomic-write crashes. Called at
+   * startup to keep the tasks directory clean.
+   */
+  cleanupTempFiles(): number {
+    if (!existsSync(this.tasksDir)) return 0
+    let deleted = 0
+    try {
+      const files = readdirSync(this.tasksDir)
+      for (const file of files) {
+        if (!file.includes(".tmp-")) continue
+        try { unlinkSync(join(this.tasksDir, file)); deleted++ } catch {}
+      }
+    } catch {}
+    return deleted
+  }
+
   restore(): { queued: ScheduledTask[]; stale: ScheduledTask[] } {
     const all = this.loadAllTasks()
     const queued: ScheduledTask[] = []
