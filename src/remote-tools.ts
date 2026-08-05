@@ -45,47 +45,151 @@ export interface RemoteToolContext {
 
 // --- Security policy helpers ---
 
-function validateCommand(command: string, policy?: SecurityPolicy): void {
+/**
+ * Split a shell command on top-level `;`, `&&`, `||`, and `|` operators,
+ * ignoring operators that appear inside quotes. Returns the individual
+ * command segments. Used to validate every program a blacklist/whitelist
+ * policy would otherwise be able to reach through shell composition.
+ */
+function splitTopLevel(command: string): string[] {
+  const parts: string[] = []
+  let start = 0
+  let quote: `"` | `'` | null = null
+  let escaped = false
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === "\\") {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === `"` || ch === `'`) {
+      quote = ch
+      continue
+    }
+    if (ch === ";" || (ch === "&" && command[i + 1] === "&") || ch === "|") {
+      parts.push(command.slice(start, i))
+      start = i + (ch === "&" ? 2 : 1)
+      if (ch === "&") i++
+    }
+  }
+  parts.push(command.slice(start))
+  return parts
+}
+
+/**
+ * Extract the top-level program tokens from a command: one token per
+ * `;`/`&&`/`||`/`|`-separated segment (skipping leading env assignments
+ * like `VAR=val`). This is what a policy must check — a blacklist that
+ * only inspects the first token can be bypassed with `echo x | rm -f y`.
+ */
+function extractTopLevelCommands(command: string): string[] {
+  const result: string[] = []
+  for (const segment of splitTopLevel(command)) {
+    let cmd = segment.trim()
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cmd)) {
+      cmd = cmd.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^ ]*)\s*/, "")
+    }
+    const token = cmd.split(/\s+/)[0]
+    if (token) result.push(token)
+  }
+  return result
+}
+
+/**
+ * Whether the command uses shell composition that a whitelist cannot
+ * meaningfully police. Whitelist mode is only safe when the command is a
+ * single invocation of a whitelisted program — pipes, command substitution,
+ * sub-shells, and redirection can smuggle arbitrary programs past it.
+ */
+function hasShellCompound(command: string): boolean {
+  // `;`, `&&`, `||`, `|` split into multiple segments in splitTopLevel.
+  if (splitTopLevel(command).length > 1) return true
+  // Command substitution / sub-shells / backticks / redirection / newlines.
+  return /[`$()<>]/.test(command) || /\n/.test(command)
+}
+
+export function validateCommand(command: string, policy?: SecurityPolicy): void {
   if (!policy) return
 
   if (policy.maxCommandLength && command.length > policy.maxCommandLength) {
     throw new Error(`Command exceeds maximum length (${policy.maxCommandLength})`)
   }
 
-  // Extract base command: skip env var assignments (VAR=val ...) and cd prefixes
-  let cmd = command.trim()
-  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cmd)) {
-    cmd = cmd.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^ ]*)\s*/, "")
-  }
-  const baseCommand = cmd.split(/\s+/)[0]
+  const commands = extractTopLevelCommands(command)
+  if (commands.length === 0) return
 
   if (policy.commandWhitelist && policy.commandWhitelist.length > 0) {
+    if (hasShellCompound(command)) {
+      throw new Error("Command contains shell composition that is not allowed under command whitelist policy")
+    }
+    const baseCommand = commands[0]
     if (!policy.commandWhitelist.includes(baseCommand)) {
       throw new Error(`Command not in whitelist: ${baseCommand}`)
     }
   }
 
   if (policy.commandBlacklist && policy.commandBlacklist.length > 0) {
-    if (policy.commandBlacklist.includes(baseCommand)) {
-      throw new Error(`Command is blacklisted: ${baseCommand}`)
+    for (const baseCommand of commands) {
+      if (policy.commandBlacklist.includes(baseCommand)) {
+        throw new Error(`Command is blacklisted: ${baseCommand}`)
+      }
     }
   }
 }
 
-function checkReadOnly(operation: string, policy?: SecurityPolicy): void {
+export function checkReadOnly(operation: string, policy?: SecurityPolicy): void {
   if (policy?.readOnly) {
     throw new Error(`Operation "${operation}" is not allowed in read-only mode`)
   }
 }
 
-function checkBlockedPath(path: string, policy?: SecurityPolicy): void {
+/**
+ * POSIX-normalize a path string without touching the remote host: collapses
+ * `.`/`..` segments, duplicate slashes, and trailing slashes. `~` is kept as
+ * a prefix (its expansion is host-dependent), but `~`-relative `..` segments
+ * are still resolved. Prevents `/tmp/../etc/shadow`-style bypasses of
+ * string-matched blocked-path patterns.
+ */
+function normalizePolicyPath(path: string): string {
+  if (!path) return path
+  const isAbsolute = path.startsWith("/")
+  const isHome = path.startsWith("~")
+  const body = isHome ? path.slice(1) : path
+
+  const stack: string[] = []
+  for (const part of body.split("/")) {
+    if (part === "" || part === ".") continue
+    if (part === "..") {
+      if (stack.length > 0 && stack[stack.length - 1] !== "..") stack.pop()
+      else if (!isAbsolute) stack.push("..")
+      continue
+    }
+    stack.push(part)
+  }
+  const normalized = (isAbsolute ? "/" : "") + stack.join("/")
+  return isHome ? `~${normalized}` : normalized
+}
+
+export function checkBlockedPath(path: string, policy?: SecurityPolicy): void {
   if (!policy?.blockedPaths || policy.blockedPaths.length === 0) return
+  const candidates = [path, normalizePolicyPath(path)]
   for (const pattern of policy.blockedPaths) {
     const regex = new RegExp(
       "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
     )
-    if (regex.test(path)) {
-      throw new Error(`Path "${path}" is blocked by security policy`)
+    for (const candidate of candidates) {
+      if (regex.test(candidate)) {
+        throw new Error(`Path "${path}" is blocked by security policy`)
+      }
     }
   }
 }
@@ -115,7 +219,7 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
       },
       async execute(params: { path: string; offset?: number; limit?: number; binary?: boolean }) {
         if (params.binary) {
-          const buffer = await fs.readFile(params.path)
+          const buffer = await fs.readFile(params.path, { maxBytes: 10 * 1024 * 1024 })
           return (buffer as Buffer).toString("base64")
         }
         const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path), { timeout: 10000 })
@@ -161,6 +265,10 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
       async execute(params: { path: string; content: string; mode?: number; binary?: boolean }) {
         checkReadOnly("writeFile", policy)
         checkBlockedPath(params.path, policy)
+        // Re-check against the canonical remote path (SFTP realpath) so
+        // symlink-based bypasses (`/link-to-etc/shadow`) are caught too.
+        const canonical = await fs.realPath(params.path)
+        checkBlockedPath(canonical, policy)
         let data: string | Buffer = params.content
         if (params.binary) {
           data = Buffer.from(params.content, "base64")

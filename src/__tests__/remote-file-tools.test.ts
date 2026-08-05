@@ -165,6 +165,30 @@ describe("remote file tool parsers", () => {
     assert.deepEqual(parsed.results.map(r => r.type), ["file", "directory"])
   })
 
+  it("caps grep/find/list results and flags truncation (P2-6)", () => {
+    const raw = "a.txt\tf\t1\t0\t0\t/a/a.txt\nb.txt\tf\t1\t0\t0\t/a/b.txt\nc.txt\tf\t1\t0\t0\t/a/c.txt\n"
+    const listed = parseListDirOutput("/a", raw, 2)
+    assert.equal(listed.entries.length, 2)
+    assert.equal(listed.entries[0].name, "a.txt")
+    assert.equal(listed.entries[1].name, "b.txt")
+    assert.equal(listed.truncated, true)
+
+    const grepRaw = "/a.ts:1:one\n/b.ts:2:two\n/c.ts:3:three\n"
+    const grep = parseGrepOutput(grepRaw, 2)
+    assert.equal(grep.count, 2)
+    assert.deepEqual(grep.matches.map(m => m.file), ["/a.ts", "/b.ts"])
+    assert.equal(grep.truncated, true)
+
+    const find = parseFindOutput("/a/a.ts\tf\t1\t0\n/a/b.ts\tf\t1\t0\n/a/c.ts\tf\t1\t0\n", 2)
+    assert.equal(find.count, 2)
+    assert.equal(find.truncated, true)
+
+    // Within the cap there is no truncation flag.
+    const exact = parseGrepOutput(grepRaw, 3)
+    assert.equal(exact.truncated, false)
+    assert.equal(exact.count, 3)
+  })
+
   it("formats read_file results with binary and truncation guidance", () => {
     const binary = formatReadFileResult({
       path: "/tmp/blob.bin",

@@ -10,7 +10,7 @@
  *   Use case: AI agent wants to expose local dev server to remote machine.
  */
 
-import { createServer, type Server, type Socket } from "net"
+import { createConnection, createServer, type Server, type Socket } from "net"
 import type { Client } from "ssh2"
 import { randomUUID } from "crypto"
 import { log } from "./logger.js"
@@ -94,7 +94,11 @@ export class PortForwardManager {
     this.tcpConnectionBound = true
 
     this.client.on("tcp connection", (details, accept, rejectConn) => {
-      const key = `${details.dstIP}:${details.dstPort}`
+      // ssh2 emits the forwarded-tcpip channel data as `destIP`/`destPort`
+      // (the bind address the remote peer connected to on the SSH server).
+      // These must match the route key registered by remoteForward(), which
+      // uses the same `bindAddr:bindPort`.
+      const key = `${details.destIP}:${details.destPort}`
       const route = this.remoteRoutes.get(key)
       if (!route) {
         rejectConn()
@@ -105,8 +109,7 @@ export class PortForwardManager {
       log("fwd", `[${route.forwardId}] Incoming remote connection (total: ${route.forward.connections})`)
 
       const stream = accept()
-      const net = require("net") as typeof import("net")
-      const localSocket = net.createConnection(route.localDstPort, route.localDstAddr)
+      const localSocket = createConnection(route.localDstPort, route.localDstAddr)
 
       localSocket.on("connect", () => {
         stream.pipe(localSocket)

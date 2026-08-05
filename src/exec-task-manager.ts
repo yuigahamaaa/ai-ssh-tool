@@ -28,6 +28,10 @@ export interface ExecTask {
   signal: string | null
   stdout: string
   stderr: string
+  /** True when stdout exceeded the in-memory cap and was truncated. */
+  stdoutTruncated?: boolean
+  /** True when stderr exceeded the in-memory cap and was truncated. */
+  stderrTruncated?: boolean
   startedAt: number
   finishedAt: number | null
   pid: number | null
@@ -197,18 +201,22 @@ export class ExecTaskManager {
     }
   }
 
-  private trimChunks(chunks: Buffer[]): void {
+  private trimChunks(chunks: Buffer[]): boolean {
     let totalSize = 0
     for (const chunk of chunks) {
       totalSize += chunk.length
     }
+    let trimmed = false
     while (totalSize > this.maxOutputBuffer && chunks.length > 1) {
       const removed = chunks.shift()!
       totalSize -= removed.length
+      trimmed = true
     }
     if (totalSize > this.maxOutputBuffer && chunks.length === 1) {
       chunks[0] = chunks[0].slice(chunks[0].length - this.maxOutputBuffer)
+      trimmed = true
     }
+    return trimmed
   }
 
   start(
@@ -246,6 +254,8 @@ export class ExecTaskManager {
     const hostname = options?.host ?? getHostIdentifier(client)
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
+    let stdoutTruncated = false
+    let stderrTruncated = false
     let stream: ClientChannel | null = null
     let pid: number | null = null
     let settled = false
@@ -272,6 +282,8 @@ export class ExecTaskManager {
           stderr: Buffer.concat(stderrChunks).toString("utf8"),
           code,
           ...(signal ? { signal } : {}),
+          ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+          ...(stderrTruncated ? { stderrTruncated: true } : {}),
         }
         resolve(result)
       }
@@ -301,7 +313,7 @@ export class ExecTaskManager {
 
             openedStream.on("data", (data: Buffer) => {
               stdoutChunks.push(data)
-              this.trimChunks(stdoutChunks)
+              stdoutTruncated = this.trimChunks(stdoutChunks) || stdoutTruncated
               onOutput?.(data.toString("utf8"), "")
             })
 
@@ -317,14 +329,14 @@ export class ExecTaskManager {
                   if (remaining) {
                     const remainingBuffer = Buffer.from(remaining)
                     stderrChunks.push(remainingBuffer)
-                    this.trimChunks(stderrChunks)
+                    stderrTruncated = this.trimChunks(stderrChunks) || stderrTruncated
                     onOutput?.("", remaining)
                   }
                   return
                 }
               }
               stderrChunks.push(data)
-              this.trimChunks(stderrChunks)
+              stderrTruncated = this.trimChunks(stderrChunks) || stderrTruncated
               onOutput?.("", data.toString("utf8"))
             })
 
@@ -669,6 +681,10 @@ export interface ExecResult {
   stderr: string
   code: number
   signal?: string
+  /** True when stdout exceeded the in-memory cap and was truncated. */
+  stdoutTruncated?: boolean
+  /** True when stderr exceeded the in-memory cap and was truncated. */
+  stderrTruncated?: boolean
 }
 
 let globalTaskManager: ExecTaskManager | null = null

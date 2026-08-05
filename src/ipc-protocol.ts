@@ -128,7 +128,13 @@ export class IPCMessageParser {
   // forward and never wraps, so a long stream of small frames doesn't
   // keep a 10MB+ buffer alive.
   private firstChunkOffset = 0
+  // Total number of unconsumed bytes currently buffered.
   private totalBytes = 0
+  // Logical offset (relative to the buffered stream start) of the first
+  // byte that has NOT yet been scanned for a newline. Invariant: no
+  // newline exists in [0, scannedBytes). When a frame is emitted, the
+  // bytes after the newline were never examined, so this resets to 0.
+  private scannedBytes = 0
   private maxRemainderBytes: number
 
   constructor(maxRemainderBytes?: number) {
@@ -148,7 +154,9 @@ export class IPCMessageParser {
     if (this.totalBytes > this.maxRemainderBytes) {
       const actualBytes = this.totalBytes
       this.chunks = []
+      this.firstChunkOffset = 0
       this.totalBytes = 0
+      this.scannedBytes = 0
       throw new Error(
         `IPC frame exceeded max size: ${actualBytes} bytes > ${this.maxRemainderBytes} bytes limit. ` +
         `The remote peer is sending malformed data or an oversized message without a newline terminator. ` +
@@ -159,97 +167,105 @@ export class IPCMessageParser {
 
     this.chunks.push(buf)
 
-    // Scan the chunk list for newline boundaries and emit one frame per
-    // newline, **without ever re-copying bytes we have already passed**.
-    // The previous implementation called `Buffer.concat(this.chunks)` on
-    // every push that contained a newline, which turned large-frame
-    // streams (e.g. 10MB `getTaskOutput full` responses) into O(n²)
-    // copies: each new 64KB chunk triggered a reallocation of the entire
-    // growing remainder. Here we walk the chunks array with an offset
-    // cursor and only allocate the bytes of the frame itself, so the
-    // total per-frame allocation stays O(frame_size) regardless of how
-    // many chunks came before it.
-    while (this.chunks.length > 0) {
-      // Find the next newline across all chunks. A newline may be:
-      //  - inside chunks[0] at offset >= firstChunkOffset
-      //  - inside chunks[k] for k >= 1 at offset >= 0
-      // Returns (chunkIndex, byteIndex) of the newline byte, or null if
-      // none was found yet.
-      let newlineAt: { chunkIdx: number; byteIdx: number } | null = null
-      for (let ci = 0; ci < this.chunks.length; ci++) {
-        const c = this.chunks[ci]
-        const start = ci === 0 ? this.firstChunkOffset : 0
-        for (let i = start; i < c.length; i++) {
-          if (c[i] === 10) {
-            newlineAt = { chunkIdx: ci, byteIdx: i }
-            break
-          }
-        }
-        if (newlineAt) break
-      }
-      if (!newlineAt) {
-        // No newline anywhere yet; keep accumulating.
+    // Scan for newline boundaries and emit one frame per newline.
+    //
+    // The critical property is that **every buffered byte is examined at
+    // most once**. Two previous implementations violated this:
+    //  - The original called `Buffer.concat(this.chunks)` on every push
+    //    that contained a newline, turning large-frame streams (e.g. 10MB
+    //    `getTaskOutput full` responses) into O(n²) copies.
+    //  - A follow-up kept the chunks array but re-scanned *all* chunks
+    //    from the start on every push (and re-walked them to recompute
+    //    `totalBytes`), so a frame arriving as many small chunks cost
+    //    O(n²) byte scans.
+    //
+    // Here the `scannedBytes` cursor remembers how far the previous push
+    // got; appending a chunk can only introduce newlines inside the newly
+    // added bytes, so we scan only from `scannedBytes`. Frames are sliced
+    // out as subarray views (no copy of the remainder), and `totalBytes`
+    // is maintained incrementally. Total work is O(total bytes pushed).
+    let scanFrom = this.scannedBytes
+    while (scanFrom < this.totalBytes) {
+      const newlinePos = this.findNewline(scanFrom)
+      if (newlinePos < 0) {
+        // No newline in the rest of the stream; everything is scanned now.
+        this.scannedBytes = this.totalBytes
         break
       }
 
-      // Slice out the frame bytes. The frame starts at `firstChunkOffset`
-      // in chunks[0] and ends at the byte before the newline.
-      const { chunkIdx: nlChunk, byteIdx: nlByte } = newlineAt
-      const frameEndExclusive = nlByte + 1 // skip the newline byte
-
-      if (nlChunk === 0 && this.firstChunkOffset === 0 && frameEndExclusive === this.chunks[0].length) {
-        // Single-chunk frame, fits entirely inside chunks[0]. Fast path:
-        // take a subarray view, then drop chunks[0] entirely.
-        const lineBuf = this.chunks[0]
-        this.chunks.shift()
-        this.firstChunkOffset = 0
-        this.emitLine(lineBuf, onMessage)
-        continue
-      }
-
-      if (nlChunk === 0 && frameEndExclusive <= this.chunks[0].length) {
-        // Frame is contained in chunks[0] but the chunk has more bytes
-        // after the newline.
-        const lineBuf = this.chunks[0].subarray(this.firstChunkOffset, nlByte)
-        this.firstChunkOffset = frameEndExclusive
-        this.emitLine(lineBuf, onMessage)
-        continue
-      }
-
-      // Frame spans multiple chunks. Walk chunks and accumulate only the
-      // frame bytes; the remainder after the newline stays in chunks[0]
-      // (a subarray view) so no re-allocation happens.
-      const parts: Buffer[] = []
-      let totalLen = 0
-      for (let ci = 0; ci <= nlChunk; ci++) {
-        const c = this.chunks[ci]
-        const startInChunk = ci === 0 ? this.firstChunkOffset : 0
-        if (ci === nlChunk) {
-          parts.push(c.subarray(startInChunk, frameEndExclusive))
-          totalLen += frameEndExclusive - startInChunk
-        } else {
-          parts.push(c.subarray(startInChunk))
-          totalLen += c.length - startInChunk
-        }
-      }
-      // Replace chunks[0] with the leftover bytes (everything after the
-      // newline in the newline's chunk), and drop everything up to and
-      // including that chunk.
-      this.chunks[0] = this.chunks[nlChunk].subarray(frameEndExclusive)
-      // Drop chunks[1..nlChunk] since their bytes are now in `parts`.
-      this.chunks.splice(1, nlChunk)
-      this.firstChunkOffset = 0
-      const lineBuf = parts.length === 1 ? parts[0] : Buffer.concat(parts, totalLen)
+      // Slice out the frame [0, newlinePos) and drop frame + newline from
+      // the front. Bytes after the newline were never examined, so the
+      // new remainder starts unscanned.
+      const lineBuf = this.sliceRange(newlinePos)
+      const consumed = newlinePos + 1 // frame bytes + trailing newline
+      this.consumeFront(consumed)
+      this.totalBytes -= consumed
+      this.scannedBytes = 0
       this.emitLine(lineBuf, onMessage)
+      scanFrom = 0
     }
+  }
 
-    // Recompute the cached byte count so `remainderLength` is accurate.
-    let total = 0
-    if (this.chunks.length > 0) {
-      total += this.chunks[0].length - this.firstChunkOffset
-      for (let i = 1; i < this.chunks.length; i++) total += this.chunks[i].length
+  /**
+   * Return the logical offset of the first newline byte at or after
+   * `absoluteStart`, or -1 if the remaining stream has no newline.
+   */
+  private findNewline(absoluteStart: number): number {
+    if (absoluteStart >= this.totalBytes) return -1
+    // Skip to the chunk containing absoluteStart.
+    let remain = absoluteStart
+    let ci = 0
+    for (; ci < this.chunks.length; ci++) {
+      const start = ci === 0 ? this.firstChunkOffset : 0
+      const avail = this.chunks[ci].length - start
+      if (remain < avail) break
+      remain -= avail
     }
-    this.totalBytes = total
+    let logicalPos = absoluteStart
+    for (; ci < this.chunks.length; ci++) {
+      const start = ci === 0 ? this.firstChunkOffset : 0
+      const idx = this.chunks[ci].indexOf(10, start + remain)
+      if (idx >= 0) return logicalPos + (idx - (start + remain))
+      logicalPos += this.chunks[ci].length - start - remain
+      remain = 0
+    }
+    return -1
+  }
+
+  /**
+   * Return the buffered bytes [0, endExclusive) as a buffer. When the
+   * frame fits in a single chunk this is a subarray view (no copy);
+   * multi-chunk frames allocate only the frame bytes themselves.
+   */
+  private sliceRange(endExclusive: number): Buffer {
+    const parts: Buffer[] = []
+    let total = 0
+    let remaining = endExclusive
+    for (let ci = 0; ci < this.chunks.length && remaining > 0; ci++) {
+      const c = this.chunks[ci]
+      const start = ci === 0 ? this.firstChunkOffset : 0
+      const take = Math.min(remaining, c.length - start)
+      parts.push(c.subarray(start, start + take))
+      total += take
+      remaining -= take
+    }
+    return parts.length === 1 ? parts[0] : Buffer.concat(parts, total)
+  }
+
+  /**
+   * Drop the first `count` buffered bytes (a frame plus its newline).
+   */
+  private consumeFront(count: number): void {
+    while (count > 0 && this.chunks.length > 0) {
+      const avail = this.chunks[0].length - this.firstChunkOffset
+      if (count < avail) {
+        this.firstChunkOffset += count
+        return
+      }
+      count -= avail
+      this.chunks.shift()
+      this.firstChunkOffset = 0
+    }
   }
 
   private emitLine(
@@ -272,6 +288,7 @@ export class IPCMessageParser {
     this.chunks = []
     this.firstChunkOffset = 0
     this.totalBytes = 0
+    this.scannedBytes = 0
   }
 }
 

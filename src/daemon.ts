@@ -57,6 +57,12 @@ interface CachedConfig {
 }
 
 const BACKGROUND_HANDLE_TIMEOUT_MS = 5 * 60 * 1000
+/**
+ * Safest "full" output size to ship over IPC. IPCMessageParser rejects frames
+ * over 16MB; JSON serialization adds ~1.5-2x, so staying well under the frame
+ * cap avoids both transfer failures and multi-copy memory spikes on the daemon.
+ */
+const FULL_IPC_SAFE_LIMIT = 8 * 1024 * 1024
 
 export function execScheduledStream(
   client: Client,
@@ -992,7 +998,28 @@ export class SSHDaemon {
 
   private handleGetTaskOutput(req: { id: string; params: { taskId: string; mode?: string } }): IPCResponse {
     try {
-      const result = this.scheduler.getTaskOutput(req.params.taskId, req.params.mode as any)
+      const mode = req.params.mode ?? "tail"
+      if (mode === "full") {
+        // IPC frames are capped at 16MB (IPCMessageParser). A "full" read of
+        // a large output would blow that cap AND allocate several copies of
+        // the payload (file Buffer → string → JSON → socket → parse). Probe
+        // the real byte counts first and fall back to a bounded tail when the
+        // output is too large, pointing the caller at the on-disk paths.
+        const preview = this.scheduler.getTaskOutput(req.params.taskId, "tail")
+        const totalBytes = (preview.stdoutBytes ?? 0) + (preview.stderrBytes ?? 0)
+        if (totalBytes > FULL_IPC_SAFE_LIMIT) {
+          return {
+            id: req.id,
+            ok: true,
+            data: {
+              ...preview,
+              fullTruncated: true,
+              message: `Output (${totalBytes} bytes) exceeds the IPC-safe limit (${FULL_IPC_SAFE_LIMIT} bytes). Use the on-disk stdoutPath/stderrPath files to read the full output.`,
+            },
+          }
+        }
+      }
+      const result = this.scheduler.getTaskOutput(req.params.taskId, mode as any)
       return { id: req.id, ok: true, data: result }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }

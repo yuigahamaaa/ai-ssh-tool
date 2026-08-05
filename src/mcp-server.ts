@@ -24,10 +24,10 @@ import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
 import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
-import { ProfileManager } from "./profile-manager.js"
+import { ProfileManager, sanitizeProfile } from "./profile-manager.js"
 import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
-import type { SSHProfile, SSHHostConfig } from "./types.js"
+import type { SSHProfile, SSHHostConfig, SecurityPolicy } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
 import type { AgentIdentity, CwdSource, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
 import { createMcpScheduleRequest, profileToLegacyConfigJson, targetIdentityHash } from "./mcp-scheduler-contract.js"
@@ -52,6 +52,7 @@ import {
   handleMcpStat,
 } from "./mcp-file-tools.js"
 import { CommandRegistryStore, type CommandExecutionMode } from "./command-registry.js"
+import { checkBlockedPath, checkReadOnly, validateCommand } from "./remote-tools.js"
 
 interface HostConfig {
   host: string
@@ -102,6 +103,45 @@ function loadConfig(): SshConfig | null {
   return null // No default config, require profile parameter
 }
 
+/**
+ * Load an optional SecurityPolicy for the MCP server from `--policy '<json>'`
+ * or `--policy-file <path>`. When absent, no policy is applied (backward
+ * compatible with the previous behaviour). The CLI `ssh-exec mcp` subcommand
+ * forwards its arguments verbatim, so `ssh-exec mcp --policy-file policy.json`
+ * works out of the box.
+ */
+function loadPolicy(): SecurityPolicy | null {
+  const args = process.argv.slice(2)
+  let policyJson: string | undefined
+  let policyFile: string | undefined
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--policy" && i + 1 < args.length) policyJson = args[++i]
+    else if (args[i] === "--policy-file" && i + 1 < args.length) policyFile = args[++i]
+  }
+  const raw = policyFile ? readFileSync(resolve(policyFile), "utf-8") : policyJson
+  if (!raw) return null
+  const parsed = JSON.parse(raw) as SecurityPolicy
+  if (
+    parsed.readOnly !== undefined && typeof parsed.readOnly !== "boolean"
+    || parsed.commandWhitelist !== undefined && !Array.isArray(parsed.commandWhitelist)
+    || parsed.commandBlacklist !== undefined && !Array.isArray(parsed.commandBlacklist)
+    || parsed.maxCommandLength !== undefined && typeof parsed.maxCommandLength !== "number"
+    || parsed.blockedPaths !== undefined && !Array.isArray(parsed.blockedPaths)
+  ) {
+    throw new Error("Invalid security policy: expected { readOnly?: boolean; commandWhitelist?: string[]; commandBlacklist?: string[]; maxCommandLength?: number; blockedPaths?: string[] }")
+  }
+  if (
+    parsed.readOnly === undefined
+    && parsed.commandWhitelist === undefined
+    && parsed.commandBlacklist === undefined
+    && parsed.maxCommandLength === undefined
+    && parsed.blockedPaths === undefined
+  ) {
+    throw new Error("Invalid security policy: no recognized fields (readOnly / commandWhitelist / commandBlacklist / maxCommandLength / blockedPaths)")
+  }
+  return parsed
+}
+
 // Type for client cache entry
 interface ClientCacheEntry {
   client: any
@@ -133,12 +173,35 @@ async function main() {
     maxSessions: 10, // Allow more concurrent sessions
   })
 
+  const policy = loadPolicy()
+  if (policy) {
+    log("mcp", `Security policy enabled: ${JSON.stringify(policy)}`)
+  }
+  // Apply the same SecurityPolicy checks the CLI agent tools use
+  // (validateCommand / checkReadOnly / checkBlockedPath). Previously these
+  // only ran in createRemoteTools, so an AI connected through the MCP server
+  // could bypass every policy with ssh_exec / ssh_write_file / etc.
+  function assertCommandAllowed(command: string): void {
+    if (policy) validateCommand(command, policy)
+  }
+  function assertPathAllowed(path: string): void {
+    if (policy) checkBlockedPath(path, policy)
+  }
+  function assertWriteAllowed(operation: string): void {
+    if (policy) checkReadOnly(operation, policy)
+  }
+
   const profileManager = new ProfileManager()
   profileManager.load()
   const commandRegistry = new CommandRegistryStore()
 
   // Client cache: profile name -> { client, forwardManager }
   const clientCache = new Map<string, ClientCacheEntry>()
+  // In-flight connection promises keyed by the same cache key. Concurrent
+  // first-time calls for the same profile share ONE underlying SSH connect
+  // instead of each racing to build its own full chain (which would create
+  // C×hopCount clients and leak all but the last into the session map).
+  const pendingConnections = new Map<string, Promise<{ client: any; forwardManager: PortForwardManager }>>()
 
   // Helper: Get or create SSH connection for a profile
   async function getClientForProfile(
@@ -234,35 +297,51 @@ async function main() {
       }
     }
 
-    const currentProfile = profile
-    const jumpHosts = currentProfile.chain.slice(0, -1).map((h) => ({
-      host: h.host,
-      port: h.port ?? 22,
-      username: h.auth.username,
-      password: h.auth.password,
-      privateKey: h.auth.privateKey,
-    }))
+    // A concurrent request may already be establishing this profile's
+    // connection. Share that in-flight promise instead of opening another
+    // full SSH chain.
+    const inflight = pendingConnections.get(cacheKey)
+    if (inflight) return inflight
 
-    const targetHost = currentProfile.chain[currentProfile.chain.length - 1]
-    const session = await gw.connectSimple({
-      host: targetHost.host,
-      port: targetHost.port ?? 22,
-      username: targetHost.auth.username,
-      password: targetHost.auth.password,
-      privateKey: targetHost.auth.privateKey,
-      jumpHosts,
-      name: `mcp-${currentProfile.name}`,
+    const connectPromise = (async () => {
+      const currentProfile = profile
+      const jumpHosts = currentProfile.chain.slice(0, -1).map((h) => ({
+        host: h.host,
+        port: h.port ?? 22,
+        username: h.auth.username,
+        password: h.auth.password,
+        privateKey: h.auth.privateKey,
+      }))
+
+      const targetHost = currentProfile.chain[currentProfile.chain.length - 1]
+      const session = await gw.connectSimple({
+        host: targetHost.host,
+        port: targetHost.port ?? 22,
+        username: targetHost.auth.username,
+        password: targetHost.auth.password,
+        privateKey: targetHost.auth.privateKey,
+        jumpHosts,
+        name: `mcp-${currentProfile.name}`,
+      })
+
+      const connection = gw.sessions.getConnection(session.id)
+      if (!connection) throw new Error("Failed to establish SSH connection")
+      const client = connection.getFinalClient()
+
+      const forwardManager = new PortForwardManager(client)
+      log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
+
+      clientCache.set(cacheKey, { client, forwardManager, sessionId: session.id })
+      return { client, forwardManager }
+    })().finally(() => {
+      // Drop the in-flight entry only if it's still the one we registered
+      // (a later re-registration after eviction must not be clobbered).
+      if (pendingConnections.get(cacheKey) === connectPromise) {
+        pendingConnections.delete(cacheKey)
+      }
     })
-
-    const connection = gw.sessions.getConnection(session.id)
-    if (!connection) throw new Error("Failed to establish SSH connection")
-    const client = connection.getFinalClient()
-
-    const forwardManager = new PortForwardManager(client)
-    log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
-
-    clientCache.set(cacheKey, { client, forwardManager, sessionId: session.id })
-    return { client, forwardManager }
+    pendingConnections.set(cacheKey, connectPromise)
+    return connectPromise
   }
 
   /**
@@ -427,6 +506,10 @@ async function main() {
     profile_json?: string
     profile_file?: string
   }): Promise<ScheduleDecision> {
+    // Security policy gate: every command executed through the MCP server
+    // (ssh_exec / ssh_exec_background / ssh_schedule / ssh_command_run) funnels
+    // through this one function.
+    assertCommandAllowed(params.command)
     const profile = await getProfileForScheduler(params.profile_name, params.profile_json, params.profile_file)
     await daemonClient.ensureDaemon()
 
@@ -781,6 +864,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         handleMcpReadFile({ client, remoteExec, path, offset, limit }),
       )
@@ -800,6 +884,8 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_write_file", async ({ path, content, mode, profile_name, profile_json, profile_file }) => {
+      assertWriteAllowed("write file")
+      assertPathAllowed(path)
       const outcome = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
         const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
         await remoteExec(client, dirCmd, { timeout: 10000 })
@@ -831,6 +917,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         handleMcpListDir({ client, remoteExec, path, showHidden: Boolean(show_hidden) }),
       )
@@ -848,6 +935,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 }),
       )
@@ -866,6 +954,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         handleMcpStat({ client, remoteExec, path }),
       )
@@ -886,6 +975,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_grep", async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         handleMcpGrep({ client, remoteExec, pattern, path, glob, caseInsensitive: Boolean(case_insensitive) }),
       )
@@ -906,6 +996,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         handleMcpFind({ client, remoteExec, path, name, type, maxDepth: max_depth }),
       )
@@ -931,6 +1022,8 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+      assertWriteAllowed("upload")
+      assertPathAllowed(remote_path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         upload(client, local_path, remote_path, {
           compressionLevel: compression_level,
@@ -967,6 +1060,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(remote_path)
       const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
         download(client, remote_path, local_path, {
           compressionLevel: compression_level,
@@ -1116,18 +1210,22 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_get_host_load", async ({ profile_name, profile_json, profile_file }) => {
+      const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
+      const target = profile.chain[profile.chain.length - 1]
+      const targetKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })
       const loadInfo = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
-        const clientObj = client as Record<string, unknown>
-        const innerClient = clientObj._client as Record<string, unknown> | undefined
-        const config = innerClient?._config as Record<string, unknown> | undefined
-        const hostname = config?.host as string | undefined
+        // hostname comes from the profile (not ssh2 private-field reflection),
+        // and scheduler state is keyed by the target identity hash — querying
+        // with the raw hostname would always return an empty scheduler view.
+        const hostname = target.host
 
         const uptimeResult = await remoteExec(client, "uptime", { timeout: 10000 })
         const memResult = await remoteExec(client, "free -h", { timeout: 10000 })
         const procResult = await remoteExec(client, "ps aux --no-headers | wc -l", { timeout: 10000 })
-        const queueResp = await daemonClient.queueStatus({ hostId: hostname })
+        const queueResp = await daemonClient.queueStatus({ hostId: targetKey })
         return {
-          hostname: hostname ?? "unknown",
+          hostname,
+          targetHostId: targetKey,
           uptime: uptimeResult.stdout.trim(),
           memory: memResult.stdout.trim(),
           processCount: procResult.stdout.trim(),
@@ -1215,7 +1313,7 @@ async function main() {
     {},
     wrapTool("ssh_list_profiles", async () => {
       const profiles = profileManager.list()
-	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profiles })) }] }
+	      return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profiles: profiles.map(sanitizeProfile) })) }] }
     },
   ))
 
@@ -1237,7 +1335,7 @@ async function main() {
           chain: chainArray,
           tags,
         })
-	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { success: true, profileId: profile.id, profile, message: `Profile '${name}' added successfully` })) }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { success: true, profileId: profile.id, profile: sanitizeProfile(profile), message: `Profile '${name}' added successfully` })) }] }
 	      } catch (err) {
 	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", (err as Error).message)) }] }
 	      }
@@ -1294,7 +1392,7 @@ async function main() {
       }
 
       if (profile) {
-	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profile })) }] }
+	        return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("profile_result", { profile: sanitizeProfile(profile) })) }] }
 	      } else {
 	        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("profile_result", "Profile not found")) }] }
 	      }
@@ -1348,6 +1446,7 @@ async function main() {
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
     wrapTool("ssh_cd", async ({ path, profile_name, profile_json, profile_file }) => {
+      assertPathAllowed(path)
       const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
       await daemonClient.ensureDaemon()
       const configJson = profileToLegacyConfigJson(profile)
@@ -1396,12 +1495,9 @@ async function main() {
     wrapTool("ssh_get_cwd", async ({ profile_name, profile_json, profile_file }) => {
       const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
       await daemonClient.ensureDaemon()
-      const configJson = profileToLegacyConfigJson(profile)
-      const connectResp = await daemonClient.connectHostJson(configJson)
-      if (!connectResp.ok) {
-        return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
-      }
-      const { sessionId } = connectResp.data as any
+      // getCwd is a purely local read of the persisted virtual cwd — it does
+      // NOT need an SSH session. Connecting first would make the lookup fail
+      // when the target is offline even though the cwd is still readable.
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
       const target = profile.chain[profile.chain.length - 1]
       const targetKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })

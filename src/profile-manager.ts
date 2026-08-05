@@ -9,7 +9,7 @@
  * - Profile files are saved with 600 permissions (owner-only read/write) to limit exposure.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync, renameSync, unlinkSync } from "fs"
 import { dirname, join } from "path"
 import { randomUUID } from "crypto"
 import type { SSHHostConfig, SSHProfile } from "./types.js"
@@ -64,6 +64,38 @@ function cachePut(path: string, profile: SSHProfile, mtimeMs: number): void {
 /** Clear the LRU cache. Exposed for tests and explicit invalidation. */
 export function clearProfileCache(): void {
   fileCache.clear()
+}
+
+/**
+ * Return a copy of a profile with all credentials removed. Profiles contain
+ * passwords / private keys / passphrases that must NEVER be echoed back to
+ * AI agents or written into MCP responses (they would end up in model context
+ * and conversation logs). Auth details are replaced with boolean flags so
+ * callers still know which auth method a profile uses.
+ */
+export function sanitizeProfile(profile: SSHProfile): SSHProfile {
+  return {
+    ...profile,
+    chain: profile.chain.map((hop) => {
+      // Guard against hand-written profile JSON missing the optional hop
+      // auth block — a bare TypeError would otherwise leak into the tool
+      // result instead of a clean (auth-less) snapshot.
+      const auth = hop.auth ?? ({} as SSHHostConfig["auth"])
+      return {
+        name: hop.name,
+        host: hop.host,
+        port: hop.port,
+        auth: {
+          username: auth.username ?? "",
+          hasPassword: Boolean(auth.password),
+          hasPrivateKey: Boolean(auth.privateKey),
+          hasPassphrase: Boolean(auth.passphrase),
+          agent: auth.agent,
+          agentForward: auth.agentForward,
+        },
+      }
+    }),
+  }
 }
 
 export class ProfileManager {
@@ -121,13 +153,17 @@ export class ProfileManager {
       data = this.profiles.map((p) => this.encryptProfile(p))
     }
 
-    writeFileSync(this.profilesPath, JSON.stringify(data, null, 2), "utf-8")
-    // Set file permissions to 600 (owner read/write only)
+    // Atomic write: write to a temp file with 0600, then rename over the
+    // target. A crash mid-write can no longer leave a truncated profiles.json
+    // behind, and the file never exists with default permissions (the temp
+    // file is created 0600 before the rename).
+    const tempPath = `${this.profilesPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     try {
-      chmodSync(this.profilesPath, 0o600)
-    } catch {
-      // Non-fatal, but log warning
-      console.warn("[ProfileManager] Could not set file permissions to 600")
+      writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 })
+      renameSync(tempPath, this.profilesPath)
+    } catch (err) {
+      try { unlinkSync(tempPath) } catch { /* best-effort cleanup */ }
+      throw err
     }
   }
 

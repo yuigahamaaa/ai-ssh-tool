@@ -28,6 +28,10 @@ export class SSHConnection extends EventEmitter {
   private shell: ClientChannel | null = null
   private connected = false
   private sessionId = ""
+  // Guards against emitting multiple "disconnected" events for a single
+  // lifecycle: an abnormal drop fires ssh2 "error" AND "close", and the
+  // interactive shell also emits "close" — all for the same disconnect.
+  private disconnectedEmitted = false
 
   /** Connect through the chain of hosts */
   async connect(opts: ConnectionOptions & { sessionId?: string }): Promise<void> {
@@ -70,6 +74,9 @@ export class SSHConnection extends EventEmitter {
       const finalClient = this.hops[this.hops.length - 1].client
       this.shell = await this.openShell(finalClient, terminalSize)
       this.connected = true
+      // Reset the guard so the NEXT lifecycle (reconnect on the same
+      // SSHConnection instance) can emit its own disconnected event.
+      this.disconnectedEmitted = false
 
       log("conn", `[${this.sessionId.slice(0, 8)}] Connected successfully`)
       this.emitEvent({ type: "connected", sessionId: this.sessionId })
@@ -189,11 +196,7 @@ export class SSHConnection extends EventEmitter {
           })
 
           stream.on("close", () => {
-            this.connected = false
-            this.emitEvent({
-              type: "disconnected",
-              sessionId: this.sessionId,
-            })
+            this.emitDisconnectedOnce()
           })
 
           stream.stderr.on("data", (data: Buffer) => {
@@ -244,9 +247,8 @@ export class SSHConnection extends EventEmitter {
 
   /** Disconnect and clean up all hops */
   async disconnect(): Promise<void> {
-    this.connected = false
+    this.emitDisconnectedOnce()
     await this.cleanup()
-    this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
   }
 
   /** Check if connected */
@@ -325,17 +327,23 @@ export class SSHConnection extends EventEmitter {
     this.emit("event", event)
   }
 
+  /** Emit at most one "disconnected" event per connection lifecycle. */
+  private emitDisconnectedOnce(): void {
+    if (this.disconnectedEmitted) return
+    this.disconnectedEmitted = true
+    this.connected = false
+    this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
+  }
+
   /** Install long-lived error/close handlers after a hop is connected. */
   private installPostConnectHandlers(client: Client, host: SSHHostConfig): void {
     client.on("error", (err) => {
       log("conn", `[${this.sessionId.slice(0, 8)}] Hop ${host.host} error after connect: ${err.message}`)
-      this.connected = false
-      this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
+      this.emitDisconnectedOnce()
     })
     client.on("close", () => {
       log("conn", `[${this.sessionId.slice(0, 8)}] Hop ${host.host} connection closed`)
-      this.connected = false
-      this.emitEvent({ type: "disconnected", sessionId: this.sessionId })
+      this.emitDisconnectedOnce()
     })
   }
 }

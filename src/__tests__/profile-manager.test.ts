@@ -8,7 +8,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { ProfileManager } from "../profile-manager.js"
+import { ProfileManager, sanitizeProfile } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
 
 function makeProfile(overrides?: Partial<Omit<SSHProfile, "id">>): Omit<SSHProfile, "id"> {
@@ -381,6 +381,57 @@ describe("ProfileManager", () => {
         () => ProfileManager.normalizeProfile({ name: "bad" }),
         { message: /missing chain/ },
       )
+    })
+  })
+
+  describe("sanitizeProfile", () => {
+    it("strips credentials and replaces them with boolean flags", () => {
+      const pm = new ProfileManager(profilesPath)
+      const profile = pm.add(makeProfile())
+
+      const sanitized = sanitizeProfile(profile)
+
+      // Credentials must never leak.
+      assert.equal((sanitized.chain[0].auth as any).password, undefined)
+      assert.equal((sanitized.chain[0].auth as any).privateKey, undefined)
+      assert.equal((sanitized.chain[1].auth as any).password, undefined)
+      // Flag tells the caller which auth method is configured.
+      assert.equal((sanitized.chain[0].auth as any).hasPassword, true)
+      assert.equal((sanitized.chain[0].auth as any).hasPrivateKey, false)
+      // Non-sensitive fields are preserved.
+      assert.equal(sanitized.chain[0].host, "10.0.0.1")
+      assert.equal(sanitized.chain[0].auth.username, "jump")
+      assert.equal(sanitized.name, "test-profile")
+      // Original profile is untouched.
+      assert.equal(profile.chain[0].auth.password, "jump123")
+    })
+
+    it("does not mutate the input profile", () => {
+      const pm = new ProfileManager(profilesPath)
+      const profile = pm.add(makeProfile())
+
+      sanitizeProfile(profile)
+      assert.equal(profile.chain[0].auth.password, "jump123")
+      assert.equal(profile.chain[1].auth.password, "root123")
+    })
+
+    it("tolerates hops without an auth block instead of throwing", () => {
+      const profile = {
+        id: "p1",
+        name: "broken",
+        chain: [
+          { name: "no-auth", host: "10.0.0.9", port: 22 } as any,
+          { name: "ok", host: "10.0.0.10", port: 22, auth: { username: "u", password: "s3cret" } },
+        ],
+      } as any
+
+      const sanitized = sanitizeProfile(profile)
+
+      assert.equal((sanitized.chain[0].auth as any).username, "")
+      assert.equal((sanitized.chain[0].auth as any).hasPassword, false)
+      assert.equal((sanitized.chain[1].auth as any).hasPassword, true)
+      // Credentials still stripped for the well-formed hop.
+      assert.equal((sanitized.chain[1].auth as any).password, undefined)
     })
   })
 })

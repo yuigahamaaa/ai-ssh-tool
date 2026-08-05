@@ -142,6 +142,38 @@ describe("SSHConnection", () => {
       assert.equal(conn.isConnected(), false)
       assert.ok(events.some((e) => e.type === "disconnected"))
     })
+
+    it("should emit disconnected only once across repeated disconnect calls", async () => {
+      const { SSHConnection: Conn } = await import("../connection.js")
+      const conn = new Conn()
+      const events: any[] = []
+      conn.on("event", (e: any) => events.push(e))
+
+      await conn.disconnect()
+      await conn.disconnect()
+
+      const disconnected = events.filter((e) => e.type === "disconnected")
+      assert.equal(disconnected.length, 1)
+    })
+
+    it("should emit disconnected only once when error and close both fire", async () => {
+      const { SSHConnection: Conn } = await import("../connection.js")
+      const { EventEmitter } = await import("events")
+      const conn = new Conn()
+      const events: any[] = []
+      conn.on("event", (e: any) => events.push(e))
+
+      // A single abnormal drop fires ssh2 "error" AND "close"; both must not
+      // produce two disconnected events for the same lifecycle.
+      const mockClient = new EventEmitter()
+      ;(conn as any).installPostConnectHandlers(mockClient, { host: "h", port: 22 })
+      mockClient.emit("error", new Error("boom"))
+      mockClient.emit("close")
+
+      const disconnected = events.filter((e) => e.type === "disconnected")
+      assert.equal(disconnected.length, 1)
+      assert.equal(conn.isConnected(), false)
+    })
   })
 
   describe("connection chain with real ssh2 (will fail gracefully)", () => {

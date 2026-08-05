@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
+import { createConnection, createServer, type Server as NetServer } from "net"
 import ssh2 from "ssh2"
 import { SSHConnection } from "../connection.js"
 import { PortForwardManager } from "../port-forwarding.js"
@@ -10,13 +11,28 @@ import { createStableEd25519KeyPair } from "./ssh-test-key.js"
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
 
-function createTestServer(opts?: { enableForwarding?: boolean }): Promise<{
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer()
+    probe.once("error", reject)
+    probe.listen(0, "127.0.0.1", () => {
+      const addr = probe.address()
+      const port = typeof addr === "object" && addr ? addr.port : 0
+      probe.close(() => resolve(port))
+    })
+  })
+}
+
+function createTestServer(opts?: { enableForwarding?: boolean; enableRemoteForwarding?: boolean }): Promise<{
   server: InstanceType<typeof Server>
   port: number
   hostConfig: Omit<SSHHostConfig, "id">
   cleanup: () => Promise<void>
 }> {
   return new Promise((resolve, reject) => {
+    // net.Server instances created for remote-forward (tcpip-forward)
+    // requests, tracked so cleanup can release the bound ports.
+    const remoteServers = new Map<string, NetServer>()
     const server = new Server({ hostKeys: [hostKey.private] }, (client: any) => {
       client.on("authentication", (ctx: any) => {
         if (ctx.method === "password" && ctx.password === "testpass") ctx.accept()
@@ -25,6 +41,48 @@ function createTestServer(opts?: { enableForwarding?: boolean }): Promise<{
       client.on("ready", () => {
         if (opts?.enableForwarding) {
           client.on("tcpip", (accept: any, rejectConn: any) => { try { rejectConn?.() } catch {} })
+        }
+        if (opts?.enableRemoteForwarding) {
+          // Emulate a real sshd for `ssh -R`: bind the requested address
+          // and tunnel incoming connections back through the SSH channel.
+          client.on("request", (accept: any, rejectReq: any, name: string, data: any) => {
+            if (name === "tcpip-forward") {
+              const key = `${data.bindAddr}:${data.bindPort}`
+              const listener = createServer((sock: any) => {
+                // boundAddr/boundPort must be the address the remote client
+                // connected to on the SSH server (our forwardIn bind) — the
+                // client routes on `${destIP}:${destPort}`.
+                client.forwardOut(
+                  data.bindAddr,
+                  data.bindPort,
+                  sock.remoteAddress ?? "127.0.0.1",
+                  sock.remotePort ?? 0,
+                  (err: Error | undefined, stream: any) => {
+                    if (err) {
+                      try { sock.destroy() } catch {}
+                      return
+                    }
+                    stream.on("error", () => {})
+                    sock.on("error", () => {})
+                    sock.pipe(stream).pipe(sock)
+                  },
+                )
+              })
+              listener.on("error", () => { try { rejectReq?.() } catch {} })
+              listener.listen(data.bindPort, data.bindAddr, () => { try { accept?.() } catch {} })
+              remoteServers.set(key, listener)
+              return
+            }
+            if (name === "cancel-tcpip-forward") {
+              const key = `${data.bindAddr}:${data.bindPort}`
+              const listener = remoteServers.get(key)
+              if (listener) {
+                try { listener.close() } catch {}
+                remoteServers.delete(key)
+              }
+              try { accept?.() } catch {}
+            }
+          })
         }
         client.on("session", (accept: any) => {
           const session = accept()
@@ -47,7 +105,13 @@ function createTestServer(opts?: { enableForwarding?: boolean }): Promise<{
         server,
         port: addr.port,
         hostConfig: { name: "test", host: "127.0.0.1", port: addr.port, auth: { username: "testuser", password: "testpass" } },
-        cleanup: () => new Promise<void>((res) => { server.close(() => setTimeout(res, 50)) }),
+        cleanup: () => new Promise<void>((res) => {
+          for (const listener of remoteServers.values()) {
+            try { listener.close() } catch {}
+          }
+          remoteServers.clear()
+          server.close(() => setTimeout(res, 50))
+        }),
       })
     })
     server.on("error", reject)
@@ -156,5 +220,91 @@ describe("Port Forwarding - Local Forward", () => {
       await manager.stopAll()
       assert.equal(manager.list().length, 0)
     })
+  })
+})
+
+describe("Port Forwarding - Remote Forward (end-to-end)", () => {
+  let srv: Awaited<ReturnType<typeof createTestServer>>
+  let conn: SSHConnection
+  let echoServer: NetServer
+  let echoPort: number
+
+  before(async () => {
+    srv = await createTestServer({ enableRemoteForwarding: true })
+    conn = new SSHConnection()
+    await conn.connect({ chain: [{ id: "t1", ...srv.hostConfig }], timeout: 5000 })
+
+    // Local echo target that the remote forward must reach through SSH.
+    echoPort = await getFreePort()
+    echoServer = createServer((socket) => {
+      socket.on("error", () => {})
+      socket.on("data", (d) => { try { socket.write(d) } catch {} })
+    })
+    await new Promise<void>((resolve, reject) => {
+      echoServer.once("error", reject)
+      echoServer.listen(echoPort, "127.0.0.1", () => resolve())
+    })
+  })
+
+  after(async () => {
+    if (echoServer) {
+      await new Promise<void>((res) => { try { echoServer.close(() => res()) } catch { res() } })
+    }
+    await conn.disconnect()
+    await srv.cleanup()
+  })
+
+  it("forwards real data through the remote tunnel (P1-1)", async () => {
+    const manager = new PortForwardManager(conn.getFinalClient())
+    const remoteBindPort = await getFreePort()
+    const fwd = await manager.remoteForward("127.0.0.1", remoteBindPort, "127.0.0.1", echoPort)
+    assert.equal(fwd.type, "remote")
+    assert.equal(fwd.status, "active")
+
+    // Connect to the port the (mock) sshd bound for us. Traffic must flow
+    // client -> SSH server -> agent -> echo target and back.
+    const payload = "ping-remote-forward"
+    const echoed = await new Promise<string>((resolve, reject) => {
+      const sock = createConnection(remoteBindPort, "127.0.0.1", () => {
+        sock.write(payload)
+      })
+      const chunks: Buffer[] = []
+      const timer = setTimeout(() => {
+        sock.destroy()
+        reject(new Error("timed out waiting for remote-forward echo"))
+      }, 10000)
+      sock.on("error", (e) => { clearTimeout(timer); reject(e) })
+      sock.on("data", (d) => {
+        chunks.push(d)
+        const data = Buffer.concat(chunks).toString()
+        if (data.length >= payload.length) {
+          clearTimeout(timer)
+          resolve(data)
+          sock.end()
+        }
+      })
+    })
+
+    assert.equal(echoed, payload)
+    await manager.stopAll()
+  })
+
+  it("rejects connections after the remote forward is stopped", async () => {
+    const manager = new PortForwardManager(conn.getFinalClient())
+    const remoteBindPort = await getFreePort()
+    const fwd = await manager.remoteForward("127.0.0.1", remoteBindPort, "127.0.0.1", echoPort)
+    assert.equal(await manager.stop(fwd.id), true)
+    assert.equal(manager.get(fwd.id), null)
+
+    // The mock sshd has closed its listener, so a fresh connection attempt
+    // must fail (ECONNREFUSED) rather than silently hang.
+    await assert.rejects(
+      new Promise<void>((resolve, reject) => {
+        const sock = createConnection(remoteBindPort, "127.0.0.1")
+        sock.once("error", reject)
+        sock.once("connect", () => { sock.destroy(); reject(new Error("expected connection to be refused")) })
+        setTimeout(() => { try { sock.destroy() } catch {}; reject(new Error("connection did not fail fast")) }, 5000)
+      }),
+    )
   })
 })

@@ -21,7 +21,12 @@ export interface ReadFileOptions {
   encoding?: BufferEncoding
   /** Skip symlinks (return error for symlinks) */
   skipSymlinks?: boolean
+  /** Maximum bytes to read before aborting (default: 10MB). Prevents a
+   *  single read from loading an arbitrarily large file into memory. */
+  maxBytes?: number
 }
+
+export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024
 
 export interface WriteFileOptions {
   encoding?: BufferEncoding
@@ -59,6 +64,8 @@ export interface RemoteFs {
   chmod(path: string, mode: number): Promise<void>
   /** Resolve a path (expand ~ and normalize) */
   resolvePath(path: string): Promise<string>
+  /** Resolve the canonical remote path (SFTP realpath, resolves symlinks). */
+  realPath(path: string): Promise<string>
   /** Close the SFTP connection */
   close(): void
 }
@@ -89,13 +96,24 @@ class SftpFs implements RemoteFs {
   async readFile(path: string, options?: ReadFileOptions): Promise<string | Buffer> {
     this.checkOpen()
     const resolved = await this.resolvePath(path)
+    const maxBytes = options?.maxBytes ?? DEFAULT_MAX_READ_BYTES
 
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = []
+      let totalBytes = 0
 
       const readStream = this.sftp.createReadStream(resolved)
 
       readStream.on("data", (chunk: Buffer) => {
+        totalBytes += chunk.length
+        if (maxBytes > 0 && totalBytes > maxBytes) {
+          // Abort before buffering an unbounded file into memory. destroy()
+          // without an error arg closes the channel cleanly; the promise is
+          // rejected below so the caller sees a real error.
+          readStream.destroy()
+          reject(new Error(`File ${path} exceeds the ${maxBytes}-byte read limit; use the download/transfer API for large files`))
+          return
+        }
         chunks.push(chunk)
       })
 
@@ -299,6 +317,22 @@ class SftpFs implements RemoteFs {
       return path.replace("~", home)
     }
     return path
+  }
+
+  async realPath(path: string): Promise<string> {
+    this.checkOpen()
+    const resolved = await this.resolvePath(path)
+    return new Promise((resolve, reject) => {
+      this.sftp.realpath(resolved, (err, canonical) => {
+        if (err) {
+          // File may not exist yet (e.g. a new write target). Fall back to
+          // the normalized input path so policy checks still apply.
+          resolve(resolved)
+          return
+        }
+        resolve(canonical)
+      })
+    })
   }
 
   close(): void {

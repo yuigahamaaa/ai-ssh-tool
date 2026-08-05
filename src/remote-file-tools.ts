@@ -56,6 +56,14 @@ export interface ReadFileResult extends ReadFileMetadata {
 
 export const DEFAULT_READ_LINE_LIMIT = 2000
 export const MAX_READ_FILE_BYTES = 1024 * 1024
+/**
+ * Hard cap on the number of entries/matches/results returned by
+ * list_dir / grep / find. Prevents a huge remote tree (or a hot grep
+ * pattern) from producing a multi-hundred-thousand-element MCP tool
+ * result that would blow past client response-size limits. Callers see
+ * `truncated: true` and can narrow the search instead.
+ */
+export const DEFAULT_MAX_RESULTS = 1000
 
 export function buildReadFileMetadataCommand(path: string): string {
   const q = shellQuote(path)
@@ -155,23 +163,27 @@ export function buildListDirFallbackCommand(path: string, showHidden = false): s
   return `sh -c 'base=$1; shift; for item do [ "$item" = "$base/*" ] && continue; name=$(basename "$item"); ${hiddenFilter}out=$(ls -ldn "$item" 2>/dev/null) || continue; set -- $out; mode=$1; size=$5; type=o; case "$mode" in d*) type=d ;; l*) type=l ;; -*) type=f ;; esac; printf "%s\\t%s\\t%s\\t%s\\t0\\t%s\\n" "$name" "$type" "$size" "$mode" "$item"; done' sh ${q} ${q}/*`
 }
 
-export function parseListDirOutput(basePath: string, raw: string): { path: string; entries: ListDirEntry[]; raw: string } {
-  const entries = raw
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map(line => {
-      const [name, type, size, mode, mtime, ...pathParts] = line.split("\t")
-      return {
-        name,
-        path: pathParts.join("\t"),
-        type: mapFindType(type),
-        sizeBytes: numberValue(size),
-        mode: normalizeMode(mode),
-        mtime: numberValue(mtime),
-      }
+export function parseListDirOutput(basePath: string, raw: string, maxResults = DEFAULT_MAX_RESULTS): { path: string; entries: ListDirEntry[]; raw: string; truncated: boolean } {
+  const entries: ListDirEntry[] = []
+  let truncated = false
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line) continue
+    if (entries.length >= maxResults) {
+      truncated = true
+      break
+    }
+    const [name, type, size, mode, mtime, ...pathParts] = line.split("\t")
+    entries.push({
+      name,
+      path: pathParts.join("\t"),
+      type: mapFindType(type),
+      sizeBytes: numberValue(size),
+      mode: normalizeMode(mode),
+      mtime: numberValue(mtime),
     })
+  }
 
-  return { path: basePath, entries, raw }
+  return { path: basePath, entries, raw, truncated }
 }
 
 export function fallbackListDirFromEntries(basePath: string, entries: DirEntry[], showHidden = false): { path: string; entries: ListDirEntry[]; raw: string; strategy: "sftp" } {
@@ -249,14 +261,19 @@ export function buildGrepFallbackCommand(params: GrepCommandParams): string {
   return `${cmd} ${shellQuote(params.pattern)} ${shellQuote(params.path)}`
 }
 
-export function parseGrepOutput(raw: string): { matches: GrepMatch[]; count: number; noMatches: boolean; raw: string } {
+export function parseGrepOutput(raw: string, maxResults = DEFAULT_MAX_RESULTS): { matches: GrepMatch[]; count: number; noMatches: boolean; raw: string; truncated: boolean } {
   const matches: GrepMatch[] = []
+  let truncated = false
   for (const line of raw.split(/\r?\n/)) {
     if (!line) continue
+    if (matches.length >= maxResults) {
+      truncated = true
+      break
+    }
     const parsed = parseGrepLine(line)
     if (parsed) matches.push(parsed)
   }
-  return { matches, count: matches.length, noMatches: matches.length === 0, raw }
+  return { matches, count: matches.length, noMatches: matches.length === 0, raw, truncated }
 }
 
 export interface FindCommandParams {
@@ -282,21 +299,25 @@ export function buildFindFallbackCommand(params: FindCommandParams): string {
   return `${cmd} -exec sh -c 'for item do out=$(ls -ldn "$item" 2>/dev/null) || continue; set -- $out; mode=$1; size=$5; type=o; case "$mode" in d*) type=d ;; l*) type=l ;; -*) type=f ;; esac; printf "%s\\t%s\\t%s\\t0\\n" "$item" "$type" "$size"; done' sh {} +`
 }
 
-export function parseFindOutput(raw: string): { results: FindResult[]; count: number; noResults: boolean; raw: string } {
-  const results = raw
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map(line => {
-      const [path, type, size, mtime] = line.split("\t")
-      return {
-        path,
-        type: mapFindType(type),
-        sizeBytes: numberValue(size),
-        mtime: numberValue(mtime),
-      }
+export function parseFindOutput(raw: string, maxResults = DEFAULT_MAX_RESULTS): { results: FindResult[]; count: number; noResults: boolean; raw: string; truncated: boolean } {
+  const results: FindResult[] = []
+  let truncated = false
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line) continue
+    if (results.length >= maxResults) {
+      truncated = true
+      break
+    }
+    const [path, type, size, mtime] = line.split("\t")
+    results.push({
+      path,
+      type: mapFindType(type),
+      sizeBytes: numberValue(size),
+      mtime: numberValue(mtime),
     })
+  }
 
-  return { results, count: results.length, noResults: results.length === 0, raw }
+  return { results, count: results.length, noResults: results.length === 0, raw, truncated }
 }
 
 function parseGrepLine(line: string): GrepMatch | undefined {

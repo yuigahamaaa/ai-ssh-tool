@@ -138,6 +138,17 @@ describe("RemoteFs", () => {
         { message: "SFTP connection is closed" },
       )
     })
+
+    it("aborts when the file exceeds maxBytes", async () => {
+      const client = createMockClient()
+      const fs = await createRemoteFs(client)
+
+      await assert.rejects(
+        () => fs.readFile("/tmp/test.txt", { maxBytes: 8 }),
+        /exceeds the 8-byte read limit/,
+      )
+      fs.close()
+    })
   })
 
   describe("writeFile", () => {

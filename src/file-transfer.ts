@@ -495,6 +495,25 @@ export async function uploadFile(
         return
       }
 
+      const timeoutMs = options?.timeout
+      let settled = false
+      const finishOnce = (fn: () => void): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        fn()
+      }
+      // Overall transfer deadline. Without it a half-open SFTP session
+      // (server stopped responding, channel never closes) would hold the
+      // promise + file descriptor + SSH channel forever, even though the
+      // FileTransferOptions.timeout contract promises a bounded operation.
+      const timer = timeoutMs ? setTimeout(() => {
+        finishOnce(() => {
+          try { sftp.end() } catch { /* best-effort */ }
+          reject(new Error(`Upload timed out after ${timeoutMs}ms: ${localPath}`))
+        })
+      }, timeoutMs) : null
+
       try {
         const readStream = createReadStream(localPath)
         const chain = buildTransformChain(options)
@@ -527,7 +546,8 @@ export async function uploadFile(
 
         const duration = Date.now() - startTime
         log("transfer", `Upload (streaming) complete: ${localPath} -> ${finalRemotePath} (${totalSize} bytes, ${duration}ms)`)
-        resolve({
+        const sourceChecksum = await sha256File(localPath)
+        finishOnce(() => resolve({
           success: true,
           path: finalRemotePath,
           finalPath: finalRemotePath,
@@ -541,17 +561,17 @@ export async function uploadFile(
           backupPath: checkResult.backupPath,
           sourceBytes: totalSize,
           bytesTransferred: transferred,
-          checksum: { algorithm: "sha256", source: await sha256File(localPath) },
+          checksum: { algorithm: "sha256", source: sourceChecksum },
           verification: { sizeMatched: transferred === totalSize },
           size: totalSize,
           duration,
-        })
+        }))
       } catch (pipelineErr: any) {
-        reject(new Error(`Upload failed for ${localPath}: ${pipelineErr.message}`))
+        finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${pipelineErr.message}`)))
       } finally {
         // Always release the SFTP channel, even on success/error paths.
         // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
-        try { sftp.end() } catch { /* best-effort cleanup */ }
+        if (!settled) { try { sftp.end() } catch { /* best-effort cleanup */ } }
       }
     })
   })
@@ -607,9 +627,14 @@ async function uploadFileDirect(
       const finishOnce = (fn: () => void) => {
         if (settled) return
         settled = true
+        if (timer) clearTimeout(timer)
         try { sftp.end() } catch { /* best-effort cleanup */ }
         fn()
       }
+      const timeoutMs = options?.timeout
+      const timer = timeoutMs ? setTimeout(() => {
+        finishOnce(() => reject(new Error(`Upload timed out after ${timeoutMs}ms: ${localPath}`)))
+      }, timeoutMs) : null
 
       try {
         const writeStream = sftp.createWriteStream(remotePath, {
@@ -704,6 +729,22 @@ export async function downloadFile(
         return
       }
 
+      let settled = false
+      const finishOnce = (fn: () => void): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        try { sftp.end() } catch { /* best-effort cleanup */ }
+        fn()
+      }
+      const timeoutMs = options?.timeout
+      // Overall transfer deadline — mirrors uploadFile. Without it a stuck
+      // SFTP channel (server stopped responding) would hold the promise and
+      // the SSH channel forever despite the documented timeout contract.
+      const timer = timeoutMs ? setTimeout(() => {
+        finishOnce(() => reject(new Error(`Download timed out after ${timeoutMs}ms: ${remotePath}`)))
+      }, timeoutMs) : null
+
       try {
         const stats = await new Promise<{ size: number; mode?: number }>((resolve, reject) => {
           sftp.stat(remotePath, (statErr, stats) => {
@@ -722,7 +763,7 @@ export async function downloadFile(
           const isSymlink = await remoteIsSymlink(client, remotePath)
           if (isSymlink) {
             log("transfer", `Skipping symbolic link: ${remotePath}`)
-              return resolve({
+              return finishOnce(() => resolve({
                 success: true,
                 path: targetLocalPath,
                 finalPath: targetLocalPath,
@@ -734,7 +775,7 @@ export async function downloadFile(
                 skipped: true,
                 size: 0,
                 duration: Date.now() - startTime,
-              })
+              }))
           }
         }
 
@@ -779,7 +820,7 @@ export async function downloadFile(
 
           const duration = Date.now() - startTime
           log("transfer", `Download (direct) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
-          return resolve({
+          return finishOnce(() => resolve({
             success: true,
             path: targetLocalPath,
             finalPath: targetLocalPath,
@@ -797,7 +838,7 @@ export async function downloadFile(
             checksum: { algorithm: "sha256", destination: sha256Buffer(data as unknown as Buffer) },
             verification: { sizeMatched: !options?.lineEnding && !options?.encoding ? data.length === totalSize : data.length > 0 },
             duration,
-          })
+          }))
         }
 
         // Streaming download with pipeline for large files
@@ -832,7 +873,8 @@ export async function downloadFile(
 
         const duration = Date.now() - startTime
         log("transfer", `Download (streaming) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
-        resolve({
+        const destinationChecksum = await sha256File(targetLocalPath)
+        finishOnce(() => resolve({
           success: true,
           path: targetLocalPath,
           finalPath: targetLocalPath,
@@ -846,17 +888,17 @@ export async function downloadFile(
           backupPath: localDecision.backupPath,
           sourceBytes: totalSize,
           bytesTransferred: transferred,
-          checksum: { algorithm: "sha256", destination: await sha256File(targetLocalPath) },
+          checksum: { algorithm: "sha256", destination: destinationChecksum },
           verification: { sizeMatched: transferred === totalSize },
           size: totalSize,
           duration,
-        })
+        }))
       } catch (error: any) {
-        reject(new Error(`Download failed: ${error.message}`))
+        finishOnce(() => reject(new Error(`Download failed: ${error.message}`)))
       } finally {
         // Always release the SFTP channel, even on success/error paths.
         // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
-        try { sftp.end() } catch { /* best-effort cleanup */ }
+        if (!settled) { try { sftp.end() } catch { /* best-effort cleanup */ } }
       }
     })
   })

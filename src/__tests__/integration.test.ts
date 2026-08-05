@@ -610,6 +610,18 @@ describe("Integration Tests", () => {
         { message: /blacklisted/ },
       )
 
+      // A blacklisted program hidden behind a pipe must also be blocked.
+      await assert.rejects(
+        () => tools.exec.execute({ command: "echo ok | rm -f /tmp/x" }),
+        { message: /blacklisted/ },
+      )
+
+      // And behind command composition.
+      await assert.rejects(
+        () => tools.exec.execute({ command: "echo ok; dd if=/dev/zero of=/tmp/x" }),
+        { message: /blacklisted/ },
+      )
+
       tools.dispose()
       await conn.disconnect()
     })
@@ -635,6 +647,23 @@ describe("Integration Tests", () => {
       await assert.rejects(
         () => tools.exec.execute({ command: "cat /etc/passwd" }),
         { message: /not in whitelist/ },
+      )
+
+      // Shell composition must be rejected outright: `;` could smuggle a
+      // non-whitelisted program past the whitelist.
+      await assert.rejects(
+        () => tools.exec.execute({ command: "echo ok; ls" }),
+        { message: /shell composition/ },
+      )
+
+      // Command substitution / redirection too.
+      await assert.rejects(
+        () => tools.exec.execute({ command: 'echo "$(ls)"' }),
+        { message: /shell composition/ },
+      )
+      await assert.rejects(
+        () => tools.exec.execute({ command: "echo ok > /tmp/x" }),
+        { message: /shell composition/ },
       )
 
       tools.dispose()
@@ -688,6 +717,12 @@ describe("Integration Tests", () => {
       // Writing to /etc should be blocked
       await assert.rejects(
         () => tools.writeFile.execute({ path: "/etc/passwd", content: "blocked" }),
+        { message: /blocked by security policy/ },
+      )
+
+      // `..` traversal must not bypass the pattern.
+      await assert.rejects(
+        () => tools.writeFile.execute({ path: "/tmp/../etc/passwd", content: "blocked" }),
         { message: /blocked by security policy/ },
       )
 

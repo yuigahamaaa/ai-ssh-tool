@@ -125,18 +125,20 @@ describe("SSHSessionManager", () => {
   })
 
   describe("max sessions limit", () => {
-    it("should reject when max sessions reached", async () => {
-      // Fill up to max (5)
-      for (let i = 0; i < 5; i++) {
-        await connectExpectingFailure(manager, makeChain([`host${i}`]))
+    it("failed connects do not consume the session quota", async () => {
+      // More failed attempts than maxSessions: the quota must never be the
+      // blocker — each attempt should fail with a connection error instead.
+      for (let i = 0; i < 6; i++) {
+        await assert.rejects(
+          () => manager.connect({ chain: makeChain([`host${i}`]), timeout: 25 }),
+          (err: Error) => {
+            assert.notEqual(err.message, "Maximum concurrent sessions (5) reached")
+            return true
+          },
+        )
       }
-      assert.equal(manager.sessionCount, 5)
-
-      // 6th should fail with max sessions error
-      await assert.rejects(
-        () => manager.connect({ chain: makeChain(["host5"]), timeout: 25 }),
-        { message: "Maximum concurrent sessions (5) reached" },
-      )
+      // Error sessions are still recorded for diagnostics.
+      assert.equal(manager.sessionCount, 6)
     })
 
     it("should enforce limit even with empty chain", async () => {

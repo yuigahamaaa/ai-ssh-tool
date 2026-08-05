@@ -79,7 +79,7 @@ export function execRemote(
   client: Client,
   command: string,
   options?: { timeout?: number; maxBufferBytes?: number },
-): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
+): Promise<{ code: number; stdout: string; stderr: string; signal?: string; stdoutTruncated?: boolean; stderrTruncated?: boolean }> {
   const timeoutMs = options?.timeout
   const maxBufferBytes = options?.maxBufferBytes ?? 10 * 1024 * 1024
   return new Promise((resolve, reject) => {
@@ -145,7 +145,14 @@ export function execRemote(
           settle(() => reject(new Error("Stream closed without an exit code (connection may have dropped)")))
           return
         }
-        settle(() => resolve({ code, stdout: stdout.join(""), stderr: stderr.join(""), signal }))
+        settle(() => resolve({
+          code,
+          stdout: stdout.join(""),
+          stderr: stderr.join(""),
+          signal,
+          ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+          ...(stderrTruncated ? { stderrTruncated: true } : {}),
+        }))
       })
       stream.on("error", (streamErr: Error) => {
         settle(() => reject(new Error(`Stream error: ${streamErr.message}`)))

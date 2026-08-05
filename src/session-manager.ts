@@ -82,7 +82,11 @@ export class SSHSessionManager extends EventEmitter {
 
   /** Create and connect a new SSH session */
   async connect(opts: ConnectionOptions): Promise<SSHSession> {
-    if (this.sessions.size >= this.maxSessions) {
+    // Quota counts ACTIVE sessions (connecting/connected) only. Error
+    // sessions are kept for diagnostics but must not consume the limit —
+    // otherwise a burst of failed connects (auth errors, unreachable hosts)
+    // would fill the quota and block healthy connections too.
+    if (this.getActiveSessionCount() >= this.maxSessions) {
       log("sm", `Max sessions (${this.maxSessions}) reached, rejecting`)
       throw new Error(`Maximum concurrent sessions (${this.maxSessions}) reached`)
     }
@@ -238,6 +242,16 @@ export class SSHSessionManager extends EventEmitter {
   /** Number of active sessions */
   get sessionCount(): number {
     return this.sessions.size
+  }
+
+  /** Number of active (connecting/connected) sessions. Failed/error sessions
+   *  are excluded so they can never block new connections. */
+  private getActiveSessionCount(): number {
+    let count = 0
+    for (const [, entry] of this.sessions) {
+      if (entry.session.status === "connecting" || entry.session.status === "connected") count++
+    }
+    return count
   }
 
   /** Check if a session exists */

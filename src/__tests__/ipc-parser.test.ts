@@ -84,6 +84,40 @@ describe("IPCMessageParser: incremental Buffer[] parser", () => {
     assert.equal(p.remainderLength, 0)
   })
 
+  it("only re-scans new bytes after a long newline-free prefix (P2-5)", () => {
+    const p = new IPCMessageParser()
+    const got: unknown[] = []
+    // A frame whose payload is a large newline-free prefix, delivered in
+    // two pushes. The first push must not cause the second push to
+    // re-examine all 5MB of already-scanned bytes.
+    const payload = "x".repeat(5 * 1024 * 1024)
+    const frame = JSON.stringify({ id: "late", payload }) + "\n"
+    const buf = Buffer.from(frame)
+    p.push(buf.subarray(0, 5 * 1024 * 1024), (m) => got.push(m))
+    assert.equal(p.remainderLength, 5 * 1024 * 1024)
+    assert.equal(got.length, 0)
+    // The frame completes in a second push.
+    p.push(buf.subarray(5 * 1024 * 1024), (m) => got.push(m))
+    assert.equal(got.length, 1)
+    assert.equal((got[0] as { id: string }).id, "late")
+    assert.equal(((got[0] as { payload: string }).payload).length, 5 * 1024 * 1024)
+    assert.equal(p.remainderLength, 0)
+  })
+
+  it("parses multiple frames split across chunk boundaries (P2-5)", () => {
+    const p = new IPCMessageParser()
+    const got: unknown[] = []
+    const frame = (id: string) => JSON.stringify({ id }) + "\n"
+    const payload = Buffer.from(frame("a") + frame("b") + frame("c"))
+    // 7-byte slices so every newline lands inside a different chunk.
+    for (let i = 0; i < payload.length; i += 7) {
+      p.push(payload.subarray(i, Math.min(i + 7, payload.length)), (m) => got.push(m))
+    }
+    assert.equal(got.length, 3)
+    assert.deepEqual(got.map((m) => (m as { id: string }).id), ["a", "b", "c"])
+    assert.equal(p.remainderLength, 0)
+  })
+
   it("rejects payload exceeding maxRemainderBytes", () => {
     const p = new IPCMessageParser(1024) // 1KB cap
     assert.throws(() => {
