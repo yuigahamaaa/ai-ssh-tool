@@ -1,6 +1,6 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
-import { createMcpScheduleRequest, profileToLegacyConfigJson } from "../mcp-scheduler-contract.js"
+import { createMcpScheduleRequest, profileToLegacyConfigJson, targetIdentityHash } from "../mcp-scheduler-contract.js"
 import type { SSHProfile } from "../types.js"
 
 function profile(): SSHProfile {
@@ -88,5 +88,20 @@ describe("MCP scheduler contract", () => {
       username: "deploy",
       password: "secret",
     })
+  })
+
+  it("targetIdentityHash is stable for the same target identity", () => {
+    const base = { host: "target.example.com", port: 2222, username: "deploy" }
+    assert.equal(targetIdentityHash(base), targetIdentityHash({ ...base }))
+    // The hash is derived from host/port/username only; credentials are not
+    // part of the key, so rotating them cannot change the virtual cwd key.
+    assert.equal(targetIdentityHash(base), targetIdentityHash({ host: base.host, port: base.port, username: base.username }))
+  })
+
+  it("targetIdentityHash differs when the target identity changes", () => {
+    const base = { host: "target.example.com", port: 2222, username: "deploy" }
+    assert.notEqual(targetIdentityHash(base), targetIdentityHash({ ...base, host: "other.example.com" }))
+    assert.notEqual(targetIdentityHash(base), targetIdentityHash({ ...base, port: 2200 }))
+    assert.notEqual(targetIdentityHash(base), targetIdentityHash({ ...base, username: "root" }))
   })
 })

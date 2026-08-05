@@ -38,6 +38,14 @@ describe("VirtualCwdStore", () => {
     assert.equal(store.resolve("agentA", "host2"), "/repo-b")
   })
 
+  it("does not collide when agent or host IDs contain the key separator", () => {
+    store.set("agent", "host:one", "/repo-one")
+    store.set("agent:host", "one", "/repo-two")
+
+    assert.equal(store.resolve("agent", "host:one"), "/repo-one")
+    assert.equal(store.resolve("agent:host", "one"), "/repo-two")
+  })
+
   it("explicit cwd overrides virtual cwd", () => {
     store.set("agentA", "host1", "/repo-a")
     assert.equal(store.resolve("agentA", "host1", "/tmp"), "/tmp")
@@ -121,6 +129,28 @@ describe("VirtualCwdStore", () => {
     // Verify the persisted map no longer contains the stale entry
     const persisted = persistence.loadVirtualCwdMap()
     assert.equal("agentOld:host1" in persisted, false, "stale entry should be removed from disk")
-    assert.equal("agentNew:host1" in persisted, true, "fresh entry should remain on disk")
+    assert.equal(JSON.stringify(["agentNew", "host1"]) in persisted, true, "fresh entry should remain on disk")
+  })
+
+  it("migrates legacy colon keys to structured keys synchronously on load", () => {
+    persistence.saveVirtualCwdMap({
+      "agentA:host1": {
+        key: "agentA:host1",
+        agentId: "agentA",
+        hostId: "host1",
+        cwd: "/repo-a",
+        updatedAt: Date.now(),
+      },
+    })
+
+    store.dispose()
+    store = new VirtualCwdStore(persistence)
+
+    // No flushNow() call: migration must be written synchronously during load
+    // so a second store instance can never overwrite the migrated file later.
+    const persisted = persistence.loadVirtualCwdMap()
+    assert.equal(JSON.stringify(["agentA", "host1"]) in persisted, true, "legacy key should be migrated synchronously")
+    assert.equal("agentA:host1" in persisted, false, "legacy colon key should not remain on disk")
+    assert.equal(store.resolve("agentA", "host1"), "/repo-a")
   })
 })

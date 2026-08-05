@@ -57,6 +57,131 @@ describe("SSHDaemon", () => {
     rmSync(tmpDir, { recursive: true, force: true })
   })
 
+  describe("concurrent connectJson dedup", () => {
+    it("deduplicates concurrent connectHostJson requests for the same config", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      let connectCalls = 0
+      ;(daemon as any).gateway.connectSimple = async () => {
+        connectCalls++
+        await new Promise(r => setTimeout(r, 30))
+        return { id: "sess-1", status: "connected" }
+      }
+
+      const configJson = JSON.stringify({ target: { host: "10.0.0.1", username: "root" } })
+      const client = new DaemonClient(pipePath)
+      await client.connect()
+      const results = await Promise.all([0, 1, 2].map(() => client.connectHostJson(configJson)))
+
+      assert.equal(connectCalls, 1, "only one underlying connection should be attempted")
+      for (const r of results) {
+        assert.equal(r.ok, true)
+        assert.equal((r.data as any).sessionId, "sess-1")
+      }
+      client.disconnect()
+    })
+
+    it("shares a failed connection result across concurrent requests", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      let connectCalls = 0
+      ;(daemon as any).gateway.connectSimple = async () => {
+        connectCalls++
+        await new Promise(r => setTimeout(r, 10))
+        throw new Error("auth failed")
+      }
+
+      const configJson = JSON.stringify({ target: { host: "10.0.0.2", username: "root" } })
+      const client = new DaemonClient(pipePath)
+      await client.connect()
+      const results = await Promise.all([0, 1, 2].map(() => client.connectHostJson(configJson)))
+
+      assert.equal(connectCalls, 1, "failed connect should also be deduplicated")
+      for (const r of results) {
+        assert.equal(r.ok, false)
+        assert.ok((r as any).error.includes("auth failed"))
+      }
+      client.disconnect()
+    })
+  })
+
+  describe("scheduled task session rebinding", () => {
+    it("rebinds a queued task to the current healthy session when its original session is gone", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      const { EventEmitter } = await import("events")
+      let receivedCmd = ""
+      const stream = new EventEmitter() as any
+      stream.stderr = new EventEmitter()
+      stream.close = () => {}
+      const fakeClient = {
+        exec: (cmd: string, cb: Function) => {
+          receivedCmd = cmd
+          cb(null, stream)
+          process.nextTick(() => stream.emit("close", 0))
+        },
+      }
+      const fakeConn = { isConnected: () => true, getFinalClient: () => fakeClient }
+      ;(daemon as any).gateway.sessions = {
+        getConnection: (sid: string) => (sid === "new-session" ? fakeConn : undefined),
+      }
+      // The sessionMap entry is keyed by CONFIG hash (which includes
+      // credentials) while the task's hostId is the TARGET identity hash
+      // (host/port/user only) — two different namespaces. Rebinding must match
+      // the entry's targetHash; a naive sessionMap.get(hostId) must NOT hit.
+      // The notEqual assertion below guarantees the test isn't passing by
+      // coincidence of equal keys.
+      const { targetIdentityHash } = await import("../mcp-scheduler-contract.js")
+      const targetHash = targetIdentityHash({ host: "10.0.0.1", port: 22, username: "root" })
+      assert.notEqual(targetHash, "cfg-hash-123")
+      ;(daemon as any).sessionMap.set("cfg-hash-123", {
+        sessionId: "new-session",
+        configHash: "cfg-hash-123",
+        targetHash,
+      })
+
+      const task: any = {
+        id: "t1",
+        sessionId: "old-session",
+        hostId: targetHash,
+        effectiveCwd: undefined,
+        command: "echo hi",
+        timeoutMs: 5000,
+      }
+      const runner = (daemon as any).scheduler.getRunner()
+      const result = await runner.start(task, () => {})
+
+      assert.equal(result.code, 0)
+      assert.ok(receivedCmd.includes("echo hi"), `expected command on rebound client, got: ${receivedCmd}`)
+      assert.equal(task.sessionId, "new-session", "task should be rebound to the healthy session")
+    })
+
+    it("fails the task when no healthy session exists for the host", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      ;(daemon as any).gateway.sessions = { getConnection: () => undefined }
+      ;(daemon as any).sessionMap.clear()
+
+      const task: any = {
+        id: "t2",
+        sessionId: "old-session",
+        hostId: "target-hash-xyz",
+        effectiveCwd: undefined,
+        command: "echo hi",
+        timeoutMs: 5000,
+      }
+      const runner = (daemon as any).scheduler.getRunner()
+      await assert.rejects(
+        () => runner.start(task, () => {}),
+        /Session .* not found/,
+      )
+    })
+  })
+
   describe("ping", () => {
     it("should respond to ping with uptime and session count", async () => {
       daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
@@ -172,6 +297,54 @@ describe("SSHDaemon", () => {
       // Give it a moment to fully shut down
       await new Promise((r) => setTimeout(r, 200))
       daemon = null as any // prevent afterEach from trying to shut it down again
+    })
+
+    it("rejects new connects once stopping has begun", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+      ;(daemon as any).stopping = true
+
+      const client = new DaemonClient(pipePath)
+      await client.connect()
+
+      const resp = await client.connectHostJson(
+        JSON.stringify({ target: { host: "10.0.0.9", username: "root" } }),
+      )
+      assert.equal(resp.ok, false)
+      assert.ok((resp as any).error.includes("shutting down"))
+      client.disconnect()
+    })
+
+    it("waits for in-flight connects to settle during stop()", async () => {
+      daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })
+      await daemon.start()
+
+      let connectCalls = 0
+      ;(daemon as any).gateway.connectSimple = async () => {
+        connectCalls++
+        await new Promise(r => setTimeout(r, 50))
+        return { id: "sess-slow", status: "connected" }
+      }
+
+      // Start an in-flight connect through the handler directly (no IPC round
+      // trip), then stop while it is still pending. stop() must wait for the
+      // connect to settle so the session it creates is torn down by
+      // disconnectAll instead of leaking past shutdown.
+      const pending = (daemon as any).handleConnectJson({
+        id: "c1",
+        params: { configJson: JSON.stringify({ target: { host: "10.0.0.8", username: "root" } }) },
+      })
+
+      // Give the connect time to start before shutting down.
+      await new Promise(r => setTimeout(r, 10))
+
+      const stopPromise = daemon.stop()
+      const resp = await pending
+      assert.equal(resp.ok, true, "in-flight connect should complete, not be rejected")
+
+      await stopPromise
+      assert.equal(connectCalls, 1)
+      daemon = null as any // prevent afterEach double-shutdown
     })
   })
 

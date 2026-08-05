@@ -30,7 +30,7 @@ import { checkDeps } from "./check-deps.js"
 import type { SSHProfile, SSHHostConfig } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
 import type { AgentIdentity, CwdSource, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
-import { createMcpScheduleRequest, profileToLegacyConfigJson } from "./mcp-scheduler-contract.js"
+import { createMcpScheduleRequest, profileToLegacyConfigJson, targetIdentityHash } from "./mcp-scheduler-contract.js"
 import {
   guidanceForTaskStatus,
   guidanceForTransferResult,
@@ -110,6 +110,18 @@ interface ClientCacheEntry {
 }
 
 const MCP_AGENT_ID = `mcp-${randomUUID().slice(0, 8)}`
+
+/**
+ * Guidance messages appended to ssh_get_cwd responses when no default cwd
+ * exists for the current AI session on the target host. Extracted so the
+ * empty-cwd guidance path is unit-testable without spinning up a full MCP
+ * server + daemon.
+ */
+export function buildCwdGuidance(virtualCwd: string | null | undefined): string[] {
+  return virtualCwd
+    ? []
+    : ["当前 host 上未查询到默认 cwd：可能尚未调用过 ssh_cd，或 MCP server 重启导致会话身份变化（虚拟 cwd 按 AI 会话隔离）。需要时重新调用 ssh_cd 设置。"]
+}
 
 async function main() {
   checkDeps()
@@ -423,12 +435,17 @@ async function main() {
     if (!connectResp.ok) {
       throw new Error(`Connection failed: ${(connectResp as any).error}`)
     }
-    const { sessionId, configHash } = connectResp.data as any
+    const { sessionId } = connectResp.data as any
+    // Key scheduler state (virtual cwd, task locks) by the remote target
+    // identity, not by the full config hash which includes credentials — so
+    // password/private-key rotation for the same target keeps its cwd.
+    const target = profile.chain[profile.chain.length - 1]
+    const hostKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })
 
     const scheduleReq = createMcpScheduleRequest({
       profile,
       sessionId,
-      configHash,
+      configHash: hostKey,
       agentId: MCP_AGENT_ID,
       command: params.command,
       cwd: params.cwd,
@@ -1338,16 +1355,18 @@ async function main() {
       if (!connectResp.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
       }
-      const { sessionId, configHash } = connectResp.data as any
+      const { sessionId } = connectResp.data as any
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
+      const target = profile.chain[profile.chain.length - 1]
+      const targetKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })
       const hostIdentity: HostIdentity = {
-        id: configHash ?? sessionId.slice(0, 16),
-        profileKey: configHash ?? sessionId.slice(0, 16),
-        targetHost: profile.chain[profile.chain.length - 1].host,
-        targetUser: profile.chain[profile.chain.length - 1].auth.username,
+        id: targetKey,
+        profileKey: targetKey,
+        targetHost: target.host,
+        targetUser: target.auth.username,
         displayName: profile.name,
       }
-      const resp = await daemonClient.setCwd(agentIdentity, hostIdentity, path)
+      const resp = await daemonClient.setCwd(agentIdentity, hostIdentity, path, sessionId)
       if (!resp.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", (resp as any).error)) }] }
       }
@@ -1382,13 +1401,15 @@ async function main() {
       if (!connectResp.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", `Connection failed: ${(connectResp as any).error}`)) }] }
       }
-      const { sessionId, configHash } = connectResp.data as any
+      const { sessionId } = connectResp.data as any
       const agentIdentity: AgentIdentity = { id: MCP_AGENT_ID, name: "mcp-server", clientType: "mcp" }
+      const target = profile.chain[profile.chain.length - 1]
+      const targetKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })
       const hostIdentity: HostIdentity = {
-        id: configHash ?? sessionId.slice(0, 16),
-        profileKey: configHash ?? sessionId.slice(0, 16),
-        targetHost: profile.chain[profile.chain.length - 1].host,
-        targetUser: profile.chain[profile.chain.length - 1].auth.username,
+        id: targetKey,
+        profileKey: targetKey,
+        targetHost: target.host,
+        targetUser: target.auth.username,
         displayName: profile.name,
       }
       const resp = await daemonClient.getCwd(agentIdentity, hostIdentity)
@@ -1396,6 +1417,7 @@ async function main() {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("cwd_result", (resp as any).error)) }] }
       }
       const data = resp.data as any
+      const guidance = buildCwdGuidance(data.virtualCwd)
       return {
         content: [{
           type: "text" as const,
@@ -1406,7 +1428,7 @@ async function main() {
               virtualCwd: data.virtualCwd ?? undefined,
               source: data.virtualCwd ? "virtual" : "none",
             }),
-          })),
+          }, guidance)),
         }],
       }
     },

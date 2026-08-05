@@ -265,8 +265,13 @@ export class DaemonClient {
     return this.send(createRequest("abortActiveTasks", { reason }))
   }
 
-  async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string): Promise<IPCResponse> {
-    return this.send(createRequest("setCwd", { agent, host, cwd }))
+  async setCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }, cwd: string, sessionId: string): Promise<IPCResponse> {
+    // Remote validation can legitimately take up to 30s (resolveRemoteCwd
+    // timeout). Give the IPC request more headroom than the server-side
+    // timeout so the daemon's response always arrives before the client
+    // gives up — otherwise a late success would be reported as a timeout
+    // while the virtual cwd has actually been updated.
+    return this.send(createRequest("setCwd", { agent, host, cwd, sessionId }), 60000)
   }
 
   async getCwd(agent: { id: string; name?: string; clientType: string }, host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }): Promise<IPCResponse> {

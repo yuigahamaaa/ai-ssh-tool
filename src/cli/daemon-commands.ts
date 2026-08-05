@@ -9,6 +9,7 @@ import { log, logError, printErrorAndLogPath } from "../logger.js"
 import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
+import { targetIdentityHash } from "../mcp-scheduler-contract.js"
 
 interface DaemonCommandClient {
   ensureDaemon(opts?: { debug?: boolean; label?: string }): Promise<void>
@@ -72,18 +73,21 @@ function profileToLegacyConfigJson(profile: SSHProfile): string {
   return JSON.stringify(legacyConfig)
 }
 
-function hostIdentityFromConfigJson(configJson: string | undefined): { targetHost: string; targetUser: string } {
+function hostIdentityFromConfigJson(configJson: string | undefined): { targetHost: string; targetUser: string; hostKey: string | undefined } {
   if (!configJson) {
-    return { targetHost: "unknown", targetUser: "unknown" }
+    return { targetHost: "unknown", targetUser: "unknown", hostKey: undefined }
   }
   try {
-    const config = JSON.parse(configJson) as { target?: { host?: string; username?: string } }
+    const config = JSON.parse(configJson) as { target?: { host?: string; port?: number; username?: string } }
     return {
       targetHost: config.target?.host ?? "unknown",
       targetUser: config.target?.username ?? "unknown",
+      hostKey: config.target?.host && config.target.username
+        ? targetIdentityHash({ host: config.target.host, port: config.target.port, username: config.target.username })
+        : undefined,
     }
   } catch {
-    return { targetHost: "unknown", targetUser: "unknown" }
+    return { targetHost: "unknown", targetUser: "unknown", hostKey: undefined }
   }
 }
 
@@ -237,7 +241,7 @@ export async function handleDaemonExec(args: string[], deps: DaemonCommandDeps =
       return
     }
 
-    const { sessionId, reused, configHash } = connectResp.data as any
+    const { sessionId, reused } = connectResp.data as any
     log("daemon-cli", `Session: ${sessionId.slice(0, 8)}, reused=${reused}`)
     if (reused) {
       console.error(`[ssh-exec] reusing session ${sessionId.slice(0, 8)}`)
@@ -245,10 +249,12 @@ export async function handleDaemonExec(args: string[], deps: DaemonCommandDeps =
       console.error(`[ssh-exec] connected, session ${sessionId.slice(0, 8)}`)
     }
 
+    const { hostKey, targetHost, targetUser } = hostIdentityFromConfigJson(finalConfigJson)
     const hostIdentity: HostIdentity = {
-      id: configHash ?? sessionId.slice(0, 16),
-      profileKey: configHash ?? sessionId.slice(0, 16),
-      ...hostIdentityFromConfigJson(finalConfigJson),
+      id: hostKey ?? sessionId.slice(0, 16),
+      profileKey: hostKey ?? sessionId.slice(0, 16),
+      targetHost,
+      targetUser,
       displayName: profileName ?? configPath ?? "inline",
     }
     const agentIdentity: AgentIdentity = {

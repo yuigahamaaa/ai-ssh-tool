@@ -21,6 +21,8 @@ const testDataDir = join(tmpdir(), `remote-shell-${Date.now()}-${process.pid}`)
 const origDataDir = process.env.SSH_TOOL_DATA_DIR
 let remoteExec: typeof import("../remote-shell.js").remoteExec
 let execOnChain: typeof import("../remote-shell.js").execOnChain
+let resolveRemoteCwd: typeof import("../remote-shell.js").resolveRemoteCwd
+let execRemote: typeof import("../remote-shell.js").execRemote
 
 before(async () => {
   mkdirSync(testDataDir, { recursive: true })
@@ -28,6 +30,8 @@ before(async () => {
   const mod = await import(`../remote-shell.js?t=${Date.now()}`)
   remoteExec = mod.remoteExec
   execOnChain = mod.execOnChain
+  resolveRemoteCwd = mod.resolveRemoteCwd
+  execRemote = mod.execRemote
 })
 
 after(() => {
@@ -178,6 +182,151 @@ describe("remoteExec", () => {
 
     const result = await remoteExec(client, "sleep 999")
     assert.equal(result.signal, "SIGTERM")
+  })
+})
+
+describe("resolveRemoteCwd", () => {
+  it("returns the normalized remote directory and uses the previous cwd for relative paths", async () => {
+    let receivedCmd = ""
+    const client = createMockClient((cmd, cb) => {
+      receivedCmd = cmd
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.emit("data", Buffer.from("/workspace/project\n"))
+        stream.emit("close", 0)
+      })
+    })
+
+    const cwd = await resolveRemoteCwd(client, "child dir", "/workspace")
+
+    assert.equal(cwd, "/workspace/project")
+    assert.ok(receivedCmd.includes("cd '/workspace' && cd 'child dir' && pwd -P"))
+  })
+
+  it("rejects when the remote directory cannot be entered", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.stderr.emit("data", Buffer.from("No such file or directory\n"))
+        stream.emit("close", 1)
+      })
+    })
+
+    await assert.rejects(
+      () => resolveRemoteCwd(client, "/missing"),
+      { message: "No such file or directory" },
+    )
+  })
+
+  it("preserves trailing whitespace in the resolved directory name", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.emit("data", Buffer.from("/workspace/trailing \n"))
+        stream.emit("close", 0)
+      })
+    })
+
+    const cwd = await resolveRemoteCwd(client, "/workspace/trailing ")
+    assert.equal(cwd, "/workspace/trailing ")
+  })
+})
+
+describe("execRemote", () => {
+  it("captures stdout, stderr, and exit code without tracking a scheduler task", async () => {
+    let receivedCmd = ""
+    const client = createMockClient((cmd, cb) => {
+      receivedCmd = cmd
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.emit("data", Buffer.from("out\n"))
+        stream.stderr.emit("data", Buffer.from("err\n"))
+        stream.emit("close", 0)
+      })
+    })
+
+    const result = await execRemote(client, "pwd -P")
+
+    assert.equal(receivedCmd, "pwd -P")
+    assert.equal(result.code, 0)
+    assert.equal(result.stdout, "out\n")
+    assert.equal(result.stderr, "err\n")
+  })
+
+  it("reports non-zero exit codes", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => stream.emit("close", 127))
+    })
+
+    const result = await execRemote(client, "missing")
+    assert.equal(result.code, 127)
+  })
+
+  it("rejects when exec fails to open a stream", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      cb(new Error("exec failed"))
+    })
+
+    await assert.rejects(
+      () => execRemote(client, "cmd"),
+      { message: "Failed to exec: exec failed" },
+    )
+  })
+
+  it("resolves with a timeout code when the command exceeds the timeout", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      // Never emit close; only the timeout should settle the promise.
+    })
+
+    const result = await execRemote(client, "sleep 999", { timeout: 50 })
+    assert.equal(result.code, 124)
+  })
+
+  it("times out even when the exec callback never fires (dead client)", async () => {
+    // A half-open/dead client may never invoke the client.exec callback.
+    // The timeout must cover that window too, or the promise hangs forever.
+    const client = createMockClient(() => {
+      // callback intentionally never called
+    })
+
+    const result = await execRemote(client, "cmd", { timeout: 50 })
+    assert.equal(result.code, 124)
+  })
+
+  it("rejects when the channel closes without an exit code", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => stream.emit("close", undefined))
+    })
+
+    await assert.rejects(
+      () => execRemote(client, "cmd"),
+      /closed without an exit code/,
+    )
+  })
+
+  it("caps buffered output at the maxBufferBytes limit", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.emit("data", Buffer.from("AAAAAA"))
+        stream.emit("data", Buffer.from("BBBBBB"))
+        stream.emit("close", 0)
+      })
+    })
+
+    const result = await execRemote(client, "cmd", { maxBufferBytes: 8 })
+    assert.equal(result.stdout, "AAAAAA", "output beyond the cap should be dropped")
   })
 })
 

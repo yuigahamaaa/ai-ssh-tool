@@ -21,19 +21,31 @@ export class VirtualCwdStore {
     const data = this.persistence.loadVirtualCwdMap()
     const now = Date.now()
     let pruned = false
-    for (const [key, value] of Object.entries(data)) {
+    for (const [key, rawValue] of Object.entries(data)) {
       // Prune entries that haven't been accessed for > 30 days. This
       // prevents the virtual-cwd.json file from growing unboundedly as
       // agents and hosts come and go across daemon restarts.
-      if (typeof value.updatedAt === "number" && now - value.updatedAt > CWD_ENTRY_RETENTION_MS) {
+      if (typeof rawValue.updatedAt === "number" && now - rawValue.updatedAt > CWD_ENTRY_RETENTION_MS) {
         pruned = true
         continue
       }
-      this.map.set(key, value)
+      const normalizedKey = VirtualCwdStore.key(rawValue.agentId, rawValue.hostId)
+      const value = key !== normalizedKey || rawValue.key !== normalizedKey
+        ? { ...rawValue, key: normalizedKey }
+        : rawValue
+      if (value !== rawValue) {
+        pruned = true
+      }
+      this.map.set(normalizedKey, value)
     }
-    // If we pruned any entries, persist the trimmed map immediately so
-    // the stale entries don't reappear on the next reload.
-    if (pruned) this.schedulePersist()
+    // If we pruned or migrated any entries, persist the trimmed map
+    // synchronously so the stale/legacy entries don't reappear on the next
+    // reload and a second store instance cannot overwrite the migrated file
+    // with a stale debounced snapshot later.
+    if (pruned) {
+      this.dirty = true
+      this.flush()
+    }
   }
 
   /**
@@ -83,7 +95,7 @@ export class VirtualCwdStore {
   }
 
   private static key(agentId: string, hostId: string): string {
-    return `${agentId}:${hostId}`
+    return JSON.stringify([agentId, hostId])
   }
 
   set(agentId: string, hostId: string, cwd: string): VirtualCwdState {

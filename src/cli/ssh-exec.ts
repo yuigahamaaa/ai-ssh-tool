@@ -37,6 +37,7 @@ import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 import { ProfileManager } from "../profile-manager.js"
 import type { SSHProfile } from "../types.js"
+import { targetIdentityHash } from "../mcp-scheduler-contract.js"
 
 interface HostConfig {
   host: string
@@ -436,14 +437,15 @@ async function execScheduledCommand(
       return
     }
 
-    const { sessionId, configHash } = connectResp.data as any
+    const { sessionId } = connectResp.data as any
     const agentIdentity: AgentIdentity = {
       id: `cli-${process.pid}-${Date.now()}`,
       clientType: "cli",
     }
+    const hostKey = targetIdentityHash(config.target)
     const hostIdentity: HostIdentity = {
-      id: configHash ?? sessionId.slice(0, 16),
-      profileKey: configHash ?? sessionId.slice(0, 16),
+      id: hostKey,
+      profileKey: hostKey,
       targetHost: config.target.host,
       targetUser: config.target.username,
       displayName: opts.profileName ?? config.target.host,

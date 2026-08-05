@@ -66,7 +66,7 @@ export type IPCRequest =
   | { id: string; action: "getTaskStatus"; params: { taskId: string } }
   | { id: string; action: "cleanupOutputs"; params: Record<string, never> }
   | { id: string; action: "abortActiveTasks"; params: { reason: string } }
-  | { id: string; action: "setCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }; cwd: string } }
+  | { id: string; action: "setCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string }; cwd: string; sessionId: string } }
   | { id: string; action: "getCwd"; params: { agent: { id: string; name?: string; clientType: string }; host: { id: string; profileKey: string; targetHost: string; targetUser: string; displayName: string } } }
   | { id: string; action: "list" }
   | { id: string; action: "ping" }

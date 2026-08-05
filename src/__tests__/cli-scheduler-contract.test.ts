@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { handleDaemonExec } from "../cli/daemon-commands.js"
+import { targetIdentityHash } from "../mcp-scheduler-contract.js"
 
 class FakeDaemonClient {
   ensured = false
@@ -111,7 +112,10 @@ describe("CLI scheduler contract", () => {
     assert.equal(fake.scheduled.timeoutMs, 60000)
     assert.equal(fake.scheduled.force, true)
     assert.equal(fake.scheduled.agent.clientType, "cli")
-    assert.equal(fake.scheduled.host.id, "cfg-123")
+    // Host identity is keyed by the remote target (host/port/user), not by the
+    // full config hash which includes credentials.
+    assert.equal(fake.scheduled.host.id, targetIdentityHash({ host: "vm.example.com", port: 22, username: "deploy" }))
+    assert.notEqual(fake.scheduled.host.id, "cfg-123")
     assert.equal(fake.scheduled.host.targetHost, "vm.example.com")
     assert.equal(fake.scheduled.host.targetUser, "deploy")
     assert.ok(logs.join("\n").includes('"action": "queued"'))

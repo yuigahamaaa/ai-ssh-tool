@@ -41,6 +41,9 @@ export class SSHSessionManager extends EventEmitter {
         host: hop.host,
         port: hop.port,
         username: hop.auth?.username,
+        // Include an auth fingerprint so credential rotation never silently
+        // reuses a connection established with the old credentials.
+        authFingerprint: hop.auth?.password ?? hop.auth?.privateKey ?? hop.auth?.agent ?? null,
       }
     })
     return createHash("md5").update(JSON.stringify(normalized)).digest("hex").slice(0, 16)

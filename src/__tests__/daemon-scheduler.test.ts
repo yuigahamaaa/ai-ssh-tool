@@ -60,9 +60,11 @@ describe("IPC Scheduler Actions", () => {
       agent: { id: "a1", clientType: "mcp" },
       host: { id: "h1", profileKey: "pk1", targetHost: "host", targetUser: "user", displayName: "host" },
       cwd: "/repo",
+      sessionId: "s1",
     })
     assert.equal(req.action, "setCwd")
     assert.equal((req as any).params.cwd, "/repo")
+    assert.equal((req as any).params.sessionId, "s1")
   })
 
   it("createRequest supports getCwd action", () => {

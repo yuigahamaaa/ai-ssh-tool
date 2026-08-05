@@ -9,6 +9,7 @@ import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
 
 import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+import { buildCwdGuidance } from "../mcp-server.js"
 
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
@@ -275,6 +276,19 @@ describe("MCP Server Tool Integration", () => {
       assert.deepEqual(tools.readFile.parameters.required, ["path"])
 
       tools.dispose()
+    })
+  })
+
+  describe("ssh_get_cwd guidance", () => {
+    it("appends guidance when no virtual cwd is set", () => {
+      const guidance = buildCwdGuidance(null)
+      assert.equal(guidance.length, 1)
+      assert.match(guidance[0], /ssh_cd/)
+    })
+
+    it("returns no guidance when a virtual cwd exists", () => {
+      const guidance = buildCwdGuidance("/workspace/project")
+      assert.deepEqual(guidance, [])
     })
   })
 })

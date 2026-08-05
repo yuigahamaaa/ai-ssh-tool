@@ -169,6 +169,34 @@ describe("Session Reuse Tests", () => {
       assert.equal(manager.getSession(session.id), undefined);
     });
 
+    it("does not reuse a session when credentials change for the same host and user", async () => {
+      const manager = new SSHSessionManager({ maxSessions: 5 });
+
+      const s1 = await manager.connect({
+        chain: [{ id: "c1", ...srv.hostConfig }],
+        timeout: 10000,
+      });
+
+      // Same host/port/user but a different password. The wrong password fails
+      // to connect, but the point is it must not silently reuse s1: the reuse
+      // key must include an auth fingerprint.
+      try {
+        await manager.connect({
+          chain: [{ id: "c2", ...srv.hostConfig, auth: { username: "testuser", password: "wrongpass" } }],
+          timeout: 10000,
+        });
+      } catch {
+        // expected: wrong credentials cannot connect
+      }
+
+      assert.equal(manager.listSessions().length, 2, "credential change must not reuse the previous session");
+
+      await manager.disconnect(s1.id);
+      for (const s of manager.getSessionsByStatus("error")) {
+        await manager.disconnect(s.id).catch(() => {});
+      }
+    });
+
     it("disconnects all sessions at once", async () => {
       const manager = new SSHSessionManager({ maxSessions: 5 });
 

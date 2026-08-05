@@ -1,3 +1,4 @@
+import { createHash } from "crypto"
 import type { SSHProfile } from "./types.js"
 import type {
   AgentIdentity,
@@ -46,6 +47,25 @@ export function profileToLegacyConfigJson(profile: SSHProfile): string {
       privateKey: target.auth.privateKey,
     },
   })
+}
+
+export interface TargetIdentity {
+  host: string
+  port?: number
+  username: string
+}
+
+/**
+ * Hash of the remote target identity (host/port/user) only — deliberately
+ * excluding credentials. Virtual cwd is keyed by this so rotating a password
+ * or private key for the same target does not lose the stored cwd.
+ */
+export function targetIdentityHash(target: TargetIdentity): string {
+  return createHash("md5").update(JSON.stringify({
+    host: target.host,
+    port: target.port ?? 22,
+    username: target.username,
+  })).digest("hex")
 }
 
 export function createMcpScheduleRequest(input: McpScheduleRequestInput): ScheduleRequest {

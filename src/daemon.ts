@@ -18,7 +18,8 @@ import { createHash } from "crypto"
 import { spawn } from "child_process"
 import { pathToFileURL } from "url"
 import { SSHGateway } from "./gateway.js"
-import { remoteExec } from "./remote-shell.js"
+import { remoteExec, resolveRemoteCwd } from "./remote-shell.js"
+import { targetIdentityHash } from "./mcp-scheduler-contract.js"
 import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
 import { enableDebug, log, logError } from "./logger.js"
@@ -42,6 +43,10 @@ import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } f
 interface DaemonSession {
   sessionId: string
   configHash: string
+  /** Remote target identity hash (host/port/user). Scheduler tasks are keyed
+   *  by this, so rebinding can find the session even when the config hash
+   *  (which includes credentials) differs from the task's hostId. */
+  targetHash?: string
 }
 
 interface CachedConfig {
@@ -130,6 +135,12 @@ export class SSHDaemon {
   private sockets = new Set<Socket>()
   private sessionMap = new Map<string, DaemonSession>() // configHash -> session
   private configCache = new Map<string, CachedConfig>() // path -> cached hash
+  /**
+   * In-flight connect promises keyed by config hash. Concurrent connect
+   * requests for the same config share one underlying SSH connection instead
+   * of racing to create duplicate sessions.
+   */
+  private pendingConnects = new Map<string, Promise<{ sessionId: string; configHash: string; reused: boolean }>>()
   private startedAt = Date.now()
   private forwardManagers = new Map<string, PortForwardManager>()
   private scheduler: SchedulerService
@@ -151,7 +162,7 @@ export class SSHDaemon {
       persistence: new BatchedPersistenceStore(new PersistenceStore()),
       runner: {
         start: async (task, onOutput) => {
-          const conn = this.gateway.sessions.getConnection(task.sessionId)
+          const conn = this.resolveTaskConnection(task)
           if (!conn) throw new Error(`Session ${task.sessionId} not found for scheduled task`)
           const client = conn.getFinalClient()
           const cmd = task.effectiveCwd
@@ -166,9 +177,14 @@ export class SSHDaemon {
           // controller couldn't stop the stream (shouldn't happen, but
           // guards against partial setups), try killing by PID.
           if (!task.pid) return false
-          const conn = this.gateway.sessions.getConnection(task.sessionId)
-          if (!conn) return false
-          const client = conn.getFinalClient()
+          // Only kill on the ORIGINAL session. If the task was rebound to a
+          // different session (resolveTaskConnection mutates task.sessionId),
+          // the recorded PID belongs to a process on the old (dead) session
+          // and killing that PID on the new session risks killing an unrelated
+          // process that reused the number.
+          const direct = this.gateway.sessions.getConnection(task.sessionId)
+          if (!direct || !direct.isConnected()) return false
+          const client = direct.getFinalClient()
           const killCmd = `kill -TERM -${task.pid} 2>/dev/null || kill -TERM ${task.pid} 2>/dev/null; sleep 0.5; kill -9 -${task.pid} 2>/dev/null || kill -9 ${task.pid} 2>/dev/null; true`
           client.exec(killCmd, () => {})
           return true
@@ -178,7 +194,7 @@ export class SSHDaemon {
           onOutput: (stdout: string, stderr: string) => void,
           onClose: (code: number, signal?: string) => void
         ) => {
-          const conn = this.gateway.sessions.getConnection(task.sessionId)
+          const conn = this.resolveTaskConnection(task)
           if (!conn) throw new Error(`Session ${task.sessionId} not found for background task`)
           const client = conn.getFinalClient()
 
@@ -377,6 +393,15 @@ export class SSHDaemon {
     }
     if (this.idleSweeper) clearInterval(this.idleSweeper)
     this.idleSweeper = null
+    // Reject new connects and wait for in-flight ones to settle. A connect
+    // that completes after this point would register a session that
+    // disconnectAll below never sees; allSettled closes that window so no
+    // SSH connection leaks past shutdown.
+    const pendingConnects = Array.from(this.pendingConnects.values())
+    this.pendingConnects.clear()
+    if (pendingConnects.length > 0) {
+      await Promise.allSettled(pendingConnects)
+    }
     // scheduler.dispose() stops any running background-task streams and
     // clears associated timers, so we don't need a separate handle map here.
     this.scheduler.dispose()
@@ -545,7 +570,7 @@ export class SSHDaemon {
         break
 
       case "setCwd":
-        resp = this.handleSetCwd(req as any)
+        resp = await this.handleSetCwd(req as any)
         break
 
       case "getCwd":
@@ -581,6 +606,10 @@ export class SSHDaemon {
 
   private async handleConnect(req: IPCRequest & { action: "connect" }): Promise<IPCResponse> {
     const { configPath } = req.params
+
+    if (this.stopping) {
+      return { id: req.id, ok: false, error: "Daemon is shutting down" }
+    }
 
     // Read config with mtime-based cache. The cache stores both the raw
     // content (for cache hits, to skip the readFileSync) and the parsed
@@ -633,18 +662,24 @@ export class SSHDaemon {
     }))
 
     try {
-      const session = await this.gateway.connectSimple({
-        host: config.target.host,
-        port: config.target.port ?? 22,
-        username: config.target.username,
-        password: config.target.password,
-        privateKey: config.target.privateKey,
-        jumpHosts,
-        name: `daemon-${config.target.host}`,
+      const data = await this.withPendingConnect(configHash, async () => {
+        const session = await this.gateway.connectSimple({
+          host: config.target.host,
+          port: config.target.port ?? 22,
+          username: config.target.username,
+          password: config.target.password,
+          privateKey: config.target.privateKey,
+          jumpHosts,
+          name: `daemon-${config.target.host}`,
+        })
+        this.sessionMap.set(configHash, {
+          sessionId: session.id,
+          configHash,
+          targetHash: targetIdentityHash({ host: config.target.host, port: config.target.port ?? 22, username: config.target.username }),
+        })
+        return { sessionId: session.id, configHash, reused: false }
       })
-
-      this.sessionMap.set(configHash, { sessionId: session.id, configHash })
-      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash } }
+      return { id: req.id, ok: true, data }
     } catch (err: any) {
       // Clean up any error sessions created during the failed connection
       for (const [sid, entry] of this.sessionMap) {
@@ -663,8 +698,63 @@ export class SSHDaemon {
     }
   }
 
+  /**
+   * Resolve the connection for a scheduled task. If the task's pinned session
+   * is gone or dead (session dropped, or daemon restarted while the task was
+   * queued), rebind to the current healthy session for the same host before
+   * the command starts. The task has not executed yet at this point, so
+   * rebinding cannot duplicate side effects.
+   */
+  private resolveTaskConnection(task: { sessionId: string; hostId: string }) {
+    const direct = this.gateway.sessions.getConnection(task.sessionId)
+    if (direct && direct.isConnected()) return direct
+    // Tasks are keyed by target identity hash (host/port/user), while
+    // sessionMap is keyed by config hash (which also includes credentials).
+    // Rebinding must therefore scan for an entry whose targetHash matches the
+    // task's hostId — a plain sessionMap.get(task.hostId) would miss every
+    // session because the keys live in different namespaces.
+    const entry =
+      Array.from(this.sessionMap.values()).find((e) => e.targetHash === task.hostId) ??
+      this.sessionMap.get(task.hostId)
+    if (entry) {
+      const rebound = this.gateway.sessions.getConnection(entry.sessionId)
+      if (rebound && rebound.isConnected()) {
+        task.sessionId = entry.sessionId
+        return rebound
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Deduplicate concurrent connects for the same config hash: the first
+   * caller runs the connection, every concurrent caller awaits the same
+   * in-flight promise (sharing both its success and its failure).
+   */
+  private withPendingConnect(
+    configHash: string,
+    connect: () => Promise<{ sessionId: string; configHash: string; reused: boolean }>,
+  ): Promise<{ sessionId: string; configHash: string; reused: boolean }> {
+    if (this.stopping) {
+      return Promise.reject(new Error("Daemon is shutting down"))
+    }
+    const inflight = this.pendingConnects.get(configHash)
+    if (inflight) return inflight
+    const p = connect().finally(() => {
+      if (this.pendingConnects.get(configHash) === p) {
+        this.pendingConnects.delete(configHash)
+      }
+    })
+    this.pendingConnects.set(configHash, p)
+    return p
+  }
+
   private async handleConnectJson(req: IPCRequest & { action: "connectJson" }): Promise<IPCResponse> {
     const { configJson } = req.params
+
+    if (this.stopping) {
+      return { id: req.id, ok: false, error: "Daemon is shutting down" }
+    }
 
     const normalized = normalizeConfig(configJson)
     const configHash = createHash("md5").update(normalized).digest("hex")
@@ -698,18 +788,24 @@ export class SSHDaemon {
     }))
 
     try {
-      const session = await this.gateway.connectSimple({
-        host: config.target.host,
-        port: config.target.port ?? 22,
-        username: config.target.username,
-        password: config.target.password,
-        privateKey: config.target.privateKey,
-        jumpHosts,
-        name: `daemon-${config.target.host}`,
+      const data = await this.withPendingConnect(configHash, async () => {
+        const session = await this.gateway.connectSimple({
+          host: config.target.host,
+          port: config.target.port ?? 22,
+          username: config.target.username,
+          password: config.target.password,
+          privateKey: config.target.privateKey,
+          jumpHosts,
+          name: `daemon-${config.target.host}`,
+        })
+        this.sessionMap.set(configHash, {
+          sessionId: session.id,
+          configHash,
+          targetHash: targetIdentityHash({ host: config.target.host, port: config.target.port ?? 22, username: config.target.username }),
+        })
+        return { sessionId: session.id, configHash, reused: false }
       })
-
-      this.sessionMap.set(configHash, { sessionId: session.id, configHash })
-      return { id: req.id, ok: true, data: { sessionId: session.id, reused: false, configHash } }
+      return { id: req.id, ok: true, data }
     } catch (err: any) {
       for (const [sid, entry] of this.sessionMap) {
         const s = this.gateway.sessions.getSession(entry.sessionId)
@@ -838,9 +934,27 @@ export class SSHDaemon {
     }
   }
 
-  private handleSetCwd(req: { id: string; params: { agent: AgentIdentity; host: HostIdentity; cwd: string } }): IPCResponse {
+  private async handleSetCwd(req: { id: string; params: { agent: AgentIdentity; host: HostIdentity; cwd: string; sessionId: string } }): Promise<IPCResponse> {
     try {
-      const cwd = this.scheduler.setCwd(req.params.agent.id, req.params.host.id, req.params.cwd)
+      const connection = this.gateway.sessions.getConnection(req.params.sessionId)
+      if (!connection) {
+        return { id: req.id, ok: false, error: `Session ${req.params.sessionId} not found` }
+      }
+      // Half-open sessions can leave client.exec callbacks pending forever.
+      // Pre-check like handleTransfer/handleBgExec and clean up so the next
+      // connectHostJson recreates the session instead of hanging the request.
+      if (!connection.isConnected()) {
+        try {
+          await this.gateway.disconnect(req.params.sessionId)
+          await this.cleanupSession(req.params.sessionId)
+        } catch {
+          // ignore cleanup errors
+        }
+        return { id: req.id, ok: false, error: `Session ${req.params.sessionId} is not connected` }
+      }
+      const previousCwd = this.scheduler.resolveCwd(req.params.agent.id, req.params.host.id)
+      const cwd = await resolveRemoteCwd(connection.getFinalClient(), req.params.cwd, previousCwd)
+      this.scheduler.setCwd(req.params.agent.id, req.params.host.id, cwd)
       return { id: req.id, ok: true, data: { success: true, cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" } }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
@@ -995,9 +1109,12 @@ export class SSHDaemon {
             }
             return { id: req.id, ok: false, error: `Session ${sessionId} is not connected` }
           }
-          // Use scheduler's background task mechanism
+          // Use scheduler's background task mechanism. The host id must be the
+          // target identity hash (not the config hash / sessionId prefix) so
+          // that queueStatus filtering and task rebinding share one namespace
+          // with MCP/CLI scheduled tasks.
           const entry = this.sessionMap.get(sessionId) ?? Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)
-          const hId = entry?.configHash ?? sessionId.slice(0, 16)
+          const hId = entry?.targetHash ?? entry?.configHash ?? sessionId.slice(0, 16)
           const decision = this.scheduler.schedule({
             agent: { id: "daemon-bgexec", clientType: "cli" },
             host: { id: hId, profileKey: hId, targetHost: "unknown", targetUser: "unknown", displayName: "bgexec" },
@@ -1025,7 +1142,9 @@ export class SSHDaemon {
           return { id: req.id, ok: true, data: result }
         }
         case "list": {
-          const statusResp = this.scheduler.queueStatus(Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)?.configHash ?? sessionId.slice(0, 16))
+          const listEntry = Array.from(this.sessionMap.values()).find(e => e.sessionId === sessionId)
+          const listHostId = listEntry?.targetHash ?? listEntry?.configHash ?? sessionId.slice(0, 16)
+          const statusResp = this.scheduler.queueStatus(listHostId)
           const tasks = [
             ...(statusResp.running || []).filter(t => t.status),
             ...(statusResp.queued || []).filter(t => t.status),

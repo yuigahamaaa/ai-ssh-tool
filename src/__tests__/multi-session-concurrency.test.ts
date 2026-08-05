@@ -367,9 +367,10 @@ describe("Multi-Session Concurrency Tests", () => {
       await Promise.all(clients.map(c => c.connect()))
 
       const host: HostIdentity = { id: "h1", profileKey: "pk1", targetHost: "host", targetUser: "user", displayName: "host" }
-      await Promise.all(clients.map((c, i) =>
-        c.setCwd(makeAgent(`agent-${i}`), host, `/project-${i}`)
+      const results = await Promise.all(clients.map((c, i) =>
+        c.setCwd(makeAgent(`agent-${i}`), host, `/project-${i}`, `missing-session-${i}`)
       ))
+      assert.ok(results.every(r => !r.ok), "setCwd should reject without a connected SSH session")
 
       clients.forEach(c => c.disconnect())
     })
