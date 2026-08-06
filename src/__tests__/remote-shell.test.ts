@@ -42,12 +42,21 @@ after(() => {
 
 // Mock ssh2 stream
 function createMockStream() {
-  const ee = new EventEmitter()
-  return Object.assign(ee, {
-    stderr: new EventEmitter(),
-    write: () => {},
-    close: () => ee.emit("close", 0),
+  const ee = new EventEmitter() as any
+  let closeCalls = 0
+  ee.stderr = new EventEmitter()
+  ee.write = () => {}
+  ee.close = () => {
+    closeCalls++
+    ee.emit("close", 0)
+  }
+  // Object.assign would snapshot the getter value (0), so define it
+  // explicitly to keep closeCalls live for assertions.
+  Object.defineProperty(ee, "closeCalls", {
+    get: () => closeCalls,
+    enumerable: true,
   })
+  return ee
 }
 
 // Mock ssh2 Client
@@ -198,7 +207,12 @@ describe("resolveRemoteCwd", () => {
     const cwd = await resolveRemoteCwd(client, "child dir", "/workspace")
 
     assert.equal(cwd, "/workspace/project")
-    assert.ok(receivedCmd.includes("cd '/workspace' && cd 'child dir' && pwd -P"))
+    // The command is wrapped (and shell-quoted) by execRemote, so assert the
+    // wrapper prefix plus the resolved cwd components rather than exact quotes.
+    assert.match(receivedCmd, /^echo "SSH_TOOL_PID:\$\$" >&2; exec sh -c /)
+    assert.ok(receivedCmd.includes("/workspace"))
+    assert.ok(receivedCmd.includes("child dir"))
+    assert.ok(receivedCmd.includes("pwd -P"))
   })
 
   it("rejects when the remote directory cannot be entered", async () => {
@@ -248,10 +262,90 @@ describe("execRemote", () => {
 
     const result = await execRemote(client, "pwd -P")
 
-    assert.equal(receivedCmd, "pwd -P")
+    assert.match(receivedCmd, /^echo "SSH_TOOL_PID:\$\$" >&2; exec sh -c /)
     assert.equal(result.code, 0)
     assert.equal(result.stdout, "out\n")
     assert.equal(result.stderr, "err\n")
+  })
+
+  it("wraps the command with a PID marker without exposing the marker in stderr", async () => {
+    let receivedCmd = ""
+    const client = createMockClient((cmd, cb) => {
+      receivedCmd = cmd
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.stderr.emit("data", Buffer.from("SSH_TOOL_PID:12345\nreal stderr\n"))
+        stream.emit("close", 0)
+      })
+    })
+
+    const result = await execRemote(client, "echo hello")
+
+    assert.match(receivedCmd, /^echo "SSH_TOOL_PID:\$\$" >&2; exec sh -c /)
+    assert.equal(result.stderr, "real stderr\n")
+  })
+
+  it("terminates the captured remote process when the command times out", async () => {
+    const commands: string[] = []
+    let commandStream: ReturnType<typeof createMockStream> | undefined
+    const client = createMockClient((cmd, cb) => {
+      commands.push(cmd)
+      if (commands.length === 1) {
+        commandStream = createMockStream()
+        cb(null, commandStream)
+        process.nextTick(() => commandStream!.stderr.emit("data", Buffer.from("SSH_TOOL_PID:4321\n")))
+        return
+      }
+      cb(null, createMockStream())
+    })
+
+    const result = await execRemote(client, "sleep 60", { timeout: 5 })
+
+    assert.equal(result.code, 124)
+    assert.equal(result.signal, "TERM")
+    assert.ok(commands.some((cmd) => cmd.includes("kill -TERM 4321")))
+    assert.ok(commands.some((cmd) => cmd.includes("kill -KILL 4321")))
+    assert.ok(commandStream!.closeCalls > 0)
+  })
+
+  it("marks a timeout as potentially still running when no PID was captured", async () => {
+    const client = createMockClient((_cmd, cb) => {
+      cb(null, createMockStream())
+    })
+
+    const result = await execRemote(client, "sleep 60", { timeout: 5 })
+
+    assert.equal(result.code, 124)
+    assert.equal(result.remoteProcessMayContinue, true)
+  })
+
+  it("closes the channel and marks stdout truncated when stdout reaches the cap", async () => {
+    let stream: ReturnType<typeof createMockStream> | undefined
+    const client = createMockClient((_cmd, cb) => {
+      stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => stream!.emit("data", Buffer.from("123456789")))
+    })
+
+    const result = await execRemote(client, "yes", { maxBufferBytes: 8 })
+
+    assert.equal(result.stdoutTruncated, true)
+    assert.ok(stream!.closeCalls > 0)
+  })
+
+  it("closes the channel and marks stderr truncated when stderr reaches the cap", async () => {
+    let stream: ReturnType<typeof createMockStream> | undefined
+    const client = createMockClient((_cmd, cb) => {
+      stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => stream!.stderr.emit("data", Buffer.from("123456789")))
+    })
+
+    const result = await execRemote(client, "cmd", { maxBufferBytes: 8 })
+
+    assert.equal(result.stderrTruncated, true)
+    assert.ok(stream!.closeCalls > 0)
   })
 
   it("reports non-zero exit codes", async () => {

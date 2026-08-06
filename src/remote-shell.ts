@@ -75,11 +75,18 @@ export async function resolveRemoteCwd(client: Client, path: string, baseCwd?: s
  * is even called: on a dead client the exec callback may never fire, and
  * without an outer timer the promise would hang forever.
  */
+/** Best-effort remote process termination. Never waits, never throws, and
+ *  must not override the main exec's settled result. */
+function killRemoteProcess(client: Client, pid: number): void {
+  const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -KILL ${pid} 2>/dev/null; true`
+  client.exec(killCmd, () => {})
+}
+
 export function execRemote(
   client: Client,
   command: string,
   options?: { timeout?: number; maxBufferBytes?: number },
-): Promise<{ code: number; stdout: string; stderr: string; signal?: string; stdoutTruncated?: boolean; stderrTruncated?: boolean }> {
+): Promise<{ code: number; stdout: string; stderr: string; signal?: string; stdoutTruncated?: boolean; stderrTruncated?: boolean; remoteProcessMayContinue?: boolean }> {
   const timeoutMs = options?.timeout
   const maxBufferBytes = options?.maxBufferBytes ?? 10 * 1024 * 1024
   return new Promise((resolve, reject) => {
@@ -89,6 +96,8 @@ export function execRemote(
     let stderrBytes = 0
     let stdoutTruncated = false
     let stderrTruncated = false
+    let pid: number | null = null
+    let pidCaptured = false
     let streamRef: import("ssh2").ClientChannel | null = null
     let settled = false
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -103,17 +112,27 @@ export function execRemote(
     if (timeoutMs) {
       timer = setTimeout(() => {
         settle(() => {
+          if (pid) killRemoteProcess(client, pid)
           // Best-effort: close the channel so the remote command doesn't run
           // forever after the caller has already moved on.
           if (streamRef) {
             try { streamRef.close() } catch { /* best-effort */ }
           }
-          resolve({ code: 124, stdout: stdout.join(""), stderr: stderr.join(""), signal: "TERM" })
+          resolve({
+            code: 124,
+            stdout: stdout.join(""),
+            stderr: stderr.join(""),
+            signal: "TERM",
+            ...(!pid ? { remoteProcessMayContinue: true } : {}),
+            ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+            ...(stderrTruncated ? { stderrTruncated: true } : {}),
+          })
         })
       }, timeoutMs)
     }
 
-    client.exec(command, (err: Error | undefined, stream: import("ssh2").ClientChannel) => {
+    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(command)}`
+    client.exec(wrappedCommand, (err: Error | undefined, stream: import("ssh2").ClientChannel) => {
       if (err) {
         settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
         return
@@ -124,18 +143,64 @@ export function execRemote(
         stdoutBytes += data.length
         if (stdoutBytes > maxBufferBytes) {
           stdoutTruncated = true
+          settle(() => resolve({
+            code: 124,
+            stdout: stdout.join(""),
+            stderr: stderr.join(""),
+            signal: "TERM",
+            ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+            ...(stderrTruncated ? { stderrTruncated: true } : {}),
+          }))
+          if (pid) killRemoteProcess(client, pid)
+          try { stream.close() } catch { /* best-effort */ }
           return
         }
         stdout.push(data.toString())
       })
       stream.stderr.on("data", (data: Buffer) => {
         if (stderrTruncated) return
+        const text = data.toString()
+        if (!pidCaptured) {
+          const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+          if (pidMatch) {
+            pid = parseInt(pidMatch[1], 10)
+            pidCaptured = true
+            const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, "")
+            if (!remaining) return
+            stderrBytes += Buffer.byteLength(remaining)
+            if (stderrBytes > maxBufferBytes) {
+              stderrTruncated = true
+              settle(() => resolve({
+                code: 124,
+                stdout: stdout.join(""),
+                stderr: stderr.join(""),
+                signal: "TERM",
+                ...(stderrTruncated ? { stderrTruncated: true } : {}),
+              }))
+              killRemoteProcess(client, pid)
+              try { stream.close() } catch { /* best-effort */ }
+              return
+            }
+            stderr.push(remaining)
+            return
+          }
+        }
         stderrBytes += data.length
         if (stderrBytes > maxBufferBytes) {
           stderrTruncated = true
+          settle(() => resolve({
+            code: 124,
+            stdout: stdout.join(""),
+            stderr: stderr.join(""),
+            signal: "TERM",
+            ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+            ...(stderrTruncated ? { stderrTruncated: true } : {}),
+          }))
+          if (pid) killRemoteProcess(client, pid)
+          try { stream.close() } catch { /* best-effort */ }
           return
         }
-        stderr.push(data.toString())
+        stderr.push(text)
       })
       stream.on("close", (code?: number, signal?: string) => {
         // ssh2 emits close without an exit code when the channel is dropped
