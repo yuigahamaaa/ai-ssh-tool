@@ -9,6 +9,7 @@
  */
 
 import type { Client } from "ssh2"
+import { spawn } from "child_process"
 import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "fs"
 import { basename, dirname, join, posix as pathPosix } from "path"
 import { tmpdir } from "os"
@@ -372,6 +373,125 @@ async function sha256File(path: string): Promise<string> {
   const hash = createHash("sha256")
   await pipelineAsync(createReadStream(path), hash)
   return hash.digest("hex")
+}
+
+/**
+ * Reject tar members that would escape the extract directory. Defends
+ * against malicious/corrupt archives where a member uses `../`, an
+ * absolute path, or normalizes outside the target dir. Pure function so
+ * it is unit-testable without spawning tar.
+ */
+export function assertTarMembersWithin(members: string[], extractDir: string): void {
+  const root = pathPosix.resolve(extractDir)
+  for (const raw of members) {
+    const member = raw.replace(/\r$/, "")
+    if (member === "." || member === "") continue
+    if (member.startsWith("/") || /^[A-Za-z]:/.test(member)) {
+      throw new Error(`Archive member escapes target directory: ${member}`)
+    }
+    const joined = pathPosix.resolve(root, member)
+    if (joined !== root && !joined.startsWith(root + "/")) {
+      throw new Error(`Archive member escapes target directory: ${member}`)
+    }
+  }
+}
+
+interface TransferScope {
+  localTempFiles: string[]
+  remoteTempPaths: string[]
+  childProcs: Set<import("child_process").ChildProcess>
+  streams: Set<{ destroy: () => void }>
+}
+
+function createTransferScope(): TransferScope {
+  return { localTempFiles: [], remoteTempPaths: [], childProcs: new Set(), streams: new Set() }
+}
+
+function cleanupTransferScope(scope: TransferScope, client: Client): Promise<void> {
+  for (const child of scope.childProcs) {
+    if (child.exitCode === null) {
+      try { child.kill("SIGKILL") } catch { /* best-effort */ }
+    }
+  }
+  scope.childProcs.clear()
+  for (const stream of scope.streams) {
+    try { stream.destroy() } catch { /* best-effort */ }
+  }
+  scope.streams.clear()
+  for (const file of scope.localTempFiles) {
+    try { if (existsSync(file)) unlinkSync(file) } catch { /* best-effort */ }
+  }
+  scope.localTempFiles = []
+  const cleanups: Promise<unknown>[] = []
+  for (const remote of scope.remoteTempPaths) {
+    cleanups.push(remoteExec(client, `rm -f ${shellQuote(remote)}`, { timeout: 10000 }).catch(() => {}))
+  }
+  scope.remoteTempPaths = []
+  return Promise.allSettled(cleanups).then(() => {})
+}
+
+/** Subprocess spawner used for local tar operations. */
+let tarSpawn: typeof spawn = spawn
+
+/**
+ * Test seam: replace the subprocess spawner used for local tar operations,
+ * so tests can observe/hang/kill tar children deterministically. Passing
+ * null restores the default `child_process.spawn`.
+ */
+export function setTarSpawn(spawnFn: typeof spawn | null): void {
+  tarSpawn = spawnFn ?? spawn
+}
+
+/** Run tar asynchronously; kills the child on timeout. Resolves on exit. */
+function runTar(args: string[], opts: { timeout: number; scope: TransferScope }): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = tarSpawn("tar", args, { stdio: ["ignore", "ignore", "pipe"] })
+    opts.scope.childProcs.add(child)
+    let stderr = ""
+    child.stderr?.on("data", (d: Buffer) => { stderr += d.toString() })
+    let settled = false
+    const finish = (code: number): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      opts.scope.childProcs.delete(child)
+      resolve({ code, stderr })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill("SIGTERM") } catch { /* best-effort */ }
+      setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
+      finish(124)
+    }, opts.timeout)
+    child.on("error", () => finish(1))
+    child.on("close", (code: number | null) => finish(code ?? 1))
+  })
+}
+
+/** Run tar and capture stdout lines (for `-tzf` listing). */
+function runTarList(args: string[], opts: { timeout: number; scope: TransferScope }): Promise<{ code: number; stderr: string; members: string[] }> {
+  return new Promise((resolve) => {
+    const child = tarSpawn("tar", args, { stdio: ["ignore", "pipe", "pipe"] })
+    opts.scope.childProcs.add(child)
+    let stdout = ""
+    let stderr = ""
+    child.stdout?.on("data", (d: Buffer) => { stdout += d.toString() })
+    child.stderr?.on("data", (d: Buffer) => { stderr += d.toString() })
+    let settled = false
+    const finish = (code: number): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      opts.scope.childProcs.delete(child)
+      resolve({ code, stderr, members: stdout.split("\n").filter((l) => l.trim() !== "") })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill("SIGTERM") } catch { /* best-effort */ }
+      setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
+      finish(124)
+    }, opts.timeout)
+    child.on("error", () => finish(1))
+    child.on("close", (code: number | null) => finish(code ?? 1))
+  })
 }
 
 function checkLocalOverwrite(localPath: string, options: FileTransferOptions | undefined): LocalOverwriteDecision {
@@ -915,7 +1035,6 @@ export async function uploadFolder(
   options?: FolderTransferOptions,
 ): Promise<TransferResult> {
   const startTime = Date.now()
-  const level = options?.compressionLevel ?? 6
   const timeout = options?.timeout ?? 5 * 60 * 1000
 
   if (!existsSync(localPath)) {
@@ -925,6 +1044,9 @@ export async function uploadFolder(
   const folderName = basename(localPath)
   const tmpFile = join(tmpdir(), `ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`)
   const remoteTmp = `/tmp/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
+  const scope = createTransferScope()
+  scope.localTempFiles.push(tmpFile)
+  scope.remoteTempPaths.push(remoteTmp)
   let uploadResult: TransferResult | null = null
   let targetDecision: OverwriteDecision | undefined
 
@@ -932,16 +1054,9 @@ export async function uploadFolder(
     targetDecision = await checkOverwrite(client, remotePath, options)
     if (!targetDecision.proceed) {
       return {
-        success: true,
-        path: remotePath,
-        finalPath: remotePath,
-        requestedPath: remotePath,
-        sourcePath: localPath,
-        action: "skipped",
-        targetType: "directory",
-        overwriteStrategy: targetDecision.strategy,
-        skipped: true,
-        size: 0,
+        success: true, path: remotePath, finalPath: remotePath, requestedPath: remotePath,
+        sourcePath: localPath, action: "skipped", targetType: "directory",
+        overwriteStrategy: targetDecision.strategy, skipped: true, size: 0,
         duration: Date.now() - startTime,
       }
     }
@@ -949,23 +1064,29 @@ export async function uploadFolder(
 
     await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000 })
 
-    const { execSync } = await import("child_process")
-    
-    let tarOptions = ""
-    if (options?.skipSymlinks) {
-      tarOptions = "--no-recursion --ignore-failed-read"
-    } else if (options?.followSymlinks) {
-      tarOptions = "--dereference"
-    }
-    
-    execSync(
-      `tar -czf ${shellQuote(tmpFile)} ${tarOptions} -C ${shellQuote(localPath)} .`,
-      { timeout, maxBuffer: 10 * 1024 * 1024 },
+    let tarOptions: string[] = []
+    if (options?.skipSymlinks) tarOptions = ["--no-recursion", "--ignore-failed-read"]
+    else if (options?.followSymlinks) tarOptions = ["--dereference"]
+
+    const compress = await runTar(
+      ["-czf", tmpFile, ...tarOptions, "-C", localPath, "."],
+      { timeout, scope },
     )
+    if (compress.code !== 0) {
+      throw new Error(`Failed to compress ${localPath}: ${compress.stderr.trim()}`)
+    }
 
     const localStat = statSync(tmpFile)
     const archiveChecksum = await sha256File(tmpFile)
     log("transfer", `Compressed ${localPath} -> ${tmpFile} (${localStat.size} bytes)`)
+
+    // Validate archive members before shipping to the remote host, so a
+    // tar/OS quirk cannot produce a path that escapes on the remote.
+    const list = await runTarList(["-tzf", tmpFile], { timeout: 30000, scope })
+    if (list.code !== 0) {
+      throw new Error(`Failed to inspect archive members: ${list.stderr.trim()}`)
+    }
+    assertTarMembersWithin(list.members, finalRemotePath)
 
     uploadResult = await uploadFile(client, tmpFile, remoteTmp, {
       onProgress: options?.onProgress
@@ -980,54 +1101,27 @@ export async function uploadFolder(
     const duration = Date.now() - startTime
     log("transfer", `Folder upload complete: ${localPath} -> ${finalRemotePath} (${duration}ms)`)
     return {
-      success: true,
-      path: finalRemotePath,
-      finalPath: finalRemotePath,
-      requestedPath: remotePath,
-      sourcePath: localPath,
-      action: "uploaded",
-      targetType: "directory",
+      success: true, path: finalRemotePath, finalPath: finalRemotePath, requestedPath: remotePath,
+      sourcePath: localPath, action: "uploaded", targetType: "directory",
       overwriteStrategy: targetDecision.strategy,
       overwritten: targetDecision.existed && !targetDecision.renamed && !targetDecision.backupPath,
-      renamed: targetDecision.renamed,
-      backupPath: targetDecision.backupPath,
-      sourceBytes: localStat.size,
-      bytesTransferred: uploadResult.bytesTransferred ?? uploadResult.size,
+      renamed: targetDecision.renamed, backupPath: targetDecision.backupPath,
+      sourceBytes: localStat.size, bytesTransferred: uploadResult.bytesTransferred ?? uploadResult.size,
       checksum: { algorithm: "sha256", source: archiveChecksum },
       verification: { sizeMatched: (uploadResult.bytesTransferred ?? uploadResult.size) === localStat.size },
-      size: uploadResult.size,
-      duration,
+      size: uploadResult.size, duration,
     }
   } catch (err: any) {
     log("transfer", `Folder upload failed: ${err.message}`)
     return {
-      success: false,
-      path: targetDecision?.targetPath ?? remotePath,
-      finalPath: targetDecision?.targetPath ?? remotePath,
-      requestedPath: remotePath,
-      sourcePath: localPath,
-      action: "failed",
-      targetType: "directory",
+      success: false, path: targetDecision?.targetPath ?? remotePath,
+      finalPath: targetDecision?.targetPath ?? remotePath, requestedPath: remotePath,
+      sourcePath: localPath, action: "failed", targetType: "directory",
       overwriteStrategy: targetDecision?.strategy ?? options?.overwrite,
-      size: uploadResult?.size ?? 0,
-      duration: Date.now() - startTime,
-      error: err.message,
+      size: uploadResult?.size ?? 0, duration: Date.now() - startTime, error: err.message,
     }
   } finally {
-    // 清理本地临时文件
-    try {
-      const { unlinkSync } = await import("fs")
-      if (existsSync(tmpFile)) unlinkSync(tmpFile)
-    } catch {
-      // 忽略删除错误
-    }
-    
-    // 清理远程临时文件
-    try {
-      await remoteExec(client, `rm -f ${shellQuote(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
-    } catch {
-      // 忽略远程删除错误
-    }
+    await cleanupTransferScope(scope, client)
   }
 }
 
@@ -1047,6 +1141,9 @@ export async function downloadFolder(
   const folderName = basename(remotePath)
   const remoteTmp = `/tmp/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
+  const scope = createTransferScope()
+  scope.localTempFiles.push(tmpFile)
+  scope.remoteTempPaths.push(remoteTmp)
   const requestedExtractPath = join(localPath, folderName)
   let finalExtractPath = requestedExtractPath
   let downloadResult: TransferResult | null = null
@@ -1062,30 +1159,20 @@ export async function downloadFolder(
     finalExtractPath = targetDecision.targetPath
     if (!targetDecision.proceed) {
       return {
-        success: true,
-        path: localPath,
-        finalPath: finalExtractPath,
-        requestedPath: localPath,
-        sourcePath: remotePath,
-        action: "skipped",
-        targetType: "directory",
-        overwriteStrategy: targetDecision.strategy,
-        skipped: true,
-        size: 0,
+        success: true, path: localPath, finalPath: finalExtractPath, requestedPath: localPath,
+        sourcePath: remotePath, action: "skipped", targetType: "directory",
+        overwriteStrategy: targetDecision.strategy, skipped: true, size: 0,
         duration: Date.now() - startTime,
       }
     }
 
     const remoteParent = dirname(remotePath)
-    
-    let tarOptions = ""
-    if (options?.skipSymlinks) {
-      tarOptions = "--no-recursion --ignore-failed-read"
-    } else if (options?.followSymlinks) {
-      tarOptions = "--dereference"
-    }
-    
-    const compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
+
+    let tarOptions: string[] = []
+    if (options?.skipSymlinks) tarOptions = ["--no-recursion", "--ignore-failed-read"]
+    else if (options?.followSymlinks) tarOptions = ["--dereference"]
+
+    const compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
     await remoteExec(client, compressCmd, { timeout })
 
     const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000 })
@@ -1100,68 +1187,48 @@ export async function downloadFolder(
     })
     const archiveChecksum = await sha256File(tmpFile)
 
+    // Validate archive members before extracting locally.
+    const list = await runTarList(["-tzf", tmpFile], { timeout: 30000, scope })
+    if (list.code !== 0) {
+      throw new Error(`Failed to inspect archive members: ${list.stderr.trim()}`)
+    }
+    assertTarMembersWithin(list.members, finalExtractPath)
+
     if (!existsSync(finalExtractPath)) {
       mkdirSync(finalExtractPath, { recursive: true })
     }
-    const { execSync } = await import("child_process")
-    execSync(
-      `tar -xzf ${shellQuote(tmpFile)} -C ${shellQuote(finalExtractPath)} --strip-components=1`,
-      { timeout, maxBuffer: 10 * 1024 * 1024 },
+    const extract = await runTar(
+      ["-xzf", tmpFile, "-C", finalExtractPath, "--strip-components=1"],
+      { timeout, scope },
     )
+    if (extract.code !== 0) {
+      throw new Error(`Failed to extract ${tmpFile}: ${extract.stderr.trim()}`)
+    }
 
     const duration = Date.now() - startTime
     log("transfer", `Folder download complete: ${remotePath} -> ${finalExtractPath} (${duration}ms)`)
     return {
-      success: true,
-      path: localPath,
-      finalPath: finalExtractPath,
-      requestedPath: localPath,
-      sourcePath: remotePath,
-      action: "downloaded",
-      targetType: "directory",
+      success: true, path: localPath, finalPath: finalExtractPath, requestedPath: localPath,
+      sourcePath: remotePath, action: "downloaded", targetType: "directory",
       overwriteStrategy: targetDecision.strategy,
       overwritten: targetDecision.existed && !targetDecision.renamed && !targetDecision.backupPath,
-      renamed: targetDecision.renamed,
-      backupPath: targetDecision.backupPath,
-      sourceBytes: remoteSize,
-      bytesTransferred: downloadResult.size,
+      renamed: targetDecision.renamed, backupPath: targetDecision.backupPath,
+      sourceBytes: remoteSize, bytesTransferred: downloadResult.size,
       checksum: { algorithm: "sha256", destination: archiveChecksum },
       verification: { sizeMatched: downloadResult.size === remoteSize },
-      size: downloadResult.size,
-      duration,
+      size: downloadResult.size, duration,
     }
   } catch (err: any) {
     log("transfer", `Folder download failed: ${err.message}`)
     return {
-      success: false,
-      path: localPath,
-      finalPath: finalExtractPath,
-      requestedPath: localPath,
-      sourcePath: remotePath,
-      action: "failed",
-      targetType: "directory",
+      success: false, path: localPath, finalPath: finalExtractPath, requestedPath: localPath,
+      sourcePath: remotePath, action: "failed", targetType: "directory",
       overwriteStrategy: targetDecision?.strategy ?? options?.overwrite,
-      renamed: targetDecision?.renamed,
-      backupPath: targetDecision?.backupPath,
-      size: downloadResult?.size ?? 0,
-      duration: Date.now() - startTime,
-      error: err.message,
+      renamed: targetDecision?.renamed, backupPath: targetDecision?.backupPath,
+      size: downloadResult?.size ?? 0, duration: Date.now() - startTime, error: err.message,
     }
   } finally {
-    // 清理本地临时文件
-    try {
-      const { unlinkSync } = await import("fs")
-      if (existsSync(tmpFile)) unlinkSync(tmpFile)
-    } catch {
-      // 忽略删除错误
-    }
-    
-    // 清理远程临时文件
-    try {
-      await remoteExec(client, `rm -f ${shellQuote(remoteTmp)}`, { timeout: 10000 }).catch(() => {})
-    } catch {
-      // 忽略远程删除错误
-    }
+    await cleanupTransferScope(scope, client)
   }
 }
 
