@@ -127,7 +127,7 @@ describe("remoteExec", () => {
     )
   })
 
-  it("should prepend cd to command when cwd is set", async () => {
+  it("wraps cwd commands with an external sh so shell builtins are valid", async () => {
     let receivedCmd = ""
     const client = createMockClient((cmd, cb) => {
       receivedCmd = cmd
@@ -137,13 +137,8 @@ describe("remoteExec", () => {
     })
 
     await remoteExec(client, "ls", { cwd: "/tmp" })
-    // The full wrapped command is `echo "SSH_TOOL_PID:$$" >&2; exec cd '<cwd>' && <cmd>`,
-    // so we assert the cwd prefix appears somewhere inside the payload rather
-    // than at offset 0 (the PID marker wrapper always precedes it).
-    assert.ok(
-      receivedCmd.includes("cd '/tmp' &&"),
-      `expected cwd prefix in wrapped command, got: ${receivedCmd}`,
-    )
+    assert.match(receivedCmd, /exec sh -c/)
+    assert.match(receivedCmd, /cd .*\/tmp.*&& ls/)
   })
 
   it("should prepend env vars to command", async () => {
@@ -156,7 +151,9 @@ describe("remoteExec", () => {
     })
 
     await remoteExec(client, "ls", { env: { FOO: "bar" } })
-    assert.ok(receivedCmd.includes("export FOO='bar'"))
+    assert.match(receivedCmd, /exec sh -c/)
+    assert.ok(receivedCmd.includes("export FOO"))
+    assert.ok(receivedCmd.includes("bar"))
     assert.ok(receivedCmd.includes("ls"))
   })
 

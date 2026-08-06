@@ -53,6 +53,6 @@ describe("daemon scheduled streaming runner", () => {
       { stdout: "stdout-1\n", stderr: "" },
       { stdout: "", stderr: "stderr-1\n" },
     ])
-    assert.ok(client.executed[0].includes("exec npm test"))
+    assert.ok(client.executed[0].includes("exec sh -c"))
   })
 })

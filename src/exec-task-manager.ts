@@ -300,7 +300,7 @@ export class ExecTaskManager {
         onClose: (code: number, signal?: string) => void,
         onError: (err: Error) => void,
       ): void => {
-        const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${fullCommand}`
+        const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(fullCommand)}`
         try {
           client.exec(wrappedCommand, (err, openedStream) => {
             if (err) {

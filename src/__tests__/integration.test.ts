@@ -287,9 +287,11 @@ function createTestServer(opts?: {
 
 function defaultExecHandler(command: string): { stdout: string; stderr: string; code: number } {
   // Strip wrappers that remoteExec/ExecTaskManager add before the actual command.
-  const stripped = command
-    .replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
-    .replace(/^cd\s+"[^"]*"\s*&&\s*/, "")
+  const wrapped = command.match(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+sh\s+-c\s+'([\s\S]*)'$/)
+  const stripped = (wrapped
+    ? wrapped[1].replace(/'\\''/g, "'")
+    : command.replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, ""))
+    .replace(/^cd\s+["']?[^&]+["']?\s*&&\s*/, "")
   if (stripped === "echo hello") return { stdout: "hello\n", stderr: "", code: 0 }
   if (stripped === "echo test123") return { stdout: "test123\n", stderr: "", code: 0 }
   if (stripped === "whoami") return { stdout: "testuser\n", stderr: "", code: 0 }

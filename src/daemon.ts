@@ -72,7 +72,7 @@ export function execScheduledStream(
   onPid?: (pid: number) => void,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
   return new Promise((resolve, reject) => {
-    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec ${command}`
+    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(command)}`
     let pid: number | null = null
     let pidCaptured = false
     let settled = false

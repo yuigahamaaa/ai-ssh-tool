@@ -63,7 +63,10 @@ function createTestServer(opts?: {
           session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
               const stream = acceptExec()
               stream.on("error", () => {})
-              const command = String(info?.command ?? "").replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
+              const rawCommand = String(info?.command ?? "")
+              const wrapped = rawCommand.match(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+sh\s+-c\s+'([\s\S]*)'$/)
+              const command = (wrapped ? wrapped[1].replace(/'\\''/g, "'") : rawCommand.replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, ""))
+                .replace(/^cd\s+['"]?[^&]+['"]?\s*&&\s*/, "")
               if (command.startsWith("echo ")) stream.write(`${command.slice(5)}\n`)
               else stream.write("ok\n")
               stream.exit(0)
