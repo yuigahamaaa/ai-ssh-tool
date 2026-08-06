@@ -205,6 +205,41 @@ describe("Port Forwarding - Local Forward", () => {
     })
   })
 
+  describe("idempotent stop and drain", () => {
+    it("coalesces concurrent stop calls into one close", async () => {
+      const manager = new PortForwardManager(conn.getFinalClient())
+      const fwd = await manager.localForward("127.0.0.1", 0, "127.0.0.1", 22)
+      // Instrument the underlying server so we can assert close() runs once.
+      const entry = (manager as any).forwards.get(fwd.id)
+      const server = entry.server
+      const origClose = server.close.bind(server)
+      let closeCalls = 0
+      server.close = (...args: unknown[]) => {
+        closeCalls++
+        return origClose(...args)
+      }
+      const results = await Promise.all([manager.stop(fwd.id), manager.stop(fwd.id)])
+      assert.deepEqual(results, [true, true])
+      assert.equal(closeCalls, 1, "the underlying server should be closed exactly once")
+      assert.equal(manager.get(fwd.id), null)
+      // Second stop of a removed forward is a no-op returning false.
+      assert.equal(await manager.stop(fwd.id), false)
+    })
+
+    it("drains active connections when the SSH client disconnects", async () => {
+      const manager = new PortForwardManager(conn.getFinalClient())
+      await manager.localForward("127.0.0.1", 0, "127.0.0.1", 22)
+      let destroyed = 0
+      const fakeConn = { destroy: () => { destroyed++ } }
+      // Seed an in-flight connection the same way a live socket would be
+      // registered, then lose the client and expect the drain to destroy it.
+      ;(manager as any).activeConnections.add(fakeConn)
+      ;(manager as any).handleClientDisconnect()
+      assert.equal(destroyed, 1)
+      assert.equal((manager as any).activeConnections.size, 0)
+    })
+  })
+
   describe("stopAll", () => {
     it("stops all forwards", async () => {
       const manager = new PortForwardManager(conn.getFinalClient())

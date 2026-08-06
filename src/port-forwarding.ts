@@ -44,6 +44,11 @@ interface RemoteRoute {
   forward: PortForward
 }
 
+/** A live tunneled connection that can be force-destroyed on client loss. */
+interface ActiveConnection {
+  destroy: () => void
+}
+
 export class PortForwardManager {
   private forwards = new Map<string, ActiveLocalForward | ActiveRemoteForward>()
   private client: Client
@@ -55,6 +60,19 @@ export class PortForwardManager {
   // Set to true when the underlying SSH client has disconnected. Once set,
   // new forward creation is rejected and existing forwards are marked "error".
   private clientClosed = false
+  // Ids currently being torn down by stop(). Makes stop() idempotent under
+  // concurrent/repeated calls: a second stop for an in-flight id is a no-op.
+  private stoppingIds = new Set<string>()
+  // Every active tunneled socket (local + remote). Drained when the SSH
+  // client drops so no connection is left half-open.
+  private activeConnections = new Set<ActiveConnection>()
+
+  private drainAllConnections(): void {
+    for (const conn of this.activeConnections) {
+      try { conn.destroy() } catch { /* best-effort */ }
+    }
+    this.activeConnections.clear()
+  }
 
   constructor(client: Client) {
     this.client = client
@@ -77,6 +95,9 @@ export class PortForwardManager {
     if (this.clientClosed) return
     this.clientClosed = true
     log("portforward", `SSH client disconnected, stopping all forwards and marking as error`)
+    // Tear down any in-flight tunneled sockets first so pipes don't sit
+    // half-open once the client's channels are gone.
+    this.drainAllConnections()
     // Mark all forwards as error so list()/get() reflect real status instead of
     // pretending they are still "active".
     for (const entry of this.forwards.values()) {
@@ -110,6 +131,10 @@ export class PortForwardManager {
 
       const stream = accept()
       const localSocket = createConnection(route.localDstPort, route.localDstAddr)
+      const conn: ActiveConnection = {
+        destroy: () => { try { localSocket.destroy() } catch {}; try { stream.close() } catch {} },
+      }
+      this.activeConnections.add(conn)
 
       localSocket.on("connect", () => {
         stream.pipe(localSocket)
@@ -127,6 +152,7 @@ export class PortForwardManager {
       })
 
       stream.on("close", () => {
+        this.activeConnections.delete(conn)
         route.forward.connections--
         localSocket.destroy()
       })
@@ -170,6 +196,8 @@ export class PortForwardManager {
     const server = createServer((socket: Socket) => {
       forward.connections++
       log("fwd", `[${id}] New connection (total: ${forward.connections})`)
+      const conn: ActiveConnection = { destroy: () => { try { socket.destroy() } catch {} } }
+      this.activeConnections.add(conn)
 
       this.client.forwardOut(
         localBindAddr,
@@ -179,6 +207,7 @@ export class PortForwardManager {
         (err, stream) => {
           if (err) {
             log("fwd", `[${id}] forwardOut error: ${err.message}`)
+            this.activeConnections.delete(conn)
             socket.destroy()
             forward.connections--
             return
@@ -186,6 +215,15 @@ export class PortForwardManager {
 
           socket.pipe(stream)
           stream.pipe(socket)
+
+          // Count each connection exactly once: only the socket 'close' event
+          // releases it, and all failure paths funnel into that event.
+          const closeOnce = (): void => {
+            this.activeConnections.delete(conn)
+            forward.connections--
+            try { stream.close() } catch {}
+            log("fwd", `[${id}] Connection closed (remaining: ${forward.connections})`)
+          }
 
           socket.on("error", (socketErr: Error) => {
             log("fwd", `[${id}] Socket error: ${socketErr.message}`)
@@ -197,15 +235,8 @@ export class PortForwardManager {
             socket.destroy()
           })
 
-          socket.on("close", () => {
-            forward.connections--
-            try { stream.close() } catch {}
-            log("fwd", `[${id}] Connection closed (remaining: ${forward.connections})`)
-          })
-
-          stream.on("close", () => {
-            socket.destroy()
-          })
+          socket.on("close", closeOnce)
+          stream.on("close", () => { socket.destroy() })
         },
       )
     })
@@ -276,37 +307,52 @@ export class PortForwardManager {
   }
 
   /**
-   * Stop a port forward.
+   * Stop a port forward. Idempotent: concurrent or repeated calls for the
+   * same id collapse into one close, and stopping an already-removed id
+   * returns false.
    */
   async stop(id: string): Promise<boolean> {
     const entry = this.forwards.get(id)
     if (!entry) return false
+    if (this.stoppingIds.has(id)) return true
+    this.stoppingIds.add(id)
 
-    if (entry.forward.type === "local") {
-      const { server } = entry as ActiveLocalForward
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve())
-      })
-    } else {
-      const remoteEntry = entry as ActiveRemoteForward
-      // unforwardIn will throw if the underlying SSH client is already dead
-      // (e.g. after handleClientDisconnect fired). Guard it so stopAll() can
-      // complete cleanup without bubbling the error up.
-      try {
-        this.client.unforwardIn(entry.forward.bindAddr, entry.forward.bindPort, () => {})
-      } catch (e) {
-        log("portforward", `[${id}] unforwardIn failed (client likely disconnected): ${(e as Error).message}`)
+    try {
+      if (entry.forward.type === "local") {
+        const { server } = entry as ActiveLocalForward
+        await new Promise<void>((resolve) => {
+          try {
+            server.close(() => resolve())
+          } catch {
+            // server was never listening (e.g. start failed); release any
+            // lingering connections and treat the close as done.
+            try { (server as any).closeAllConnections?.() } catch { /* best-effort */ }
+            resolve()
+          }
+        })
+      } else {
+        const remoteEntry = entry as ActiveRemoteForward
+        // unforwardIn will throw if the underlying SSH client is already dead
+        // (e.g. after handleClientDisconnect fired). Guard it so stopAll() can
+        // complete cleanup without bubbling the error up.
+        try {
+          this.client.unforwardIn(entry.forward.bindAddr, entry.forward.bindPort, () => {})
+        } catch (e) {
+          log("portforward", `[${id}] unforwardIn failed (client likely disconnected): ${(e as Error).message}`)
+        }
+        if (remoteEntry.routeKey) {
+          this.remoteRoutes.delete(remoteEntry.routeKey)
+          this.unbindTcpConnection()
+        }
       }
-      if (remoteEntry.routeKey) {
-        this.remoteRoutes.delete(remoteEntry.routeKey)
-        this.unbindTcpConnection()
-      }
+
+      entry.forward.status = "stopped"
+      this.forwards.delete(id)
+      log("fwd", `[${id}] Forward stopped`)
+      return true
+    } finally {
+      this.stoppingIds.delete(id)
     }
-
-    entry.forward.status = "stopped"
-    this.forwards.delete(id)
-    log("fwd", `[${id}] Forward stopped`)
-    return true
   }
 
   /**
