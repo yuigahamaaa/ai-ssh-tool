@@ -64,6 +64,29 @@ const BACKGROUND_HANDLE_TIMEOUT_MS = 5 * 60 * 1000
  */
 const FULL_IPC_SAFE_LIMIT = 8 * 1024 * 1024
 
+/** IPC request lanes. Heavy resource users (exec/transfer/wait) are bounded
+ *  independently; light requests are never blocked by them. */
+type RequestLane = "light" | "exec" | "transfer" | "wait"
+
+interface DaemonResourceLimits {
+  maxInflightPerSocket: number
+  maxInflightExec: number
+  maxInflightTransfers: number
+  maxInflightWaits: number
+}
+
+const DEFAULT_DAEMON_RESOURCE_LIMITS: DaemonResourceLimits = {
+  maxInflightPerSocket: 16,
+  maxInflightExec: 4,
+  maxInflightTransfers: 2,
+  maxInflightWaits: 32,
+}
+
+interface SocketRequestState {
+  inflight: number
+  closed: boolean
+}
+
 export function execScheduledStream(
   client: Client,
   command: string,
@@ -151,11 +174,26 @@ export class SSHDaemon {
   private forwardManagers = new Map<string, PortForwardManager>()
   private scheduler: SchedulerService
   private stopping = false
+  private resourceLimits: DaemonResourceLimits
+  private socketRequestStates = new WeakMap<Socket, SocketRequestState>()
+  private inflightByLane: Record<RequestLane, number> = {
+    light: 0,
+    exec: 0,
+    transfer: 0,
+    wait: 0,
+  }
   private readonly signalShutdownHandler = () => { this.shutdown().catch((err) => log("daemon", `signal shutdown failed: ${err.message}`)) }
 
-  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService }) {
+  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService; resourceLimits?: Partial<DaemonResourceLimits> }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
     this.idleTimeoutMs = opts?.idleTimeoutMs ?? 10 * 60 * 1000 // 10 min default
+    this.resourceLimits = { ...DEFAULT_DAEMON_RESOURCE_LIMITS, ...opts?.resourceLimits }
+    for (const key of ["maxInflightPerSocket", "maxInflightExec", "maxInflightTransfers", "maxInflightWaits"] as const) {
+      const value = this.resourceLimits[key]
+      if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`Invalid daemon resource limit: ${key} must be a positive integer`)
+      }
+    }
     this.gateway = new SSHGateway({
       connectionTimeout: 15000,
       maxSessions: 50,
@@ -454,21 +492,75 @@ export class SSHDaemon {
     }
   }
 
+  private requestLane(req: IPCRequest): RequestLane {
+    if (req.action === "exec") return "exec"
+    if (req.action === "transfer") return "transfer"
+    if (req.action === "waitTask") return "wait"
+    return "light"
+  }
+
+  private laneLimit(lane: RequestLane): number {
+    switch (lane) {
+      case "exec": return this.resourceLimits.maxInflightExec
+      case "transfer": return this.resourceLimits.maxInflightTransfers
+      case "wait": return this.resourceLimits.maxInflightWaits
+      case "light": return Number.MAX_SAFE_INTEGER
+    }
+  }
+
+  /** Attempt to reserve capacity for one request. On success returns a
+   *  once-only release handle; on overload returns the client-visible error. */
+  private tryAcquireRequest(socket: Socket, req: IPCRequest): { release: () => void } | { error: string } {
+    const state = this.socketRequestStates.get(socket)
+    if (!state || state.closed) return { error: "RESOURCE_LIMIT_EXCEEDED: socket is closed" }
+    if (state.inflight >= this.resourceLimits.maxInflightPerSocket) {
+      return { error: "RESOURCE_LIMIT_EXCEEDED: too many concurrent socket requests; retry shortly" }
+    }
+    const lane = this.requestLane(req)
+    if (this.inflightByLane[lane] >= this.laneLimit(lane)) {
+      return { error: `RESOURCE_LIMIT_EXCEEDED: too many concurrent ${lane} requests; retry shortly` }
+    }
+    state.inflight++
+    this.inflightByLane[lane]++
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        state.inflight--
+        this.inflightByLane[lane]--
+      },
+    }
+  }
+
+  /** Write a response only when the socket is still open. Completed requests
+   *  for a socket the client already dropped are silently discarded; the
+   *  request's release() in its finally block still frees lane capacity. */
+  private writeResponse(socket: Socket, resp: IPCResponse): void {
+    const state = this.socketRequestStates.get(socket)
+    if (!state || state.closed || socket.destroyed) return
+    socket.write(encodeMessage(resp))
+  }
+
   private handleConnection(socket: Socket): void {
     this.sockets.add(socket)
+    this.socketRequestStates.set(socket, { inflight: 0, closed: false })
     const parser = new IPCMessageParser()
 
     socket.on("data", (data) => {
       try {
         parser.push(data, (msg) => {
-          this.handleRequest(socket, msg as IPCRequest).catch((err) => {
-            const resp: IPCResponse = {
-              id: (msg as IPCRequest).id,
-              ok: false,
-              error: err.message,
-            }
-            socket.write(encodeMessage(resp))
-          })
+          const req = msg as IPCRequest
+          const acquired = this.tryAcquireRequest(socket, req)
+          if ("error" in acquired) {
+            this.writeResponse(socket, { id: req.id, ok: false, error: acquired.error })
+            return
+          }
+          void this.handleRequest(socket, req)
+            .catch((err) => {
+              this.writeResponse(socket, { id: req.id, ok: false, error: err.message })
+            })
+            .finally(acquired.release)
         })
       } catch (err: any) {
         // maxRemainderBytes limit exceeded or other parse error.
@@ -479,7 +571,7 @@ export class SSHDaemon {
           ok: false,
           error: err.message,
         }
-        socket.write(encodeMessage(errorResp))
+        this.writeResponse(socket, errorResp)
         socket.destroy()
       }
     })
@@ -489,6 +581,8 @@ export class SSHDaemon {
     })
 
     socket.on("close", () => {
+      const state = this.socketRequestStates.get(socket)
+      if (state) state.closed = true
       this.sockets.delete(socket)
       parser.reset()
     })
@@ -543,7 +637,7 @@ export class SSHDaemon {
 
       case "shutdown":
         resp = { id: req.id, ok: true, data: { message: "shutting down" } }
-        socket.write(encodeMessage(resp))
+        this.writeResponse(socket, resp)
         await this.shutdown()
         return
 
@@ -607,7 +701,7 @@ export class SSHDaemon {
         resp = { id: (req as any).id ?? "", ok: false, error: `Unknown action: ${(req as any).action}` }
     }
 
-    socket.write(encodeMessage(resp))
+    this.writeResponse(socket, resp)
   }
 
   private async handleConnect(req: IPCRequest & { action: "connect" }): Promise<IPCResponse> {

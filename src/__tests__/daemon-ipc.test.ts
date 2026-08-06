@@ -9,6 +9,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import {
   encodeMessage,
   parseMessages,
@@ -17,6 +20,8 @@ import {
   createRequest,
 } from "../ipc-protocol.js";
 import type { IPCRequest, IPCResponse } from "../ipc-protocol.js";
+import { SSHDaemon } from "../daemon.js";
+import { DaemonClient } from "../daemon-client.js";
 
 describe("Daemon IPC Tests", () => {
   describe("encodeMessage", () => {
@@ -412,6 +417,193 @@ describe("Daemon IPC Tests", () => {
       }) as Extract<IPCRequest, { action: "disconnect" }>;
       assert.equal(req.action, "disconnect");
       assert.equal(req.params.sessionId, "s1");
+    });
+  });
+
+  describe("daemon resource limits", () => {
+    async function waitForResolvers(
+      resolvers: unknown[],
+      count: number,
+      timeoutMs = 2000,
+    ): Promise<void> {
+      const start = Date.now()
+      while (resolvers.length < count) {
+        if (Date.now() - start > timeoutMs) throw new Error("resolver was not registered in time")
+        await new Promise((r) => setTimeout(r, 5))
+      }
+    }
+
+    it("merges partial resource limit overrides with compatibility defaults", async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-limits-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({ pipePath, resourceLimits: { maxInflightExec: 1 } });
+
+      assert.deepEqual((daemon as any).resourceLimits, {
+        maxInflightPerSocket: 16,
+        maxInflightExec: 1,
+        maxInflightTransfers: 2,
+        maxInflightWaits: 32,
+      });
+
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("rejects a second exec on a saturated exec lane without blocking ping", async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-exec-lane-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({
+        pipePath,
+        resourceLimits: { maxInflightExec: 1 },
+      });
+      await daemon.start();
+
+      let execResolvers: { id: string; resolve: (resp: IPCResponse) => void }[] = [];
+      (daemon as any).handleExec = (req: IPCRequest) =>
+        new Promise<IPCResponse>((resolve) => execResolvers.push({ id: req.id, resolve }));
+
+      const client1 = new DaemonClient(pipePath);
+      await client1.connect();
+      const firstExec = client1.exec("s1", "cmd1");
+
+      // Exec lane is now saturated. A light request must still succeed.
+      const client2 = new DaemonClient(pipePath);
+      await client2.connect();
+      const ping = await client2.ping();
+      assert.equal(ping.ok, true);
+
+      // A second exec on another socket is rejected by the exec lane limit.
+      const secondExec = await client2.exec("s1", "cmd2");
+      assert.equal(secondExec.ok, false);
+      assert.match((secondExec as any).error, /^RESOURCE_LIMIT_EXCEEDED:.*exec/i);
+
+      // Releasing the in-flight exec frees the lane for the next request.
+      execResolvers[0].resolve({ id: execResolvers[0].id, ok: true, data: {} });
+      await firstExec;
+
+      const thirdExecPromise = client2.exec("s1", "cmd3");
+      await waitForResolvers(execResolvers, 2);
+      execResolvers[1].resolve({ id: execResolvers[1].id, ok: true, data: {} });
+      const thirdExec = await thirdExecPromise;
+      assert.equal(thirdExec.ok, true);
+
+      client1.disconnect();
+      client2.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("rejects requests beyond the per-socket limit and recovers after completion", async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-socket-limit-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({
+        pipePath,
+        resourceLimits: { maxInflightPerSocket: 1, maxInflightExec: 1 },
+      });
+      await daemon.start();
+
+      let execResolvers: { id: string; resolve: (resp: IPCResponse) => void }[] = [];
+      (daemon as any).handleExec = (req: IPCRequest) =>
+        new Promise<IPCResponse>((resolve) => execResolvers.push({ id: req.id, resolve }));
+
+      const client = new DaemonClient(pipePath);
+      await client.connect();
+
+      const first = client.exec("s1", "cmd1");
+      const second = await client.exec("s1", "cmd2");
+      assert.equal(second.ok, false);
+      assert.match((second as any).error, /^RESOURCE_LIMIT_EXCEEDED:.*socket/i);
+
+      execResolvers[0].resolve({ id: execResolvers[0].id, ok: true, data: {} });
+      await first;
+
+      const thirdPromise = client.exec("s1", "cmd3");
+      await waitForResolvers(execResolvers, 2);
+      execResolvers[1].resolve({ id: execResolvers[1].id, ok: true, data: {} });
+      const third = await thirdPromise;
+      assert.equal(third.ok, true);
+
+      client.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("keeps the wait lane independently bounded", async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-wait-lane-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({
+        pipePath,
+        resourceLimits: { maxInflightWaits: 1 },
+      });
+      await daemon.start();
+
+      let waitResolvers: { id: string; resolve: (resp: IPCResponse) => void }[] = [];
+      (daemon as any).handleWaitTask = (req: IPCRequest) =>
+        new Promise<IPCResponse>((resolve) => waitResolvers.push({ id: req.id, resolve }));
+
+      const client1 = new DaemonClient(pipePath);
+      await client1.connect();
+      const first = client1.waitTask("t1");
+
+      const client2 = new DaemonClient(pipePath);
+      await client2.connect();
+      const second = await client2.waitTask("t2");
+      assert.equal(second.ok, false);
+      assert.match((second as any).error, /^RESOURCE_LIMIT_EXCEEDED:.*wait/i);
+
+      waitResolvers[0].resolve({ id: waitResolvers[0].id, ok: true, data: {} });
+      await first;
+
+      const thirdPromise = client2.waitTask("t3");
+      await waitForResolvers(waitResolvers, 2);
+      waitResolvers[1].resolve({ id: waitResolvers[1].id, ok: true, data: {} });
+      const third = await thirdPromise;
+      assert.equal(third.ok, true);
+
+      client1.disconnect();
+      client2.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("does not leak lane capacity after a disconnected socket", async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-close-race-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({
+        pipePath,
+        resourceLimits: { maxInflightExec: 1 },
+      });
+      await daemon.start();
+
+      let execResolvers: { id: string; resolve: (resp: IPCResponse) => void }[] = [];
+      (daemon as any).handleExec = (req: IPCRequest) =>
+        new Promise<IPCResponse>((resolve) => execResolvers.push({ id: req.id, resolve }));
+
+      const client1 = new DaemonClient(pipePath);
+      await client1.connect();
+      const first = client1.exec("s1", "cmd1");
+      // Give the request time to reach the daemon before dropping the client.
+      await new Promise((r) => setTimeout(r, 50));
+      client1.disconnect();
+
+      // A fresh client can still acquire the exec lane once the in-flight
+      // request releases its count in its finally block. The original client
+      // is gone, so its response is discarded and its promise rejects with
+      // "IPC client disposed" — the lane release must still have happened.
+      execResolvers[0].resolve({ id: execResolvers[0].id, ok: true, data: {} });
+      await first.catch(() => {});
+
+      const client2 = new DaemonClient(pipePath);
+      await client2.connect();
+      const nextPromise = client2.exec("s1", "cmd2");
+      await waitForResolvers(execResolvers, 2);
+      execResolvers[1].resolve({ id: execResolvers[1].id, ok: true, data: {} });
+      const next = await nextPromise;
+      assert.equal(next.ok, true);
+
+      client2.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
     });
   });
 });
