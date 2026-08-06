@@ -242,4 +242,33 @@ describe("IPCSocket", () => {
       ipc.dispose();
     });
   });
+
+  describe("degraded full output size", () => {
+    it("keeps degraded full output responses below the IPC frame cap", () => {
+      const resp = {
+        id: "r-degraded",
+        ok: true as const,
+        data: {
+          stdout: "TAIL_STDOUT",
+          stderr: "TAIL_STDERR",
+          stdoutBytes: 8 * 1024 * 1024 + 1,
+          stderrBytes: 0,
+          stdoutPath: "/tmp/task.stdout",
+          stderrPath: "/tmp/task.stderr",
+          outputFiles: { stdout: "/tmp/task.stdout", stderr: "/tmp/task.stderr" },
+          truncated: true,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          stdoutFileTruncated: false,
+          stderrFileTruncated: false,
+          fullTruncated: true,
+          fullOutputUnavailableOverIpc: true,
+          message:
+            "Output (8388609 bytes) exceeds the IPC-safe limit (8388608 bytes). Use the on-disk stdoutPath/stderrPath files to read the full output.",
+        },
+      };
+      const encoded = encodeMessage(resp);
+      assert.ok(Buffer.byteLength(encoded) < 16 * 1024 * 1024);
+    });
+  });
 });

@@ -36,7 +36,7 @@ import {
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
-import type { AgentIdentity, HostIdentity, ScheduleRequest } from "./scheduler/types.js"
+import type { AgentIdentity, HostIdentity, ScheduleRequest, TaskOutputResult } from "./scheduler/types.js"
 import { shellQuote } from "./shell-quote.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 
@@ -1090,30 +1090,36 @@ export class SSHDaemon {
     }
   }
 
+  private getIpcSafeTaskOutput(
+    taskId: string,
+    mode: string | undefined,
+  ): TaskOutputResult & { fullTruncated?: boolean; fullOutputUnavailableOverIpc?: boolean; message?: string } {
+    const requestedMode = mode ?? "tail"
+    if (requestedMode !== "full") {
+      return this.scheduler.getTaskOutput(taskId, requestedMode as "tail" | "full")
+    }
+    // IPC frames are capped at 16MB (IPCMessageParser). A "full" read of
+    // a large output would blow that cap AND allocate several copies of
+    // the payload (file Buffer → string → JSON → socket → parse). Probe
+    // the real byte counts first and fall back to a bounded tail when the
+    // output is too large, pointing the caller at the on-disk paths.
+    const preview = this.scheduler.getTaskOutput(taskId, "tail")
+    const totalBytes = (preview.stdoutBytes ?? 0) + (preview.stderrBytes ?? 0)
+    if (totalBytes <= FULL_IPC_SAFE_LIMIT) {
+      return this.scheduler.getTaskOutput(taskId, "full")
+    }
+    return {
+      ...preview,
+      truncated: true,
+      fullTruncated: true,
+      fullOutputUnavailableOverIpc: true,
+      message: `Output (${totalBytes} bytes) exceeds the IPC-safe limit (${FULL_IPC_SAFE_LIMIT} bytes). Use the on-disk stdoutPath/stderrPath files to read the full output.`,
+    }
+  }
+
   private handleGetTaskOutput(req: { id: string; params: { taskId: string; mode?: string } }): IPCResponse {
     try {
-      const mode = req.params.mode ?? "tail"
-      if (mode === "full") {
-        // IPC frames are capped at 16MB (IPCMessageParser). A "full" read of
-        // a large output would blow that cap AND allocate several copies of
-        // the payload (file Buffer → string → JSON → socket → parse). Probe
-        // the real byte counts first and fall back to a bounded tail when the
-        // output is too large, pointing the caller at the on-disk paths.
-        const preview = this.scheduler.getTaskOutput(req.params.taskId, "tail")
-        const totalBytes = (preview.stdoutBytes ?? 0) + (preview.stderrBytes ?? 0)
-        if (totalBytes > FULL_IPC_SAFE_LIMIT) {
-          return {
-            id: req.id,
-            ok: true,
-            data: {
-              ...preview,
-              fullTruncated: true,
-              message: `Output (${totalBytes} bytes) exceeds the IPC-safe limit (${FULL_IPC_SAFE_LIMIT} bytes). Use the on-disk stdoutPath/stderrPath files to read the full output.`,
-            },
-          }
-        }
-      }
-      const result = this.scheduler.getTaskOutput(req.params.taskId, mode as any)
+      const result = this.getIpcSafeTaskOutput(req.params.taskId, req.params.mode)
       return { id: req.id, ok: true, data: result }
     } catch (err: any) {
       return { id: req.id, ok: false, error: err.message }
@@ -1254,7 +1260,7 @@ export class SSHDaemon {
         }
         case "output": {
           if (!taskId) return { id: req.id, ok: false, error: "taskId is required" }
-          const output = this.scheduler.getTaskOutput(taskId, "full")
+          const output = this.getIpcSafeTaskOutput(taskId, "full")
           return { id: req.id, ok: true, data: output }
         }
         case "cancel": {

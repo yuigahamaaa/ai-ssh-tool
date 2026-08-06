@@ -606,4 +606,101 @@ describe("Daemon IPC Tests", () => {
       rmSync(tmp, { recursive: true, force: true });
     });
   });
+
+  describe("daemon full output IPC safety", () => {
+    function makeOutputStub(tailStdoutBytes = 64) {
+      const calls: string[] = [];
+      const getTaskOutput = (taskId: string, mode: "tail" | "full" = "tail") => {
+        calls.push(mode);
+        const preview = {
+          stdout: "TAIL_STDOUT",
+          stderr: "TAIL_STDERR",
+          stdoutBytes: tailStdoutBytes,
+          stderrBytes: 0,
+          stdoutPath: "/tmp/task.stdout",
+          stderrPath: "/tmp/task.stderr",
+          outputFiles: { stdout: "/tmp/task.stdout", stderr: "/tmp/task.stderr" },
+          truncated: true,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          stdoutFileTruncated: false,
+          stderrFileTruncated: false,
+        };
+        if (mode === "full") {
+          return { ...preview, stdout: "FULL_STDOUT", truncated: false };
+        }
+        return preview;
+      };
+      return { stub: { getTaskOutput } as any, calls };
+    }
+
+    it("returns full output intact when it stays within the IPC-safe limit", async () => {
+      const { stub, calls } = makeOutputStub();
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-full-small-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({ pipePath, scheduler: stub });
+      await daemon.start();
+      const client = new DaemonClient(pipePath);
+      await client.connect();
+
+      const resp = await client.getTaskOutput("t1", "full");
+      assert.equal(resp.ok, true);
+      const data = resp.data as any;
+      assert.equal(data.stdout, "FULL_STDOUT");
+      assert.equal(data.fullTruncated, undefined);
+      assert.equal(data.fullOutputUnavailableOverIpc, undefined);
+      assert.deepEqual(calls, ["tail", "full"]);
+
+      client.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("degrades an oversized full output to a bounded tail with file paths", async () => {
+      const { stub, calls } = makeOutputStub(8 * 1024 * 1024 + 1);
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-full-large-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({ pipePath, scheduler: stub });
+      await daemon.start();
+      const client = new DaemonClient(pipePath);
+      await client.connect();
+
+      const resp = await client.getTaskOutput("t1", "full");
+      assert.equal(resp.ok, true);
+      const data = resp.data as any;
+      assert.equal(data.fullTruncated, true);
+      assert.equal(data.fullOutputUnavailableOverIpc, true);
+      assert.equal(data.stdout, "TAIL_STDOUT");
+      assert.ok(data.message.includes("IPC-safe limit"));
+      assert.ok(!calls.includes("full"));
+
+      client.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("applies the same degradation to the bgExec output subcommand", async () => {
+      const { stub, calls } = makeOutputStub(8 * 1024 * 1024 + 1);
+      const tmp = mkdtempSync(join(tmpdir(), "daemon-bg-full-"));
+      const pipePath = join(tmp, "daemon.sock");
+      const daemon = new SSHDaemon({ pipePath, scheduler: stub });
+      await daemon.start();
+      const client = new DaemonClient(pipePath);
+      await client.connect();
+
+      const resp = await client.send(
+        createRequest("bgExec", { sessionId: "s1", subcommand: "output", taskId: "t1" }),
+      );
+      assert.equal(resp.ok, true);
+      const data = resp.data as any;
+      assert.equal(data.fullTruncated, true);
+      assert.equal(data.fullOutputUnavailableOverIpc, true);
+      assert.equal(data.stdout, "TAIL_STDOUT");
+      assert.ok(!calls.includes("full"));
+
+      client.disconnect();
+      await daemon.shutdown().catch(() => {});
+      rmSync(tmp, { recursive: true, force: true });
+    });
+  });
 });
