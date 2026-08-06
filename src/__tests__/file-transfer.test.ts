@@ -26,6 +26,19 @@ function unquoteShellSingle(value: string): string {
   return value.slice(1, -1).replace(/'\\''/g, "'")
 }
 
+/**
+ * exec-task-manager wraps every exec as:
+ *   echo "SSH_TOOL_PID:$$" >&2; exec sh -c '<shellQuoted command>'
+ * Undo the wrapper so command matchers below see the original command.
+ */
+function unwrapExecCommand(raw: string): string {
+  const prefix = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c `
+  if (!raw.startsWith(prefix)) return raw
+  const quoted = raw.slice(prefix.length)
+  if (!quoted.startsWith("'") || !quoted.endsWith("'")) return raw
+  return quoted.slice(1, -1).replace(/'\\''/g, "'")
+}
+
 function createTestServer(): Promise<{
   server: InstanceType<typeof Server>
   port: number
@@ -59,7 +72,8 @@ function createTestServer(): Promise<{
               stream.write(testResult.stderr)
               remoteExecResults.delete("test")
             } else if (typeof info?.command === "string") {
-              const existsMatch = info.command.match(/test -e ('(?:'\\''|[^'])*'|"(?:\\.|[^"])*") && echo "YES" \|\| echo "NO"/)
+              const command = unwrapExecCommand(info.command)
+              const existsMatch = command.match(/test -e ('(?:'\\''|[^'])*'|"(?:\\.|[^"])*") && echo "YES" \|\| echo "NO"/)
               if (existsMatch) {
                 const remotePath = existsMatch[1].startsWith("'")
                   ? unquoteShellSingle(existsMatch[1])
