@@ -195,6 +195,28 @@ export function checkBlockedPath(path: string, policy?: SecurityPolicy): void {
 }
 
 /**
+ * Literal blocked-path check plus a canonical re-check via SFTP realpath so
+ * symlink-based bypasses (`/tmp/link-to-etc-shadow`) are caught too. When no
+ * blockedPaths rule is configured (or no policy at all) this is a no-op that
+ * never opens an SFTP channel, preserving existing behaviour.
+ */
+export async function assertRemotePathAllowedWithSymlinkCheck(
+  client: Client,
+  path: string,
+  policy?: SecurityPolicy,
+): Promise<void> {
+  checkBlockedPath(path, policy)
+  if (!policy?.blockedPaths || policy.blockedPaths.length === 0) return
+  const fs = await createRemoteFs(client)
+  try {
+    const canonical = await fs.realPath(path)
+    if (canonical && canonical !== path) checkBlockedPath(canonical, policy)
+  } finally {
+    fs.close()
+  }
+}
+
+/**
  * Create tool implementations for a remote SSH session.
  * These mirror opencode's built-in tools but operate on the remote host.
  */

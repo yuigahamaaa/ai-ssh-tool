@@ -1,6 +1,9 @@
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
 import ssh2 from "ssh2"
+import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
 import { SSHConnection } from "../connection.js"
 import { remoteExec } from "../remote-shell.js"
 import { getGlobalTaskManager } from "../exec-task-manager.js"
@@ -9,7 +12,7 @@ import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
 
 import { createStableEd25519KeyPair } from "./ssh-test-key.js"
-import { buildCwdGuidance } from "../mcp-server.js"
+import { buildCwdGuidance, assertLocalPathSafeForTransfer } from "../mcp-server.js"
 
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
@@ -289,6 +292,30 @@ describe("MCP Server Tool Integration", () => {
     it("returns no guidance when a virtual cwd exists", () => {
       const guidance = buildCwdGuidance("/workspace/project")
       assert.deepEqual(guidance, [])
+    })
+  })
+
+  describe("assertLocalPathSafeForTransfer", () => {
+    let symlinkDir: string
+    before(() => { symlinkDir = mkdtempSync(join(tmpdir(), "mcp-symlink-")) })
+    after(() => { try { rmSync(symlinkDir, { recursive: true, force: true }) } catch {} })
+
+    it("allows a regular file path", () => {
+      const file = join(symlinkDir, "real.txt")
+      writeFileSync(file, "x")
+      assert.doesNotThrow(() => assertLocalPathSafeForTransfer(file, "upload"))
+    })
+
+    it("allows a missing destination path", () => {
+      assert.doesNotThrow(() => assertLocalPathSafeForTransfer(join(symlinkDir, "new.txt"), "download"))
+    })
+
+    it("rejects a symbolic link root", () => {
+      const target = join(symlinkDir, "secret.txt")
+      const link = join(symlinkDir, "link.txt")
+      writeFileSync(target, "secret")
+      symlinkSync(target, link)
+      assert.throws(() => assertLocalPathSafeForTransfer(link, "upload"), /symbolic link/)
     })
   })
 })

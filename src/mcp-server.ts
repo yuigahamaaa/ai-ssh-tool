@@ -18,7 +18,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
-import { readFileSync } from "fs"
+import { lstatSync, readFileSync } from "fs"
 import { resolve } from "path"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
@@ -52,7 +52,7 @@ import {
   handleMcpStat,
 } from "./mcp-file-tools.js"
 import { CommandRegistryStore, type CommandExecutionMode } from "./command-registry.js"
-import { checkBlockedPath, checkReadOnly, validateCommand } from "./remote-tools.js"
+import { assertRemotePathAllowedWithSymlinkCheck, checkBlockedPath, checkReadOnly, validateCommand } from "./remote-tools.js"
 
 interface HostConfig {
   host: string
@@ -161,6 +161,26 @@ export function buildCwdGuidance(virtualCwd: string | null | undefined): string[
   return virtualCwd
     ? []
     : ["当前 host 上未查询到默认 cwd：可能尚未调用过 ssh_cd，或 MCP server 重启导致会话身份变化（虚拟 cwd 按 AI 会话隔离）。需要时重新调用 ssh_cd 设置。"]
+}
+
+/**
+ * Reject local transfer roots that are symbolic links. Without this, an
+ * upload would follow the link and ship the linked file's contents to the
+ * remote host, and a download would follow the link and overwrite the
+ * linked target — both letting a pre-planted symlink redirect the transfer.
+ * Missing paths are allowed (a download destination that does not exist
+ * yet, or an upload source that will error naturally). Only the MCP layer
+ * enforces this; CLI transfers keep their existing behaviour.
+ */
+export function assertLocalPathSafeForTransfer(localPath: string, operation: string): void {
+  try {
+    if (lstatSync(localPath).isSymbolicLink()) {
+      throw new Error(`${operation} local path is a symbolic link: ${localPath}. Use the real path, or set skip_symlinks to skip symlinks instead.`)
+    }
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return
+    throw err
+  }
 }
 
 async function main() {
@@ -865,9 +885,10 @@ async function main() {
     },
     wrapTool("ssh_read_file", async ({ path, offset, limit, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        handleMcpReadFile({ client, remoteExec, path, offset, limit }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return handleMcpReadFile({ client, remoteExec, path, offset, limit })
+      })
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -887,6 +908,7 @@ async function main() {
       assertWriteAllowed("write file")
       assertPathAllowed(path)
       const outcome = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
         const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
         await remoteExec(client, dirCmd, { timeout: 10000 })
         const b64 = Buffer.from(content).toString("base64")
@@ -918,9 +940,10 @@ async function main() {
     },
     wrapTool("ssh_list_dir", async ({ path, show_hidden, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        handleMcpListDir({ client, remoteExec, path, showHidden: Boolean(show_hidden) }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return handleMcpListDir({ client, remoteExec, path, showHidden: Boolean(show_hidden) })
+      })
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -936,9 +959,10 @@ async function main() {
     },
     wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
+      })
       const exists = result.stdout.trim() === "exists"
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, exists, raw: result.stdout.trim() })) }] }
     },
@@ -955,9 +979,10 @@ async function main() {
     },
     wrapTool("ssh_stat", async ({ path, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        handleMcpStat({ client, remoteExec, path }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return handleMcpStat({ client, remoteExec, path })
+      })
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -976,9 +1001,10 @@ async function main() {
     },
     wrapTool("ssh_grep", async ({ pattern, path, glob, case_insensitive, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        handleMcpGrep({ client, remoteExec, pattern, path, glob, caseInsensitive: Boolean(case_insensitive) }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return handleMcpGrep({ client, remoteExec, pattern, path, glob, caseInsensitive: Boolean(case_insensitive) })
+      })
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -997,9 +1023,10 @@ async function main() {
     },
     wrapTool("ssh_find", async ({ path, name, type, max_depth, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        handleMcpFind({ client, remoteExec, path, name, type, maxDepth: max_depth }),
-      )
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
+        return handleMcpFind({ client, remoteExec, path, name, type, maxDepth: max_depth })
+      })
       return { content: [{ type: "text" as const, text: jsonText(result) }] }
     },
   ))
@@ -1024,16 +1051,18 @@ async function main() {
     wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
       assertWriteAllowed("upload")
       assertPathAllowed(remote_path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        upload(client, local_path, remote_path, {
+      if (!skip_symlinks) assertLocalPathSafeForTransfer(local_path, "upload")
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, remote_path, policy ?? undefined)
+        return upload(client, local_path, remote_path, {
           compressionLevel: compression_level,
           overwrite: overwrite as any,
           skipSymlinks: skip_symlinks,
           lineEnding: line_ending as any,
           encoding: encoding as any,
           sourceEncoding: source_encoding as any,
-        }),
-      )
+        })
+      })
       return {
         content: [{
           type: "text" as const,
@@ -1061,16 +1090,18 @@ async function main() {
     },
     wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(remote_path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, (client) =>
-        download(client, remote_path, local_path, {
+      assertLocalPathSafeForTransfer(local_path, "download")
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+        await assertRemotePathAllowedWithSymlinkCheck(client, remote_path, policy ?? undefined)
+        return download(client, remote_path, local_path, {
           compressionLevel: compression_level,
           overwrite: overwrite as any,
           skipSymlinks: skip_symlinks,
           lineEnding: line_ending as any,
           encoding: encoding as any,
           sourceEncoding: source_encoding as any,
-        }),
-      )
+        })
+      })
       return {
         content: [{
           type: "text" as const,

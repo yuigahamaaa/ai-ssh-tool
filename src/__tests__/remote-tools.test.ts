@@ -20,12 +20,14 @@ import { MAX_READ_FILE_BYTES } from "../remote-file-tools.js"
 const testDataDir = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
 const origDataDir = process.env.SSH_TOOL_DATA_DIR
 let createRemoteTools: typeof import("../remote-tools.js").createRemoteTools
+let assertRemotePathAllowedWithSymlinkCheck: typeof import("../remote-tools.js").assertRemotePathAllowedWithSymlinkCheck
 
 before(async () => {
   mkdirSync(testDataDir, { recursive: true })
   process.env.SSH_TOOL_DATA_DIR = testDataDir
   const mod = await import(`../remote-tools.js?t=${Date.now()}`)
   createRemoteTools = mod.createRemoteTools
+  assertRemotePathAllowedWithSymlinkCheck = mod.assertRemotePathAllowedWithSymlinkCheck
 })
 
 after(() => {
@@ -682,5 +684,50 @@ describe("RemoteTools", () => {
       tools.dispose()
       assert.equal(sftp.end.mock.callCount(), 1)
     })
+  })
+})
+
+describe("assertRemotePathAllowedWithSymlinkCheck", () => {
+  it("skips the symlink re-check when no policy is set", async () => {
+    const sftp = createMockSftp()
+    const client = createMockClient({ sftp })
+    await assertRemotePathAllowedWithSymlinkCheck(client, "/tmp/x", undefined)
+    assert.equal(sftp.realpath.mock.callCount(), 0)
+  })
+
+  it("rejects a literal blocked path before resolving", async () => {
+    const client = createMockClient()
+    await assert.rejects(
+      assertRemotePathAllowedWithSymlinkCheck(client, "/etc/shadow", { blockedPaths: ["/etc/shadow"] }),
+      /blocked by security policy/,
+    )
+  })
+
+  it("rejects a symlink that resolves to a blocked path", async () => {
+    const sftp = createMockSftp()
+    sftp.realpath = mock.fn((_p: string, cb: Function) => cb(null, "/etc/shadow"))
+    const client = createMockClient({ sftp })
+    await assert.rejects(
+      assertRemotePathAllowedWithSymlinkCheck(client, "/tmp/link-to-shadow", { blockedPaths: ["/etc/shadow"] }),
+      /blocked by security policy/,
+    )
+  })
+
+  it("allows a symlink that resolves outside the blocked list", async () => {
+    const sftp = createMockSftp()
+    sftp.realpath = mock.fn((_p: string, cb: Function) => cb(null, "/var/log/app.log"))
+    const client = createMockClient({ sftp })
+    await assert.doesNotReject(
+      assertRemotePathAllowedWithSymlinkCheck(client, "/tmp/link", { blockedPaths: ["/etc/shadow"] }),
+    )
+  })
+
+  it("closes the SFTP channel after re-checking", async () => {
+    const sftp = createMockSftp()
+    let closed = false
+    sftp.end = () => { closed = true }
+    const client = createMockClient({ sftp })
+    await assertRemotePathAllowedWithSymlinkCheck(client, "/tmp/x", { blockedPaths: ["/etc/shadow"] })
+    assert.equal(closed, true)
   })
 })
