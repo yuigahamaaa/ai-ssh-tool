@@ -456,7 +456,10 @@ function runTar(args: string[], opts: { timeout: number; scope: TransferScope })
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
-      if (killTimer) clearTimeout(killTimer)
+      // Only cancel the SIGKILL backstop once the child has actually exited
+      // (close/error path). On the timeout path (code 124) the child may still
+      // be alive and needs the 500ms SIGKILL follow-up.
+      if (code !== 124 && killTimer) clearTimeout(killTimer)
       opts.scope.childProcs.delete(child)
       resolve({ code, stderr })
     }
@@ -490,7 +493,10 @@ function runTarList(args: string[], opts: { timeout: number; scope: TransferScop
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
-      if (killTimer) clearTimeout(killTimer)
+      // Only cancel the SIGKILL backstop once the child has actually exited
+      // (close/error path). On the timeout path (code 124) the child may still
+      // be alive and needs the 500ms SIGKILL follow-up.
+      if (code !== 124 && killTimer) clearTimeout(killTimer)
       opts.scope.childProcs.delete(child)
       resolve({ code, stderr, members: stdout.split("\n").filter((l) => l.trim() !== "") })
     }

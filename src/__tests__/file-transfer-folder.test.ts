@@ -94,4 +94,26 @@ describe("uploadFolder async tar", () => {
     )
     rmSync(tmp, { recursive: true, force: true })
   })
+
+  it("keeps the SIGKILL backstop alive after a timeout (TERM then KILL)", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "ft-folder-"))
+    const { spawn, children } = makeMockSpawn()
+    setTarSpawn(spawn as any)
+    try {
+      await uploadFolder(makeMockClient(), tmp, "/remote/dir", { timeout: 50 })
+    } finally {
+      setTarSpawn(null)
+    }
+    rmSync(tmp, { recursive: true, force: true })
+
+    // The mock child never exits, so the timeout path must (1) SIGTERM first,
+    // then (2) still fire the 500ms SIGKILL follow-up even though the promise
+    // already settled with code 124.
+    const child = children[0]
+    assert.ok(child, "a tar child must have been spawned")
+    assert.equal(child.kill.mock.calls[0]?.arguments[0], "SIGTERM")
+    await new Promise((r) => setTimeout(r, 650))
+    const signals = child.kill.mock.calls.map((c: any) => c.arguments[0])
+    assert.ok(signals.includes("SIGKILL"), `expected a SIGKILL follow-up, got: ${signals.join(",")}`)
+  })
 })
