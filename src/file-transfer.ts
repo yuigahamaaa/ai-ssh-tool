@@ -450,19 +450,26 @@ function runTar(args: string[], opts: { timeout: number; scope: TransferScope })
     let stderr = ""
     child.stderr?.on("data", (d: Buffer) => { stderr += d.toString() })
     let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let killTimer: ReturnType<typeof setTimeout> | null = null
     const finish = (code: number): void => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       opts.scope.childProcs.delete(child)
       resolve({ code, stderr })
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       try { child.kill("SIGTERM") } catch { /* best-effort */ }
-      setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
+      killTimer = setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
       finish(124)
     }, opts.timeout)
-    child.on("error", () => finish(1))
+    child.on("error", (err: Error) => {
+      // stderr is often empty when the binary is missing; keep the OS error.
+      if (!stderr) stderr = err.message
+      finish(1)
+    })
     child.on("close", (code: number | null) => finish(code ?? 1))
   })
 }
@@ -477,19 +484,26 @@ function runTarList(args: string[], opts: { timeout: number; scope: TransferScop
     child.stdout?.on("data", (d: Buffer) => { stdout += d.toString() })
     child.stderr?.on("data", (d: Buffer) => { stderr += d.toString() })
     let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let killTimer: ReturnType<typeof setTimeout> | null = null
     const finish = (code: number): void => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       opts.scope.childProcs.delete(child)
       resolve({ code, stderr, members: stdout.split("\n").filter((l) => l.trim() !== "") })
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       try { child.kill("SIGTERM") } catch { /* best-effort */ }
-      setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
+      killTimer = setTimeout(() => { try { child.kill("SIGKILL") } catch { /* best-effort */ } }, 500)
       finish(124)
     }, opts.timeout)
-    child.on("error", () => finish(1))
+    child.on("error", (err: Error) => {
+      // stderr is often empty when the binary is missing; keep the OS error.
+      if (!stderr) stderr = err.message
+      finish(1)
+    })
     child.on("close", (code: number | null) => finish(code ?? 1))
   })
 }
