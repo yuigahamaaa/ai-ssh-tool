@@ -10,11 +10,11 @@ import {
   readdirSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from "fs"
 import { join, relative, resolve } from "path"
 import type { TaskOutputFiles, TaskOutputResult } from "./types.js"
-import { getSchedulerOutputsDir, ensureDir } from "../paths.js"
+import { getSchedulerOutputsDir } from "../paths.js"
+import { log } from "../logger.js"
 
 export const OUTPUT_TAIL_LIMIT = 64 * 1024
 export const DEFAULT_OUTPUT_RETURN_LIMIT = 16 * 1024
@@ -50,6 +50,17 @@ export interface OutputCleanupResult {
   keptFiles: number
 }
 
+/**
+ * Per-task queued output awaiting a coalesced disk flush. The flush timer
+ * batches all appends within `flushIntervalMs` into a single write so a
+ * chatty task does not burn one syscall per chunk.
+ */
+interface PendingWrites {
+  stdoutQueue: string[]
+  stderrQueue: string[]
+  flushTimer: NodeJS.Timeout | null
+}
+
 function safeTaskId(taskId: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(taskId)) {
     throw new Error(`Invalid task id for output path: ${taskId}`)
@@ -79,11 +90,14 @@ function bufferToString(buf: Buffer): string {
 export class OutputStore {
   private baseDir: string
   private maxOutputFileSize: number
+  private flushIntervalMs: number
   private inMemory = new Map<string, OutputEntry>()
+  private pending = new Map<string, PendingWrites>()
 
-  constructor(baseDir?: string, opts?: { maxOutputFileSize?: number }) {
+  constructor(baseDir?: string, opts?: { maxOutputFileSize?: number; flushIntervalMs?: number }) {
     this.baseDir = resolve(baseDir ?? getSchedulerOutputsDir())
     this.maxOutputFileSize = opts?.maxOutputFileSize ?? DEFAULT_MAX_OUTPUT_FILE_SIZE
+    this.flushIntervalMs = opts?.flushIntervalMs ?? 100
     if (!existsSync(this.baseDir)) {
       mkdirSync(this.baseDir, { recursive: true, mode: 0o700 })
     }
@@ -124,18 +138,69 @@ export class OutputStore {
     const entry = this.ensureEntry(taskId)
     entry.stdoutTail = appendTail(entry.stdoutTail, data)
     entry.stdoutBytes += Buffer.byteLength(data)
-    this.appendWithinLimit(entry.stdoutPath, data, entry.stdoutBytes, (truncated) => {
-      entry.stdoutFileTruncated = truncated
-    })
+    this.enqueue(taskId, "stdout", data)
   }
 
   appendStderr(taskId: string, data: string): void {
     const entry = this.ensureEntry(taskId)
     entry.stderrTail = appendTail(entry.stderrTail, data)
     entry.stderrBytes += Buffer.byteLength(data)
-    this.appendWithinLimit(entry.stderrPath, data, entry.stderrBytes, (truncated) => {
-      entry.stderrFileTruncated = truncated
-    })
+    this.enqueue(taskId, "stderr", data)
+  }
+
+  /** Immediately persist pending output for one task. Idempotent. */
+  flush(taskId: string): void {
+    const p = this.pending.get(taskId)
+    if (!p) return
+    this.pending.delete(taskId)
+    if (p.flushTimer) { clearTimeout(p.flushTimer); p.flushTimer = null }
+    const paths = this.getPaths(taskId)
+    this.flushQueue(paths.stdout, p.stdoutQueue)
+    this.flushQueue(paths.stderr, p.stderrQueue)
+  }
+
+  /** Persist all pending output (call from shutdown/cleanup paths). */
+  flushAll(): void {
+    for (const taskId of Array.from(this.pending.keys())) {
+      this.flush(taskId)
+    }
+  }
+
+  /**
+   * Write one queued buffer to disk, respecting maxOutputFileSize. Appends in
+   * 'a' mode so the first write also creates the file (matching the previous
+   * lazy-create behaviour); a full file silently drops further bytes.
+   */
+  private flushQueue(path: string, queue: string[]): void {
+    if (queue.length === 0) return
+    const buf = Buffer.concat(queue.map((d) => Buffer.from(d, "utf8")))
+    const cap = this.maxOutputFileSize
+    const existing = existsSync(path) ? statSync(path).size : 0
+    const remaining = cap - existing
+    if (remaining <= 0) return
+    try {
+      appendFileSync(path, buf.subarray(0, remaining), { mode: 0o600 })
+    } catch (err) {
+      log("scheduler", `Output flush failed for ${path}: ${(err as Error).message}`)
+    }
+  }
+
+  /** Queue data and arm the coalescing timer for this task. */
+  private enqueue(taskId: string, stream: "stdout" | "stderr", data: string): void {
+    let p = this.pending.get(taskId)
+    if (!p) {
+      p = { stdoutQueue: [], stderrQueue: [], flushTimer: null }
+      this.pending.set(taskId, p)
+    }
+    const queue = stream === "stdout" ? p.stdoutQueue : p.stderrQueue
+    queue.push(data)
+    if (!p.flushTimer) {
+      p.flushTimer = setTimeout(() => {
+        p.flushTimer = null
+        this.flush(taskId)
+      }, this.flushIntervalMs)
+      if (typeof (p.flushTimer as any).unref === "function") (p.flushTimer as any).unref()
+    }
   }
 
   get(taskId: string): OutputEntry | undefined {
@@ -158,9 +223,13 @@ export class OutputStore {
     // missing (e.g. daemon restart with no in-memory state).
     const stdoutBytes = entry?.stdoutBytes ?? this.sizeOf(paths.stdout)
     const stderrBytes = entry?.stderrBytes ?? this.sizeOf(paths.stderr)
-    const stdoutFileTruncated = entry?.stdoutFileTruncated ?? false
-    const stderrFileTruncated = entry?.stderrFileTruncated ?? false
+    const stdoutFileTruncated = (entry?.stdoutFileTruncated ?? false) || (stdoutBytes > this.maxOutputFileSize)
+    const stderrFileTruncated = (entry?.stderrFileTruncated ?? false) || (stderrBytes > this.maxOutputFileSize)
 
+    if (mode === "full") {
+      // A full read must include bytes still sitting in the coalescing queue.
+      this.flush(taskId)
+    }
     let stdout = mode === "full"
       ? this.getFullStdout(taskId)
       : (entry ? bufferToString(entry.stdoutTail) : this.readFileTail(paths.stdout, returnLimit))
@@ -196,6 +265,7 @@ export class OutputStore {
   }
 
   remove(taskId: string): void {
+    this.flush(taskId)
     this.inMemory.delete(taskId)
     const paths = this.getPaths(taskId)
     this.safeUnlink(paths.stdout)
@@ -203,6 +273,9 @@ export class OutputStore {
   }
 
   cleanup(policy: OutputCleanupPolicy = {}, protectedTaskIds: Iterable<string> = []): OutputCleanupResult {
+    // Persist everything first so retention decisions see the real file sizes
+    // and so unflushed output is not stranded after files are deleted.
+    this.flushAll()
     const retentionMs = policy.retentionMs ?? DEFAULT_RETENTION_DAYS * 24 * 60 * 60 * 1000
     const maxTotalBytes = policy.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES
     const keepRecentTasks = policy.keepRecentTasks ?? DEFAULT_KEEP_RECENT_TASKS
@@ -271,33 +344,6 @@ export class OutputStore {
     if (existing) return existing
     this.create(taskId)
     return this.inMemory.get(taskId)!
-  }
-
-  private appendWithinLimit(path: string, data: string, logicalBytes: number, setTruncated: (value: boolean) => void): void {
-    if (logicalBytes <= this.maxOutputFileSize) {
-      // Lazy-create the file on the first append. After that, appendFileSync
-      // is the cheap path. Doing a stat here is far cheaper than always
-      // pre-creating an empty file for tasks that never produce output.
-      if (existsSync(path)) {
-        appendFileSync(path, data)
-      } else {
-        writeFileSync(path, data, { mode: 0o600 })
-      }
-      return
-    }
-
-    const previousBytes = logicalBytes - Buffer.byteLength(data)
-    if (previousBytes < this.maxOutputFileSize) {
-      const remaining = this.maxOutputFileSize - previousBytes
-      if (remaining > 0) {
-        if (existsSync(path)) {
-          appendFileSync(path, Buffer.from(data).subarray(0, remaining))
-        } else {
-          writeFileSync(path, Buffer.from(data).subarray(0, remaining), { mode: 0o600 })
-        }
-      }
-    }
-    setTruncated(true)
   }
 
   private loadEntryFromDisk(taskId: string): OutputEntry | undefined {

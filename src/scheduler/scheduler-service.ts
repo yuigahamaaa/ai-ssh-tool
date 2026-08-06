@@ -172,6 +172,9 @@ export class SchedulerService {
     // so no data is lost on shutdown.
     this.eventLog.flushSync()
     if (typeof this.persistence.flushSync === "function") this.persistence.flushSync()
+    // Flush any scheduler-output bytes still in the coalescing queue so a
+    // shutdown never strands task output that was appended but not yet written.
+    this.outputStore.flushAll()
   }
 
   /**

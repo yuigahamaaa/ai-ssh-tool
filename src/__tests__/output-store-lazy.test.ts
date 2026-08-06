@@ -2,8 +2,9 @@
  * OutputStore lazy file-creation tests
  *
  * The store no longer creates empty stdout/stderr files up front in
- * `create()`. Files are only created on the first append. This avoids
- * two useless syscalls + 0-byte file artefacts for tasks that finish
+ * `create()`. Files are only created when output is first flushed to disk
+ * (the coalescing window batches writes; `flush()` forces them out). This
+ * avoids two useless syscalls + 0-byte file artefacts for tasks that finish
  * without writing anything.
  */
 
@@ -38,6 +39,7 @@ describe("OutputStore lazy file creation", () => {
     const store = new OutputStore(testDir)
     store.create("lazy-2")
     store.appendStdout("lazy-2", "hello\n")
+    store.flush("lazy-2")
     const paths = store.getPaths("lazy-2")
     assert.equal(existsSync(paths.stdout), true)
     assert.equal(existsSync(paths.stderr), false, "stderr should remain absent until used")
@@ -48,16 +50,18 @@ describe("OutputStore lazy file creation", () => {
     const store = new OutputStore(testDir)
     store.create("lazy-3")
     store.appendStderr("lazy-3", "warn\n")
+    store.flush("lazy-3")
     const paths = store.getPaths("lazy-3")
     assert.equal(existsSync(paths.stdout), false)
     assert.equal(existsSync(paths.stderr), true)
   })
 
-  it("subsequent appends use appendFileSync, not writeFileSync", () => {
+  it("subsequent appends accumulate in a single file", () => {
     const store = new OutputStore(testDir)
     store.create("lazy-4")
     store.appendStdout("lazy-4", "first\n")
     store.appendStdout("lazy-4", "second\n")
+    store.flush("lazy-4")
     const paths = store.getPaths("lazy-4")
     assert.equal(readFileSync(paths.stdout, "utf8"), "first\nsecond\n")
   })

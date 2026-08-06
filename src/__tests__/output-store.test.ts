@@ -30,6 +30,12 @@ describe("OutputStore", () => {
     store.appendStdout("task-1", "hello\n")
     store.appendStderr("task-1", "error\n")
 
+    // Writes are coalesced: nothing on disk until an explicit flush.
+    assert.ok(!existsSync(join(testDir, "task-1.stdout")))
+    assert.ok(!existsSync(join(testDir, "task-1.stderr")))
+
+    store.flush("task-1")
+
     assert.ok(existsSync(join(testDir, "task-1.stdout")))
     assert.ok(existsSync(join(testDir, "task-1.stderr")))
   })
@@ -51,7 +57,8 @@ describe("OutputStore", () => {
     const store = new OutputStore(testDir)
     store.create("task-1")
     store.appendStdout("task-1", "hello\n")
-    
+    store.flush("task-1")
+
     const content = readFileSync(join(testDir, "task-1.stdout"), "utf8")
     assert.equal(content, "hello\n")
   })
@@ -60,7 +67,8 @@ describe("OutputStore", () => {
     const store = new OutputStore(testDir)
     store.create("task-1")
     store.appendStdout("task-1", "hello world\n")
-    
+    store.flush("task-1")
+
     const full = store.getFullStdout("task-1")
     assert.equal(full, "hello world\n")
   })
@@ -147,6 +155,9 @@ describe("OutputStore", () => {
     store.create("protected-task")
     store.appendStdout("protected-task", "keep")
     store.appendStderr("protected-task", "")
+    // Materialize the files so utimesSync below can adjust their mtimes.
+    store.flush("old-task")
+    store.flush("protected-task")
 
     const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000)
     utimesSync(join(testDir, "old-task.stdout"), oldDate, oldDate)
