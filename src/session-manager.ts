@@ -26,6 +26,11 @@ export class SSHSessionManager extends EventEmitter {
 
   private sessionsByProfile = new Map<string, string>()
 
+  /** In-flight connect promises keyed by config hash. Concurrent connect
+   *  requests for the same config share one underlying SSH connection
+   *  instead of racing to create duplicate sessions. */
+  private pendingConnects = new Map<string, Promise<SSHSession>>()
+
   private maxSessions: number
   private defaultTerminalSize: TerminalSize
 
@@ -80,12 +85,29 @@ export class SSHSessionManager extends EventEmitter {
     return result
   }
 
+  /** Remove a session entry from both indexes. With configHash, only that
+   *  specific mapping is removed; without it, any profile mapping pointing
+   *  at the session id is cleaned up. */
+  private removeSessionEntry(sessionId: string, configHash?: string): void {
+    this.sessions.delete(sessionId)
+    if (configHash) {
+      if (this.sessionsByProfile.get(configHash) === sessionId) {
+        this.sessionsByProfile.delete(configHash)
+      }
+      return
+    }
+    for (const [hash, id] of this.sessionsByProfile) {
+      if (id === sessionId) {
+        this.sessionsByProfile.delete(hash)
+        return
+      }
+    }
+  }
+
   /** Create and connect a new SSH session */
   async connect(opts: ConnectionOptions): Promise<SSHSession> {
-    // Quota counts ACTIVE sessions (connecting/connected) only. Error
-    // sessions are kept for diagnostics but must not consume the limit —
-    // otherwise a burst of failed connects (auth errors, unreachable hosts)
-    // would fill the quota and block healthy connections too.
+    // Quota counts ACTIVE sessions (connecting/connected) only. Failed
+    // attempts are cleaned up immediately, so they never consume the limit.
     if (this.getActiveSessionCount() >= this.maxSessions) {
       log("sm", `Max sessions (${this.maxSessions}) reached, rejecting`)
       throw new Error(`Maximum concurrent sessions (${this.maxSessions}) reached`)
@@ -104,8 +126,29 @@ export class SSHSessionManager extends EventEmitter {
         log("sm", `Reusing existing session ${existingSession.id.slice(0, 8)} for config ${configHash}`)
         return existingSession
       }
+      const pending = this.pendingConnects.get(configHash)
+      if (pending) {
+        log("sm", `Waiting on in-flight connect for config ${configHash}`)
+        return pending
+      }
     }
 
+    const creation = this.createSession(opts, configHash)
+    if (opts.reuseSession === false) {
+      return creation
+    }
+
+    this.pendingConnects.set(configHash, creation)
+    try {
+      return await creation
+    } finally {
+      if (this.pendingConnects.get(configHash) === creation) {
+        this.pendingConnects.delete(configHash)
+      }
+    }
+  }
+
+  private async createSession(opts: ConnectionOptions, configHash: string): Promise<SSHSession> {
     const id = randomUUID()
     log("sm", `Creating session ${id.slice(0, 8)}, chain: ${opts.chain.map(h => h.host).join(" -> ")}`)
     const chainNames = opts.chain.map((h) => h.host)
@@ -125,7 +168,9 @@ export class SSHSessionManager extends EventEmitter {
     const connection = new SSHConnection()
     const entry: { connection: SSHConnection; session: SSHSession; listeners: ConnectionEventListener[] } = { connection, session, listeners: [] }
     this.sessions.set(id, entry)
-    this.sessionsByProfile.set(configHash, id)
+    if (opts.reuseSession !== false) {
+      this.sessionsByProfile.set(configHash, id)
+    }
 
     // Forward connection events
     connection.on("event", (event: ConnectionEvent) => {
@@ -154,8 +199,14 @@ export class SSHSessionManager extends EventEmitter {
         sessionId: id,
       })
     } catch (err: any) {
-      entry.session.status = "error"
-      entry.session.error = err.message
+      // Best-effort teardown of any partially established hops, then remove
+      // the session from both indexes so failed attempts never accumulate.
+      try {
+        await connection.disconnect()
+      } catch {
+        // cleanup is best effort; preserve the original connection error
+      }
+      this.removeSessionEntry(id, configHash)
       throw err
     }
 
@@ -169,14 +220,7 @@ export class SSHSessionManager extends EventEmitter {
     log("sm", `Disconnecting session ${sessionId.slice(0, 8)}`)
     await entry.connection.disconnect()
     entry.session.status = "closed"
-    this.sessions.delete(sessionId)
-
-    for (const [hash, id] of this.sessionsByProfile) {
-      if (id === sessionId) {
-        this.sessionsByProfile.delete(hash)
-        break
-      }
-    }
+    this.removeSessionEntry(sessionId)
 
     log("sm", `Session ${sessionId.slice(0, 8)} disconnected and removed`)
   }
@@ -193,6 +237,8 @@ export class SSHSessionManager extends EventEmitter {
     }
     await Promise.allSettled(promises)
     this.sessions.clear()
+    this.sessionsByProfile.clear()
+    this.pendingConnects.clear()
   }
 
   /** Send data to a session's remote shell */

@@ -94,33 +94,19 @@ describe("SSHSessionManager", () => {
       )
     })
 
-    it("should create session before connection attempt (on valid chain)", async () => {
-      // connect will fail (no real SSH server), but session should be created
+    it("removes a failed connection attempt from session indexes", async () => {
       await connectExpectingFailure(manager, makeChain(["local"]), "test")
 
-      // Session should exist (in error state)
-      assert.equal(manager.sessionCount, 1)
-      const sessions = manager.listSessions()
-      assert.equal(sessions.length, 1)
-      assert.equal(sessions[0].name, "test")
-      assert.equal(sessions[0].status, "error")
+      assert.equal(manager.sessionCount, 0)
+      assert.deepEqual(manager.listSessions(), [])
     })
 
-    it("should use chain summary as default name", async () => {
-      await connectExpectingFailure(manager, makeChain(["gw1", "target1"]))
-
-      const sessions = manager.listSessions()
-      assert.equal(sessions[0].name, "gw1 -> target1")
-      assert.equal(sessions[0].chainSummary, "gw1 -> target1")
-      assert.equal(sessions[0].hops, 1) // 2 hosts = 1 hop
-    })
-
-    it("should track multiple sessions", async () => {
+    it("does not retain failed connections", async () => {
       await connectExpectingFailure(manager, makeChain(["host1"]))
       await connectExpectingFailure(manager, makeChain(["host2"]))
       await connectExpectingFailure(manager, makeChain(["host3"]))
 
-      assert.equal(manager.sessionCount, 3)
+      assert.equal(manager.sessionCount, 0)
     })
   })
 
@@ -137,8 +123,8 @@ describe("SSHSessionManager", () => {
           },
         )
       }
-      // Error sessions are still recorded for diagnostics.
-      assert.equal(manager.sessionCount, 6)
+      // Failed connections are cleaned up, so nothing accumulates.
+      assert.equal(manager.sessionCount, 0)
     })
 
     it("should enforce limit even with empty chain", async () => {
@@ -150,82 +136,16 @@ describe("SSHSessionManager", () => {
     })
   })
 
-  describe("getSession", () => {
-    it("should return session by ID after connect attempt", async () => {
-      let sessionId: string | undefined
-      try {
-        const session = await manager.connect({ chain: makeChain(["host1"]), name: "test", timeout: 25 })
-        sessionId = session.id
-      } catch {
-        // Get the session ID from the list
-        sessionId = manager.listSessions()[0]?.id
-      }
-
-      assert.ok(sessionId)
-      const found = manager.getSession(sessionId!)
-      assert.ok(found)
-      assert.equal(found!.name, "test")
-    })
-  })
-
-  describe("hasSession", () => {
-    it("should return true for existing session", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      const id = manager.listSessions()[0].id
-      assert.equal(manager.hasSession(id), true)
-    })
-
-    it("should return false for nonexistent session", () => {
-      assert.equal(manager.hasSession("nonexistent"), false)
-    })
-  })
-
-  describe("getLastActivity", () => {
-    it("should return timestamp for existing session", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      const id = manager.listSessions()[0].id
-      const lastActivity = manager.getLastActivity(id)
-      assert.ok(lastActivity)
-      assert.ok(lastActivity! > 0)
-    })
-  })
-
-  describe("getConnection", () => {
-    it("should return connection for existing session", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      const id = manager.listSessions()[0].id
-      const conn = manager.getConnection(id)
-      assert.ok(conn)
-    })
-  })
-
   describe("getSessionsByStatus", () => {
-    it("should filter sessions by error status (failed connections)", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      await connectExpectingFailure(manager, makeChain(["host2"]))
-
-      const errorSessions = manager.getSessionsByStatus("error")
-      assert.equal(errorSessions.length, 2)
-    })
-
     it("should return empty for status with no sessions", async () => {
       await connectExpectingFailure(manager, makeChain(["host1"]))
       assert.deepEqual(manager.getSessionsByStatus("connected"), [])
       assert.deepEqual(manager.getSessionsByStatus("closed"), [])
+      assert.deepEqual(manager.getSessionsByStatus("error"), [])
     })
   })
 
   describe("disconnect", () => {
-    it("should remove session", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      const id = manager.listSessions()[0].id
-      assert.equal(manager.sessionCount, 1)
-
-      await manager.disconnect(id)
-      assert.equal(manager.sessionCount, 0)
-      assert.equal(manager.hasSession(id), false)
-    })
-
     it("should reject disconnecting nonexistent session", async () => {
       await assert.rejects(
         () => manager.disconnect("nonexistent"),
@@ -235,15 +155,6 @@ describe("SSHSessionManager", () => {
   })
 
   describe("disconnectAll", () => {
-    it("should remove all sessions", async () => {
-      await connectExpectingFailure(manager, makeChain(["host1"]))
-      await connectExpectingFailure(manager, makeChain(["host2"]))
-      assert.equal(manager.sessionCount, 2)
-
-      await manager.disconnectAll()
-      assert.equal(manager.sessionCount, 0)
-    })
-
     it("should handle empty session list", async () => {
       await manager.disconnectAll()
       assert.equal(manager.sessionCount, 0)
@@ -257,45 +168,21 @@ describe("SSHSessionManager", () => {
 
       await connectExpectingFailure(manager, makeChain(["host1"]))
 
-      // Should have at least the error event (connection failed)
+      // Connection failures still emit their event even though the session
+      // entry is cleaned up afterwards.
       assert.ok(events.length > 0)
       assert.ok(events.some((e) => e.type === "error" || e.type === "connecting"))
     })
   })
 
-  describe("config hash preserves hop order", () => {
-    it("A->B->target and B->A->target produce different hashes", async () => {
-      const chainAB = makeChain(["hostA", "hostB", "target"])
-      const chainBA = makeChain(["hostB", "hostA", "target"])
-
-      let session1: SSHSession | undefined
-      let session2: SSHSession | undefined
-      try { session1 = await manager.connect({ chain: chainAB, timeout: 25 }) } catch {}
-      // We need a new manager to avoid session reuse
-      const manager2 = new SSHSessionManager({ maxSessions: 5 })
-      try { session2 = await manager2.connect({ chain: chainBA, timeout: 25 }) } catch {}
-
-      // Both should create sessions (not reuse each other)
-      assert.equal(manager.sessionCount, 1)
-      assert.equal(manager2.sessionCount, 1)
-
-      const id1 = manager.listSessions()[0].id
-      const id2 = manager2.listSessions()[0].id
-      assert.notEqual(id1, id2)
-    })
-
-    it("same chain produces same hash (session reuse)", async () => {
-      const chain = makeChain(["gw1", "target1"])
+  describe("retry after failure", () => {
+    it("allows retrying the same configuration after a failed connection", async () => {
+      const chain = makeChain(["retry-host"])
 
       await connectExpectingFailure(manager, chain)
-      const s1 = manager.listSessions()[0]
-
-      // Connect again with same chain - should reuse (but session is in error state, so it creates new)
       await connectExpectingFailure(manager, chain)
-      const sessions = manager.listSessions()
 
-      // Even if error, the config hash logic should be tested
-      assert.ok(sessions.length >= 1)
+      assert.equal(manager.sessionCount, 0)
     })
   })
 })

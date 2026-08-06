@@ -24,12 +24,15 @@ function createTestServer(): Promise<{
   server: InstanceType<typeof Server>;
   port: number;
   hostConfig: Omit<SSHHostConfig, "id">;
+  acceptedConnections: () => number;
   cleanup: () => Promise<void>;
 }> {
   return new Promise((resolve, reject) => {
+    let acceptedConnections = 0
     const server = new Server(
       { hostKeys: [hostKey.private] },
       (client: any) => {
+        acceptedConnections++
         client.on("authentication", (ctx: any) => {
           if (ctx.method === "password" && ctx.password === "testpass") {
             ctx.accept();
@@ -69,6 +72,7 @@ function createTestServer(): Promise<{
           port: addr.port,
           auth: { username: "testuser", password: "testpass" },
         },
+        acceptedConnections: () => acceptedConnections,
         cleanup: () =>
           new Promise<void>((res) => {
             server.close(() => setTimeout(res, 50));
@@ -189,12 +193,66 @@ describe("Session Reuse Tests", () => {
         // expected: wrong credentials cannot connect
       }
 
-      assert.equal(manager.listSessions().length, 2, "credential change must not reuse the previous session");
+      // The failed attempt is cleaned up, so only the original session remains.
+      assert.equal(manager.listSessions().length, 1, "credential change must not reuse the previous session");
 
       await manager.disconnect(s1.id);
-      for (const s of manager.getSessionsByStatus("error")) {
-        await manager.disconnect(s.id).catch(() => {});
-      }
+    });
+
+    it("shares one underlying connection for concurrent connects with the same config", async () => {
+      const manager = new SSHSessionManager({ maxSessions: 5 });
+      const before = srv.acceptedConnections();
+
+      const [first, second] = await Promise.all([
+        manager.connect({ chain: [{ id: "p1", ...srv.hostConfig }], timeout: 10000 }),
+        manager.connect({ chain: [{ id: "p2", ...srv.hostConfig }], timeout: 10000 }),
+      ]);
+
+      assert.equal(first.id, second.id, "concurrent identical configs should share one session");
+      assert.equal(srv.acceptedConnections() - before, 1, "only one TCP connection should be established");
+
+      await manager.disconnect(first.id);
+    });
+
+    it("creates an independent connection when reuseSession is false", async () => {
+      const manager = new SSHSessionManager({ maxSessions: 5 });
+      const before = srv.acceptedConnections();
+
+      const first = await manager.connect({
+        chain: [{ id: "r1", ...srv.hostConfig }],
+        timeout: 10000,
+      });
+      const second = await manager.connect({
+        chain: [{ id: "r2", ...srv.hostConfig }],
+        timeout: 10000,
+        reuseSession: false,
+      });
+
+      assert.notEqual(first.id, second.id);
+      assert.equal(srv.acceptedConnections() - before, 2, "reuseSession:false must create a separate connection");
+
+      await manager.disconnect(first.id);
+      await manager.disconnect(second.id);
+    });
+
+    it("disconnectAll clears the profile index so the next connect is a new session", async () => {
+      const manager = new SSHSessionManager({ maxSessions: 5 });
+
+      const first = await manager.connect({
+        chain: [{ id: "d1", ...srv.hostConfig }],
+        timeout: 10000,
+      });
+
+      await manager.disconnectAll();
+      assert.equal(manager.listSessions().length, 0);
+
+      const second = await manager.connect({
+        chain: [{ id: "d2", ...srv.hostConfig }],
+        timeout: 10000,
+      });
+
+      assert.notEqual(second.id, first.id, "profile index must not point at the destroyed session");
+      await manager.disconnect(second.id);
     });
 
     it("disconnects all sessions at once", async () => {

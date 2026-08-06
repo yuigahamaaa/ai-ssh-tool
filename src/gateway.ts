@@ -85,46 +85,9 @@ export class SSHGateway {
     jumpHosts?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[]
     name?: string
   }): Promise<SSHSession> {
-    const chain: SSHConnectionChain = []
-
-    // Determine which gateways to use:
-    // - If jumpHosts is explicitly provided (even empty array), use it
-    // - If jumpHosts is undefined, use defaultGateways from config
-    const gateways = params.jumpHosts !== undefined
-      ? params.jumpHosts
-      : (this.config.defaultGateways ?? [])
-
-    // Add gateways first
-    for (let i = 0; i < gateways.length; i++) {
-      const gw = gateways[i]
-      chain.push({
-        id: `gw-${i}`,
-        name: gw.host,
-        host: gw.host,
-        port: gw.port ?? 22,
-        auth: {
-          username: gw.username,
-          password: gw.password,
-          privateKey: gw.privateKey,
-        },
-      })
-    }
-
-    // Add target host last
-    chain.push({
-      id: "target",
-      name: params.host,
-      host: params.host,
-      port: params.port ?? 22,
-      auth: {
-        username: params.username,
-        password: params.password,
-        privateKey: params.privateKey,
-      },
-    })
-
-    return this.connectByChain(chain, params.name)
-  }
+    const chain = buildSimpleChain(params, this.config.defaultGateways)
+  return this.connectByChain(chain, params.name)
+}
 
   /** Connect by resolving a hostname through ~/.ssh/config */
   async connectBySSHConfig(
@@ -218,4 +181,60 @@ export class SSHGateway {
   saveProfile(name: string, chain: Omit<SSHHostConfig, "id">[], tags?: string[]): SSHProfile {
     return this.profiles.add({ name, chain, tags })
   }
+}
+
+/** Build the hop chain for connectSimple. Exported as a pure function so the
+ *  gateway-selection rules (jumpHosts over defaultGateways, empty array skips
+ *  defaults) can be tested without a live SSH connection. */
+export function buildSimpleChain(
+  params: {
+    host: string
+    port?: number
+    username: string
+    password?: string
+    privateKey?: string
+    jumpHosts?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[]
+    name?: string
+  },
+  defaultGateways?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[],
+): SSHConnectionChain {
+  const chain: SSHConnectionChain = []
+
+  // Determine which gateways to use:
+  // - If jumpHosts is explicitly provided (even empty array), use it
+  // - If jumpHosts is undefined, use defaultGateways from config
+  const gateways = params.jumpHosts !== undefined
+    ? params.jumpHosts
+    : (defaultGateways ?? [])
+
+  // Add gateways first
+  for (let i = 0; i < gateways.length; i++) {
+    const gw = gateways[i]
+    chain.push({
+      id: `gw-${i}`,
+      name: gw.host,
+      host: gw.host,
+      port: gw.port ?? 22,
+      auth: {
+        username: gw.username,
+        password: gw.password,
+        privateKey: gw.privateKey,
+      },
+    })
+  }
+
+  // Add target host last
+  chain.push({
+    id: "target",
+    name: params.host,
+    host: params.host,
+    port: params.port ?? 22,
+    auth: {
+      username: params.username,
+      password: params.password,
+      privateKey: params.privateKey,
+    },
+  })
+
+  return chain
 }
