@@ -14,7 +14,7 @@
 import { createServer, type Server, type Socket } from "net"
 import type { Client, ClientChannel } from "ssh2"
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs"
-import { createHash } from "crypto"
+import { createHash, randomUUID } from "crypto"
 import { spawn } from "child_process"
 import { pathToFileURL } from "url"
 import { SSHGateway } from "./gateway.js"
@@ -36,9 +36,11 @@ import {
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
-import type { AgentIdentity, HostIdentity, ScheduleRequest, TaskOutputResult } from "./scheduler/types.js"
+import type { AgentIdentity, HostIdentity, ScheduleRequest, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
 import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
+import { SshExecCoordinatorTransport, RemoteCoordinatorClient } from "./coordinator/client.js"
+import { CoordinatorTaskScope } from "./coordinator/task-scope.js"
 
 interface DaemonSession {
   sessionId: string
@@ -201,6 +203,10 @@ export class SSHDaemon {
   private pendingConnects = new Map<string, Promise<{ sessionId: string; configHash: string; reused: boolean }>>()
   private startedAt = Date.now()
   private forwardManagers = new Map<string, PortForwardManager>()
+  private coordinatorScopes = new Map<string, CoordinatorTaskScope>()
+  private coordinatorClientId = randomUUID()
+  private coordinatorInstallationId = randomUUID()
+  private coordinatorRegisteredClients = new Set<string>()
   private scheduler: SchedulerService
   private stopping = false
   private resourceLimits: DaemonResourceLimits
@@ -228,6 +234,10 @@ export class SSHDaemon {
       maxSessions: 50,
     })
     this.scheduler = opts?.scheduler ?? new SchedulerService({
+      hooks: {
+        onTaskStarted: (task) => { this.beginCoordinatorTask(task) },
+        onTaskFinished: (task) => { this.finishCoordinatorTask(task) },
+      },
       // Use batched persistence so a task's many state-transition writes
       // (create → queue → start → finish) coalesce into ~1 disk write per
       // 100ms quiet window instead of 6-8 synchronous writeFileSync calls
@@ -475,6 +485,8 @@ export class SSHDaemon {
     // scheduler.dispose() stops any running background-task streams and
     // clears associated timers, so we don't need a separate handle map here.
     this.scheduler.dispose()
+    await Promise.allSettled(Array.from(this.coordinatorScopes.values()).map((scope) => scope.dispose()))
+    this.coordinatorScopes.clear()
     await this.gateway.disconnectAll()
     this.forwardManagers.clear()
     for (const socket of this.sockets) {
@@ -831,6 +843,41 @@ export class SSHDaemon {
    * the command starts. The task has not executed yet at this point, so
    * rebinding cannot duplicate side effects.
    */
+  private beginCoordinatorTask(task: ScheduledTask): void {
+    if (task.classification.intent === "inspect" || task.classification.intent === "search") return
+    const connection = this.resolveTaskConnection(task)
+    if (!connection) return
+    const client = connection.getFinalClient()
+    const coordinator = new RemoteCoordinatorClient(new SshExecCoordinatorTransport(client))
+    if (!this.coordinatorRegisteredClients.has(task.hostId)) {
+      this.coordinatorRegisteredClients.add(task.hostId)
+      void coordinator.registerClient({ clientId: this.coordinatorClientId, installationId: this.coordinatorInstallationId, operatorLabel: task.agentName ?? task.agentId, sshUser: "unknown", toolVersion: "ssh-tool" }).catch(() => {})
+    }
+    const scope = new CoordinatorTaskScope(
+      coordinator,
+      {
+        clientId: this.coordinatorClientId,
+        workspace: task.effectiveCwd ?? "/",
+        kind: task.classification.intent === "build" ? "build" : task.classification.intent === "deploy" || task.classification.intent === "server" ? "service" : "write",
+        summary: task.reason ?? task.classification.reason,
+        ttlMs: Math.min(Math.max(task.timeoutMs ?? 120_000, 30_000), 24 * 60 * 60 * 1000),
+        pid: task.pid ?? undefined,
+        source: "ssh-tool",
+      },
+      false,
+    )
+    this.coordinatorScopes.set(task.id, scope)
+    void scope.begin().catch(() => {})
+  }
+
+  private finishCoordinatorTask(task: ScheduledTask): void {
+    const scope = this.coordinatorScopes.get(task.id)
+    if (!scope) return
+    this.coordinatorScopes.delete(task.id)
+    const outcome = task.status === "completed" ? "success" : task.status === "cancelled" ? "cancelled" : "failed"
+    void scope.finish(outcome).catch(() => {})
+  }
+
   private resolveTaskConnection(task: { sessionId: string; hostId: string }) {
     const direct = this.gateway.sessions.getConnection(task.sessionId)
     if (direct && direct.isConnected()) return direct

@@ -1,0 +1,22 @@
+[Unit]
+Description=SSH Tool unmanaged session and process observer
+After=ssh-tool-coordinator.service
+Requires=ssh-tool-coordinator.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/ssh-tool-coordinator/current/observer-main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/proc
+ReadWritePaths=/run/ssh-tool-coordinator
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

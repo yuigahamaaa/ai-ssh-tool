@@ -10,6 +10,9 @@
     "dist/*.js.map",
     "dist/cli/",
     "dist/scheduler/",
+    "dist/coordinator/",
+    "dist/coordinator/systemd/",
+
     "docs/",
     "profiles/",
     "README.md",
@@ -21,10 +24,13 @@
   "bin": {
     "ssh-exec": "./dist/cli/ssh-exec.js",
     "ssh-daemon": "./dist/daemon.js",
-    "ssh-mcp": "./dist/mcp-server.js"
+    "ssh-mcp": "./dist/mcp-server.js",
+    "ssh-tool-coordinator": "./dist/coordinator/server-main.js",
+    "ssh-tool-coordinator-helper": "./dist/coordinator/remote-helper.js",
+    "ssh-tool-observer": "./dist/coordinator/observer-main.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-coordinator-assets.js",
     "setup": "npm install && npm run build",
     "build:test": "npm run clean:test && tsc -p tsconfig.test.json",
     "test": "npm run test:fast",
