@@ -8,7 +8,7 @@
 
 为解决多个 AI 同时连接同一台虚拟机、在相同工作区执行写操作导致的误撞问题，新增一个整机单实例的远端协调服务：`ssh-tool-coordinator`。
 
-服务通过仅本机可见的 Unix socket 提供控制面能力。本地 SSH Tool 不直接访问其数据库，而是通过既有 SSH 通道执行远端轻量 helper。SSH Tool 仍负责实际连接和命令执行；协调服务只记录客户端、任务意图、心跳与短期租约，并返回同工作区的活跃任务摘要。
+服务通过仅本机可见的 Unix socket 提供控制面能力。本地 SSH Tool 不直接访问其数据库，而是通过既有 SSH 通道执行远端轻量 helper。SSH Tool 仍负责实际连接和命令执行；协调服务记录客户端、任务意图、心跳与短期租约，并返回同工作区的活跃任务摘要。独立的最小权限 root observer 还会低频观察其他 SSH 会话和仍在运行的进程，为未接入 SSH Tool 的人工、VS Code Remote SSH、CI 或脚本活动提供低可信提示。
 
 第一版采用软协调：发现冲突时，SSH Tool 把结构化 warning 返回给 AI，AI 必须向用户确认后再执行高风险写操作。服务不可用、部署失败或版本不兼容时，不阻断既有 SSH exec/transfer 能力，只携带降级警告。
 
@@ -65,6 +65,11 @@ ssh-tool-coordinator（systemd，整机单实例）
     +-- 工作区冲突检测
     +-- 操作与部署审计
     +-- SQLite 状态存储
+
+ssh-tool-observer（systemd，root，只读）
+    +-- SSH 会话快照：用户、TTY、来源 IP、登录时间
+    +-- /proc 进程快照：PID、UID、cwd、完整 cmdline
+    +-- 私有 Unix socket 提交给 coordinator
 ```
 
 ### 3.1 责任划分
@@ -75,6 +80,7 @@ ssh-tool-coordinator（systemd，整机单实例）
 | `RemoteCoordinatorClient` | 通过 SSH 调用远端 helper，探测版本、注册/续租/完成任务，将协调信息附到现有结果 | 直接访问 SQLite、保存凭据、打开新网络连接 |
 | `coordinator-client` | 将行分隔 JSON 请求转发到 Unix socket 并输出响应 | 执行用户命令、修改协调状态文件 |
 | `ssh-tool-coordinator` | 验证协议和 socket 调用者，管理租约、冲突、审计和 SQLite | 代执行 shell、反向控制本地 SSH Tool |
+| `ssh-tool-observer` | 以最小 root 权限低频读取 SSH 会话和 `/proc`，将观察快照提交到 coordinator | 执行或阻断用户命令、读取环境变量/stdin/终端内容、直接修改 coordinator 数据库 |
 | installer | 校验版本化发布产物、串行化部署、原子切换、健康检查和回滚 | 运行远程在线安装脚本或扩大主机网络暴露 |
 
 ### 3.2 为什么不让远端服务直接调度本地 SSH Tool 对象
@@ -128,6 +134,18 @@ ssh-tool-coordinator（systemd，整机单实例）
 
 不支持 systemd、架构不支持或权限不足时，SSH Tool 返回明确诊断并降级继续执行；不得尝试 `sudo`、修改 SSH 配置、打开防火墙端口或自动改变用户组。
 
+### 4.4 非 SSH Tool 活动观测
+
+协调器只能确定接入协议的 SSH Tool 租约。为让 AI 也能看到未接入 SSH Tool 的普通 SSH、VS Code Remote SSH、CI 和脚本活动，第一版增加 `ssh-tool-observer`。
+
+- observer 以 root 运行，但只能读取 `who`/`w` 和 `/proc` 会话/进程元数据；它没有 SQLite 写权限，也不能执行用户提供的命令。
+- 默认每 30 秒扫描一次，收集在线 SSH 用户、TTY、来源 IP、登录时间，以及运行进程的 PID、父 PID、UID、cwd、完整命令行、首次/最后发现时间。
+- coordinator 对 `git`、构建工具、包管理器、测试、容器、服务管理和编辑器等进程标记风险类别；无法分类的进程仍可作为完整命令观察记录显示。
+- 观察记录统一标记 `source: "session-observer" | "process-observer"` 和 `confidence: "low"`。AI 只能表述为“检测到”或“可能正在执行”，不得将其描述成确定任务事实。
+- 观察只覆盖扫描时仍在运行的会话和进程。已退出的短命令、shell 内已完成的写操作和编辑器保存操作无法可靠恢复；auditd/eBPF/execve 级别审计不属于第一版。
+- observer 不采集环境变量、stdin、终端屏幕内容、文件内容或网络包。
+- 普通非 SSH Tool 活动只产生 warning，绝不自动阻止 SSH Tool 任务。
+
 ## 5. 协议和状态模型
 
 ### 5.1 传输协议
@@ -179,7 +197,9 @@ type TaskIntent = {
 
 独立 Linux 账号下，以 `peerUid` 为可信身份。共享 root 下，记录 `identityTrust: "self-asserted"`，展示给用户时必须标注该限制。任何客户端自报的 `sshUser` 或 `operatorLabel` 都不能被视为安全归因。
 
-完整命令、环境变量、令牌、密码、私钥及其路径不得写入状态库或审计日志。`summary` 必须限制长度且由 SSH Tool 进行敏感内容脱敏。
+完整命令、环境变量、令牌、密码、私钥及其路径不得写入主动 SSH Tool 租约或其审计日志。`summary` 必须限制长度且由 SSH Tool 进行敏感内容脱敏。
+
+根据团队确认的观测策略，`process-observer` 记录可以保存其实际读到的完整进程命令行，以帮助 AI 判断普通 SSH、CI 和 VS Code 活动；该高敏感数据必须与主动任务摘要分表存储，并遵守第 8 节的 24 小时硬删除策略。完整命令可包含凭据或业务参数，因此该模式是团队共享监控，不是安全审计，也不适用于不允许共享命令历史的主机。
 
 ### 5.3 租约和任务生命周期
 
@@ -296,8 +316,11 @@ SQLite 最少包含：
 - `leases`：活跃和已完成任务、workspace、租约、peer UID、协作标签与结果。
 - `audit_events`：部署、升级、health failure、begin/heartbeat/finish/force override 等不可变事件。
 - `schema_migrations`：可兼容 migration 版本。
+- `observed_sessions`：observer 最近看到的 SSH 会话元数据。
+- `observed_processes`：当前仍活跃的进程快照，含完整命令、PID、UID、TTY/来源、cwd、风险类别和置信度。
+- `observed_process_history`：完整命令观察历史，硬保留 24 小时。
 
-数据库写入采用事务。TTL 清理在 `beginTask`、`heartbeat`、`listActive` 以及周期性清理时执行。审计日志按大小或时间轮转，默认保留期和最大容量必须可配置，并以安全默认值限制磁盘增长。
+数据库写入采用事务。TTL 清理在 `beginTask`、`heartbeat`、`listActive` 以及周期性清理时执行。observer 当前快照在连续两个扫描周期未见后过期。完整命令历史固定保留 24 小时，且以 `maxCommandBytes`、`maxObservedProcesses` 和每轮最大记录数限制数据量；超过限制时截断并显式标注。审计日志按大小或时间轮转，默认保留期和最大容量必须可配置，并以安全默认值限制磁盘增长。
 
 ## 9. 错误处理
 
@@ -333,6 +356,9 @@ SQLite 最少包含：
 - 允许组成员通过 socket 调用；非组成员被拒绝。
 - SQLite 和审计目录不能被普通客户端直接写入。
 - 共享 root 的响应明确标记 `self-asserted` 身份可信级别。
+- observer 只能通过私有 socket 提交观察记录，不能直接读取或写入 coordinator SQLite 文件。
+- observer 采集 SSH 会话和运行进程，但不会采集环境变量、stdin、终端内容或文件内容。
+- 完整命令观察历史在 24 小时后被硬删除，并受单条和单轮上限约束。
 
 ### 10.3 部署测试
 
@@ -362,7 +388,9 @@ SQLite 最少包含：
 | 自动部署扩大远端风险 | 只使用签名的版本化产物、部署锁、最小权限、原子切换和回滚 |
 | coordinator 故障影响工作 | 协调功能始终可降级，不能阻断现有 SSH 功能 |
 | 警告被忽略 | 第一版由 AI 询问用户；若出现真实需求，后续引入可配置强制锁 |
-| 远端状态泄露任务内容 | 限制 summary、脱敏、禁止保存完整命令和密钥、严格文件权限 |
+| 远端状态泄露任务内容 | 主动任务限制 summary、脱敏、禁止保存完整命令和密钥、严格文件权限 |
+| observer 读取完整命令行扩大泄露面 | 仅限团队明确授权的共享主机；独立 root observer、私有提交 socket、24 小时硬删除、单条/单轮大小上限；不采集环境变量或终端内容 |
+| 被动扫描造成误判或遗漏短命令 | `source`/`confidence` 明确标记为低可信；只提示不阻止；不将扫描结果作为强制锁依据 |
 
 后续可在不破坏协议的情况下增加：
 
@@ -371,5 +399,6 @@ SQLite 最少包含：
 3. 远端任务队列与本地 SSH Tool 主动拉取。
 4. 审计导出和只读状态 UI。
 5. 多主机 coordinator 或集中控制面。
+6. 经过单独权限与隐私评审后的 auditd/eBPF/execve 级别审计。
 
 这些均不属于第一版实现范围。
