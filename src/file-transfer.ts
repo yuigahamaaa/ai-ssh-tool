@@ -124,7 +124,7 @@ export interface FileTransferOptions {
 /** Check if a remote path is a directory */
 async function remoteIsDir(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`, { timeout: 5000, splitSemicolons: false })
     return result.stdout.trim() === "DIR"
   } catch {
     return false
@@ -134,7 +134,7 @@ async function remoteIsDir(client: Client, remotePath: string): Promise<boolean>
 /** Check if a remote path exists */
 async function remotePathExists(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000, splitSemicolons: false })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -144,7 +144,7 @@ async function remotePathExists(client: Client, remotePath: string): Promise<boo
 /** Check if a remote path is a symbolic link */
 async function remoteIsSymlink(client: Client, remotePath: string): Promise<boolean> {
   try {
-    const result = await remoteExec(client, `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000 })
+    const result = await remoteExec(client, `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000, splitSemicolons: false })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -325,7 +325,7 @@ async function checkOverwrite(
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000 })
+      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000, splitSemicolons: false })
       return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
@@ -424,7 +424,7 @@ function cleanupTransferScope(scope: TransferScope, client: Client): Promise<voi
   scope.localTempFiles = []
   const cleanups: Promise<unknown>[] = []
   for (const remote of scope.remoteTempPaths) {
-    cleanups.push(remoteExec(client, `rm -f ${shellQuote(remote)}`, { timeout: 10000 }).catch(() => {}))
+    cleanups.push(remoteExec(client, `rm -f ${shellQuote(remote)}`, { timeout: 10000, splitSemicolons: false }).catch(() => {}))
   }
   scope.remoteTempPaths = []
   return Promise.allSettled(cleanups).then(() => {})
@@ -557,6 +557,14 @@ function checkLocalOverwrite(localPath: string, options: FileTransferOptions | u
     default:
       return { proceed: true, targetPath: localPath, requestedPath: localPath, strategy, existed: true }
   }
+}
+
+function validateCompressionLevel(level: number | undefined): number {
+  const value = level ?? 6
+  if (!Number.isInteger(value) || value < 1 || value > 9) {
+    throw new Error(`compressionLevel must be an integer from 1 to 9 (got: ${level})`)
+  }
+  return value
 }
 
 function checkLocalDirectoryOverwrite(directoryPath: string, options: FolderTransferOptions | undefined): LocalOverwriteDecision {
@@ -1056,6 +1064,7 @@ export async function uploadFolder(
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const timeout = options?.timeout ?? 5 * 60 * 1000
+  const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
   if (!existsSync(localPath)) {
     throw new Error(`Local path does not exist: ${localPath}`)
@@ -1082,14 +1091,17 @@ export async function uploadFolder(
     }
     const finalRemotePath = targetDecision.targetPath
 
-    await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000 })
+    const mkdirResult = await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000, splitSemicolons: false })
+    if (mkdirResult.code !== 0) {
+      throw new Error(`Failed to create remote directory ${finalRemotePath}: ${mkdirResult.stderr.trim() || `exit code ${mkdirResult.code}`}`)
+    }
 
     let tarOptions: string[] = []
     if (options?.skipSymlinks) tarOptions = ["--no-recursion", "--ignore-failed-read"]
     else if (options?.followSymlinks) tarOptions = ["--dereference"]
 
     const compress = await runTar(
-      ["-czf", tmpFile, ...tarOptions, "-C", localPath, "."],
+      ["-I", `gzip -${compressionLevel}`, "-cf", tmpFile, ...tarOptions, "-C", localPath, "."],
       { timeout, scope },
     )
     if (compress.code !== 0) {
@@ -1116,7 +1128,10 @@ export async function uploadFolder(
     })
 
     const extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
-    await remoteExec(client, extractCmd, { timeout })
+    const extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false })
+    if (extractResult.code !== 0) {
+      throw new Error(`Failed to extract ${remoteTmp}: ${extractResult.stderr.trim() || `exit code ${extractResult.code}`}`)
+    }
 
     const duration = Date.now() - startTime
     log("transfer", `Folder upload complete: ${localPath} -> ${finalRemotePath} (${duration}ms)`)
@@ -1157,6 +1172,7 @@ export async function downloadFolder(
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const timeout = options?.timeout ?? 5 * 60 * 1000
+  const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
   const folderName = basename(remotePath)
   const remoteTmp = `/tmp/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
@@ -1192,11 +1208,20 @@ export async function downloadFolder(
     if (options?.skipSymlinks) tarOptions = ["--no-recursion", "--ignore-failed-read"]
     else if (options?.followSymlinks) tarOptions = ["--dereference"]
 
-    const compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
-    await remoteExec(client, compressCmd, { timeout })
+    const compressCmd = `tar -I ${shellQuote(`gzip -${compressionLevel}`)} -cf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
+    const compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false })
+    if (compressResult.code !== 0) {
+      throw new Error(`Failed to compress ${remotePath}: ${compressResult.stderr.trim() || `exit code ${compressResult.code}`}`)
+    }
 
-    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000 })
+    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000, splitSemicolons: false })
+    if (sizeResult.code !== 0) {
+      throw new Error(`Failed to determine archive size ${remoteTmp}: ${sizeResult.stderr.trim() || `exit code ${sizeResult.code}`}`)
+    }
     const remoteSize = parseInt(sizeResult.stdout.trim()) || 0
+    if (remoteSize <= 0) {
+      throw new Error(`Remote archive is empty: ${remoteTmp}`)
+    }
     log("transfer", `Compressed on remote: ${remotePath} -> ${remoteTmp} (${remoteSize} bytes)`)
 
     downloadResult = await downloadFile(client, remoteTmp, tmpFile, {

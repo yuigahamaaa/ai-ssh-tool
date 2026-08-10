@@ -1,6 +1,6 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
-import { assertEnvName, assertOctalMode, shellQuote } from "../shell-quote.js"
+import { assertEnvName, assertOctalMode, shellQuote, splitTopLevelSemicolonCommands } from "../shell-quote.js"
 
 describe("shellQuote", () => {
   it("single-quotes shell arguments so command substitution stays literal", () => {
@@ -20,6 +20,22 @@ describe("shellQuote", () => {
     })
 
     assert.equal(result, value)
+  })
+})
+
+describe("splitTopLevelSemicolonCommands", () => {
+  it("splits top-level semicolons while preserving quoted values", () => {
+    assert.deepEqual(
+      splitTopLevelSemicolonCommands("echo one; printf '%s' 'a;b'; echo three"),
+      ["echo one", "printf '%s' 'a;b'", "echo three"],
+    )
+  })
+
+  it("skips empty segments and preserves escaped semicolons", () => {
+    assert.deepEqual(
+      splitTopLevelSemicolonCommands("; echo one;; printf '%s' a\\;b;"),
+      ["echo one", "printf '%s' a\\;b"],
+    )
   })
 })
 

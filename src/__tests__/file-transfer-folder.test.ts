@@ -69,6 +69,18 @@ function makeMockSpawn() {
 }
 
 describe("uploadFolder async tar", () => {
+  it("rejects invalid compression levels before starting transfer", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "ft-folder-"))
+    try {
+      await assert.rejects(
+        () => uploadFolder(makeMockClient(), tmp, "/remote/dir", { compressionLevel: 10 }),
+        /compressionLevel must be an integer from 1 to 9/,
+      )
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
   it("compresses with spawn and cleans up temp files on tar failure", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "ft-folder-"))
     const tmpFilesBefore = new Set(readdirSync(tmpdir()).filter((f) => f.startsWith("ssh-upload-")))

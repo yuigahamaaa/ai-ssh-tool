@@ -166,6 +166,43 @@ describe("remoteExec", () => {
     assert.ok(receivedCmd.includes("ls"))
   })
 
+  it("executes top-level semicolon commands sequentially", async () => {
+    const commands: string[] = []
+    const client = createMockClient((cmd, cb) => {
+      commands.push(cmd)
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => {
+        stream.emit("data", Buffer.from(`${commands.length}\n`))
+        stream.emit("close", 0)
+      })
+    })
+
+    const result = await remoteExec(client, "echo one; echo two")
+
+    assert.equal(commands.length, 2)
+    assert.match(commands[0], /echo one/)
+    assert.match(commands[1], /echo two/)
+    assert.equal(result.stdout, "1\n2\n")
+    assert.equal(result.code, 0)
+  })
+
+  it("continues semicolon command execution after a non-zero exit", async () => {
+    const commands: string[] = []
+    const client = createMockClient((cmd, cb) => {
+      commands.push(cmd)
+      const stream = createMockStream()
+      cb(null, stream)
+      process.nextTick(() => stream.emit("close", commands.length === 1 ? 7 : 0))
+    })
+
+    const result = await remoteExec(client, "false; echo should-run")
+
+    assert.equal(commands.length, 2)
+    assert.match(commands[1], /echo should-run/)
+    assert.equal(result.code, 0)
+  })
+
   it("should handle empty output", async () => {
     const client = createMockClient((_cmd, cb) => {
       const stream = createMockStream()

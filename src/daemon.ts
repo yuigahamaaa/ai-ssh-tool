@@ -37,7 +37,7 @@ import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest, TaskOutputResult } from "./scheduler/types.js"
-import { shellQuote } from "./shell-quote.js"
+import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 
 interface DaemonSession {
@@ -87,7 +87,7 @@ interface SocketRequestState {
   closed: boolean
 }
 
-export function execScheduledStream(
+function execScheduledStreamSingle(
   client: Client,
   command: string,
   timeoutMs: number,
@@ -155,6 +155,35 @@ export function execScheduledStream(
   })
 }
 
+export async function execScheduledStream(
+  client: Client,
+  command: string,
+  timeoutMs: number,
+  onOutput?: (stdout: string, stderr: string) => void,
+  onPid?: (pid: number) => void,
+  cwd?: string,
+): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
+  const commands = splitTopLevelSemicolonCommands(command)
+  if (commands.length <= 1) {
+    const singleCommand = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command
+    return execScheduledStreamSingle(client, singleCommand, timeoutMs, onOutput, onPid)
+  }
+
+  let stdout = ""
+  let stderr = ""
+  let code = 0
+  let signal: string | undefined
+  for (const commandPart of commands) {
+    const currentCommand = cwd ? `cd ${shellQuote(cwd)} && ${commandPart}` : commandPart
+    const result = await execScheduledStreamSingle(client, currentCommand, timeoutMs, onOutput, onPid)
+    stdout += result.stdout
+    stderr += result.stderr
+    code = result.code
+    signal = result.signal
+  }
+  return { code, stdout, stderr, ...(signal ? { signal } : {}) }
+}
+
 export class SSHDaemon {
   private gateway: SSHGateway
   private server: Server | null = null
@@ -209,12 +238,9 @@ export class SSHDaemon {
           const conn = this.resolveTaskConnection(task)
           if (!conn) throw new Error(`Session ${task.sessionId} not found for scheduled task`)
           const client = conn.getFinalClient()
-          const cmd = task.effectiveCwd
-            ? `cd ${shellQuote(task.effectiveCwd)} && ${task.command}`
-            : task.command
-          return execScheduledStream(client, cmd, task.timeoutMs ?? 120_000, onOutput, (pid) => {
+          return execScheduledStream(client, task.command, task.timeoutMs ?? 120_000, onOutput, (pid) => {
             task.pid = pid
-          })
+          }, task.effectiveCwd)
         },
         cancel: (task) => {
           // Backstop cancel: if the scheduler's own background-task

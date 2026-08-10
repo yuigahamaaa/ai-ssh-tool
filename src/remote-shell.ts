@@ -6,14 +6,14 @@
 import type { Client } from "ssh2"
 import { getGlobalTaskManager, type ExecResult } from "./exec-task-manager.js"
 import { log } from "./logger.js"
-import { shellQuote } from "./shell-quote.js"
+import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 
 /**
  * Execute a command on a remote host via an existing SSH client.
  * Returns when the command finishes (non-interactive).
  * All commands are tracked in the global task manager for visibility.
  */
-export function remoteExec(
+function remoteExecSingle(
   client: Client,
   command: string,
   options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string },
@@ -33,6 +33,29 @@ export function remoteExec(
   }
 
   return promise
+}
+
+export async function remoteExec(
+  client: Client,
+  command: string,
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean },
+): Promise<ExecResult> {
+  const commands = options?.splitSemicolons === false ? [command] : splitTopLevelSemicolonCommands(command)
+  if (commands.length <= 1) return remoteExecSingle(client, command, options)
+
+  let stdout = ""
+  let stderr = ""
+  let code = 0
+  let signal: string | undefined
+  for (const currentCommand of commands) {
+    const result = await remoteExecSingle(client, currentCommand, options)
+    stdout += result.stdout
+    stderr += result.stderr
+    code = result.code
+    signal = result.signal
+  }
+
+  return { code, stdout, stderr, ...(signal ? { signal } : {}) }
 }
 
 /**

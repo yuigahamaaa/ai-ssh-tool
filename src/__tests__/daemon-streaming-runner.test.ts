@@ -14,16 +14,37 @@ class FakeChannel extends EventEmitter {
 }
 
 class FakeClient {
-  stream = new FakeChannel()
+  streams: FakeChannel[] = []
   executed: string[] = []
 
   exec(command: string, cb: (err: Error | undefined, stream: FakeChannel) => void): void {
     this.executed.push(command)
-    setImmediate(() => cb(undefined, this.stream))
+    const stream = new FakeChannel()
+    this.streams.push(stream)
+    cb(undefined, stream)
   }
 }
 
 describe("daemon scheduled streaming runner", () => {
+  it("executes semicolon commands one at a time", async () => {
+    const client = new FakeClient()
+    const resultPromise = execScheduledStream(client as any, "echo one; echo two", 5000)
+
+    await new Promise(resolve => setImmediate(resolve))
+    client.streams[0]!.emit("close", 0, undefined)
+    await new Promise<void>((resolve) => {
+      const check = () => client.streams.length === 2 ? resolve() : setImmediate(check)
+      check()
+    })
+    assert.equal(client.executed.length, 2)
+    client.streams[1]!.emit("close", 0, undefined)
+
+    const result = await resultPromise
+    assert.equal(result.code, 0)
+    assert.match(client.executed[0]!, /echo one/)
+    assert.match(client.executed[1]!, /echo two/)
+  })
+
   it("streams stdout/stderr through callback and returns no aggregated output", async () => {
     const client = new FakeClient()
     const chunks: { stdout: string; stderr: string }[] = []
@@ -38,10 +59,11 @@ describe("daemon scheduled streaming runner", () => {
     )
 
     await new Promise(resolve => setImmediate(resolve))
-    client.stream.stderr.emit("data", Buffer.from("SSH_TOOL_PID:12345\n"))
-    client.stream.emit("data", Buffer.from("stdout-1\n"))
-    client.stream.stderr.emit("data", Buffer.from("stderr-1\n"))
-    client.stream.emit("close", 0, undefined)
+    const stream = client.streams[0]!
+    stream.stderr.emit("data", Buffer.from("SSH_TOOL_PID:12345\n"))
+    stream.emit("data", Buffer.from("stdout-1\n"))
+    stream.stderr.emit("data", Buffer.from("stderr-1\n"))
+    stream.emit("close", 0, undefined)
 
     const result = await resultPromise
 
