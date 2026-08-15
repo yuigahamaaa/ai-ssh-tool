@@ -44,6 +44,8 @@ import {
 } from "./mcp-response.js"
 import { randomUUID } from "crypto"
 import { assertOctalMode, shellQuote } from "./shell-quote.js"
+import { getDialect } from "./remote-dialect/index.js"
+import { psQuote } from "./remote-dialect/powershell.js"
 import { remoteParentDir } from "./remote-path.js"
 import {
   handleMcpFind,
@@ -229,6 +231,44 @@ export async function writeRemoteFileViaSftp(
   const fs = await createRemoteFs(client)
   await sftpMkdirP(client, remoteParentDir(path))
   await fs.writeFile(path, content, mode ? { mode: parseInt(assertOctalMode(mode), 8) } : undefined)
+}
+
+/**
+ * Build a remote "path exists" probe for the session's dialect.
+ * posix: `test -e` (byte-identical without a sessionKey).
+ * powershell: `Test-Path -LiteralPath` (no glob expansion, `''` doubling).
+ * cmd: `if exist` fallback.
+ */
+export function buildExistsCommand(path: string, sessionKey?: string): string {
+  switch (getDialect(sessionKey).kind) {
+    case "powershell":
+      return `if (Test-Path -LiteralPath ${psQuote(path)}) { 'exists' } else { 'not_found' }`
+    case "cmd":
+      return `if exist ${shellQuote(path)} (echo exists) else (echo not_found)`
+    default:
+      return `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`
+  }
+}
+
+/**
+ * Build portable host-load commands for the session's dialect.
+ * posix: Linux /proc fallback to BSD sysctl/vm_stat; process count via `ps -e`.
+ * powershell: CIM Win32_OperatingSystem (boot time / memory) + process count.
+ * cmd: falls through to powershell branch for Windows.
+ */
+export function buildHostLoadCommands(sessionKey?: string): { uptime: string; memory: string; proc: string } {
+  if (getDialect(sessionKey).kind !== "posix") {
+    return {
+      uptime: "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString()",
+      memory: "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List",
+      proc: "(Get-Process | Measure-Object).Count",
+    }
+  }
+  return {
+    uptime: "cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg",
+    memory: "cat /proc/meminfo 2>/dev/null | head -n 8 || vm_stat | head -n 8",
+    proc: "ps -e -o comm 2>/dev/null | wc -l || ps aux --no-headers | wc -l",
+  }
 }
 
 async function main() {
@@ -1002,9 +1042,9 @@ async function main() {
     },
     wrapTool("ssh_exists", async ({ path, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(path)
-      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client, sessionKey) => {
         await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
-        return remoteExec(client, `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`, { timeout: 5000 })
+        return remoteExec(client, buildExistsCommand(path, sessionKey), { timeout: 5000 })
       })
       const exists = result.stdout.trim() === "exists"
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, exists, raw: result.stdout.trim() })) }] }
@@ -1287,15 +1327,16 @@ async function main() {
       const profile = await getProfileForScheduler(profile_name, profile_json, profile_file)
       const target = profile.chain[profile.chain.length - 1]
       const targetKey = targetIdentityHash({ host: target.host, port: target.port, username: target.auth.username })
-      const loadInfo = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+      const loadInfo = await withReconnect(profile_name, profile_json, profile_file, async (client, sessionKey) => {
         // hostname comes from the profile (not ssh2 private-field reflection),
         // and scheduler state is keyed by the target identity hash — querying
         // with the raw hostname would always return an empty scheduler view.
         const hostname = target.host
+        const cmds = buildHostLoadCommands(sessionKey)
 
-        const uptimeResult = await remoteExec(client, "uptime", { timeout: 10000 })
-        const memResult = await remoteExec(client, "free -h", { timeout: 10000 })
-        const procResult = await remoteExec(client, "ps aux --no-headers | wc -l", { timeout: 10000 })
+        const uptimeResult = await remoteExec(client, cmds.uptime, { timeout: 10000 })
+        const memResult = await remoteExec(client, cmds.memory, { timeout: 10000 })
+        const procResult = await remoteExec(client, cmds.proc, { timeout: 10000 })
         const queueResp = await daemonClient.queueStatus({ hostId: targetKey })
         return {
           hostname,

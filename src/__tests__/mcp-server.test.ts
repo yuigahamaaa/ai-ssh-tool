@@ -13,7 +13,8 @@ import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
 
 import { createStableEd25519KeyPair } from "./ssh-test-key.js"
-import { buildCwdGuidance, assertLocalPathSafeForTransfer, writeRemoteFileViaSftp } from "../mcp-server.js"
+import { buildCwdGuidance, assertLocalPathSafeForTransfer, writeRemoteFileViaSftp, buildExistsCommand, buildHostLoadCommands } from "../mcp-server.js"
+import { clearDialectCache, putCachedDialect } from "../remote-dialect/cache.js"
 
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
@@ -345,6 +346,41 @@ describe("MCP Server Tool Integration", () => {
       assert.ok(mkdirs.includes("/remote/deep"), `expected recursive mkdir, got: ${JSON.stringify(mkdirs)}`)
       assert.equal(writes[0]?.path, "/remote/deep/file.txt")
       assert.equal(writes[0]?.data, "hello")
+    })
+  })
+
+  describe("dialect-aware mcp commands", () => {
+    it("keeps the posix exists command byte-identical without a sessionKey", () => {
+      assert.equal(buildExistsCommand("/x"), `test -e '/x' && echo "exists" || echo "not_found"`)
+    })
+
+    it("builds a Test-Path exists command for a powershell session", () => {
+      putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+      try {
+        const cmd = buildExistsCommand("/x", "u@h:22")
+        assert.ok(cmd.includes("Test-Path"), cmd)
+      } finally {
+        clearDialectCache()
+      }
+    })
+
+    it("builds portable posix host load commands", () => {
+      const c = buildHostLoadCommands()
+      assert.ok(c.uptime.includes("/proc/loadavg"), c.uptime)
+      assert.ok(c.memory.includes("/proc/meminfo"), c.memory)
+      assert.ok(c.proc.includes("ps -e -o comm"), c.proc)
+    })
+
+    it("builds powershell host load commands", () => {
+      putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+      try {
+        const c = buildHostLoadCommands("u@h:22")
+        assert.ok(c.uptime.includes("Get-CimInstance"), c.uptime)
+        assert.ok(c.memory.includes("TotalVisibleMemorySize"), c.memory)
+        assert.ok(c.proc.includes("Get-Process"), c.proc)
+      } finally {
+        clearDialectCache()
+      }
     })
   })
 })
