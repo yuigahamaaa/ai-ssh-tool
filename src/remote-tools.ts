@@ -41,6 +41,8 @@ export interface RemoteToolContext {
   sessionId: string
   client: Client
   cwd: string
+  /** 远端方言缓存键（user@host:port），用于选择远端 shell 方言。 */
+  sessionKey?: string
 }
 
 // --- Security policy helpers ---
@@ -244,7 +246,7 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           const buffer = await fs.readFile(params.path, { maxBytes: 10 * 1024 * 1024 })
           return (buffer as Buffer).toString("base64")
         }
-        const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path), { timeout: 10000 })
+        const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path), { timeout: 10000, sessionKey: ctx.sessionKey })
         if (metadataResult.code !== 0) {
           throw new Error(`Failed to read metadata for ${params.path}: ${metadataResult.stderr}`)
         }
@@ -255,7 +257,7 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         const contentResult = await remoteExec(
           ctx.client,
           buildReadFileContentCommand(params.path, params.offset ?? 0, params.limit ?? DEFAULT_READ_LINE_LIMIT),
-          { timeout: 30000 },
+          { timeout: 30000, sessionKey: ctx.sessionKey },
         )
         if (contentResult.code !== 0) {
           throw new Error(`Failed to read ${params.path}: ${contentResult.stderr}`)
@@ -327,6 +329,7 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           timeout: params.timeout,
           cwd: workDir,
           env: params.env,
+          sessionKey: ctx.sessionKey,
         })
       },
     },
@@ -344,11 +347,11 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string; showHidden?: boolean }) {
-        const result = await remoteExec(ctx.client, buildListDirCommand(params.path, Boolean(params.showHidden)), { timeout: 15000 })
+        const result = await remoteExec(ctx.client, buildListDirCommand(params.path, Boolean(params.showHidden)), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code === 0) {
           return { ...parseListDirOutput(params.path, result.stdout), strategy: "gnu" as const }
         }
-        const fallback = await remoteExec(ctx.client, buildListDirFallbackCommand(params.path, Boolean(params.showHidden)), { timeout: 15000 })
+        const fallback = await remoteExec(ctx.client, buildListDirFallbackCommand(params.path, Boolean(params.showHidden)), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (fallback.code === 0) {
           return { ...parseListDirOutput(params.path, fallback.stdout), strategy: "shell" as const }
         }
@@ -385,11 +388,11 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string }) {
-        const result = await remoteExec(ctx.client, buildStatCommand(params.path), { timeout: 10000 })
+        const result = await remoteExec(ctx.client, buildStatCommand(params.path), { timeout: 10000, sessionKey: ctx.sessionKey })
         if (result.code === 0) {
           return { ...parseStatOutput(result.stdout), raw: result.stdout, strategy: "gnu" as const }
         }
-        const fallback = await remoteExec(ctx.client, buildStatFallbackCommand(params.path), { timeout: 10000 })
+        const fallback = await remoteExec(ctx.client, buildStatFallbackCommand(params.path), { timeout: 10000, sessionKey: ctx.sessionKey })
         if (fallback.code === 0) {
           return { ...parseStatOutput(fallback.stdout), raw: fallback.stdout, strategy: "shell" as const }
         }
@@ -424,14 +427,14 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           path: params.path,
           glob: params.glob,
           caseInsensitive: Boolean(params.caseInsensitive),
-        }), { timeout: 15000 })
+        }), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code > 1) {
           result = await remoteExec(ctx.client, buildGrepFallbackCommand({
             pattern: params.pattern,
             path: params.path,
             glob: params.glob,
             caseInsensitive: Boolean(params.caseInsensitive),
-          }), { timeout: 15000 })
+          }), { timeout: 15000, sessionKey: ctx.sessionKey })
         }
         const raw = result.stdout || ""
         if (result.code > 1) {
@@ -473,14 +476,14 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           name: params.name,
           type: params.type as "f" | "d" | "l" | undefined,
           maxDepth: params.maxDepth,
-        }), { timeout: 15000 })
+        }), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code !== 0) {
           result = await remoteExec(ctx.client, buildFindFallbackCommand({
             path: params.path,
             name: params.name,
             type: params.type as "f" | "d" | "l" | undefined,
             maxDepth: params.maxDepth,
-          }), { timeout: 15000 })
+          }), { timeout: 15000, sessionKey: ctx.sessionKey })
         }
         if (result.code !== 0) {
           throw new Error(result.stderr || "find failed")

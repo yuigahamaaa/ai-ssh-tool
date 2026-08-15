@@ -20,6 +20,8 @@ import iconv from "iconv-lite"
 import { remoteExec } from "./remote-shell.js"
 import { log } from "./logger.js"
 import { shellQuote } from "./shell-quote.js"
+import { getDialect } from "./remote-dialect/index.js"
+import { psQuote } from "./remote-dialect/powershell.js"
 
 const pipelineAsync = promisify(pipeline)
 
@@ -84,6 +86,8 @@ export interface FolderTransferOptions {
   encoding?: "auto" | "utf8" | "gbk" | "latin1"
   /** Source file encoding (download: remote encoding; upload: local encoding). auto=utf-8 */
   sourceEncoding?: "auto" | "utf8" | "gbk" | "latin1"
+  /** 远端方言缓存键（user@host:port），用于选择远端 shell 方言与推断换行符。 */
+  sessionKey?: string
 }
 
 export type OverwriteStrategy = boolean | "ask" | "skip" | "overwrite" | "rename" | "backup"
@@ -119,12 +123,21 @@ export interface FileTransferOptions {
   encoding?: "auto" | "utf8" | "gbk" | "latin1"
   /** Source file encoding (download: remote encoding; upload: local encoding). auto=utf-8 */
   sourceEncoding?: "auto" | "utf8" | "gbk" | "latin1"
+  /** 远端方言缓存键（user@host:port），用于选择远端 shell 方言与推断换行符。 */
+  sessionKey?: string
 }
 
 /** Check if a remote path is a directory */
-async function remoteIsDir(client: Client, remotePath: string): Promise<boolean> {
+async function remoteIsDir(client: Client, remotePath: string, sessionKey?: string): Promise<boolean> {
+  const kind = getDialect(sessionKey).kind
   try {
-    const result = await remoteExec(client, `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`, { timeout: 5000, splitSemicolons: false })
+    const command =
+      kind === "powershell"
+        ? `if (Test-Path -LiteralPath ${psQuote(remotePath)} -PathType Container) { 'DIR' } else { 'FILE' }`
+        : kind === "cmd"
+          ? `if exist "${remotePath}\\" (echo DIR) else (echo FILE)`
+          : `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
     return result.stdout.trim() === "DIR"
   } catch {
     return false
@@ -132,9 +145,16 @@ async function remoteIsDir(client: Client, remotePath: string): Promise<boolean>
 }
 
 /** Check if a remote path exists */
-async function remotePathExists(client: Client, remotePath: string): Promise<boolean> {
+async function remotePathExists(client: Client, remotePath: string, sessionKey?: string): Promise<boolean> {
+  const kind = getDialect(sessionKey).kind
   try {
-    const result = await remoteExec(client, `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000, splitSemicolons: false })
+    const command =
+      kind === "powershell"
+        ? `if (Test-Path -LiteralPath ${psQuote(remotePath)}) { 'YES' } else { 'NO' }`
+        : kind === "cmd"
+          ? `if exist "${remotePath}" (echo YES) else (echo NO)`
+          : `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -142,9 +162,15 @@ async function remotePathExists(client: Client, remotePath: string): Promise<boo
 }
 
 /** Check if a remote path is a symbolic link */
-async function remoteIsSymlink(client: Client, remotePath: string): Promise<boolean> {
+async function remoteIsSymlink(client: Client, remotePath: string, sessionKey?: string): Promise<boolean> {
+  const kind = getDialect(sessionKey).kind
   try {
-    const result = await remoteExec(client, `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`, { timeout: 5000, splitSemicolons: false })
+    if (kind === "cmd") return false // cmd 无可靠软链判定
+    const command =
+      kind === "powershell"
+        ? `if ((Get-Item -LiteralPath ${psQuote(remotePath)} -ErrorAction SilentlyContinue).Attributes -band [IO.FileAttributes]::ReparsePoint) { 'YES' } else { 'NO' }`
+        : `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -270,7 +296,8 @@ function buildTransformChain(options?: FileTransferOptions): Transform[] {
   const sourceEncoding = options.sourceEncoding ?? "auto"
 
   if (lineEnding === "auto") {
-    lineEnding = process.platform === "win32" ? "crlf" : "lf"
+    // 按远端方言推断换行符：Windows 系远端（PowerShell/cmd）文件为 CRLF
+    lineEnding = getDialect(options?.sessionKey).kind !== "posix" ? "crlf" : "lf"
   }
 
   const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
@@ -305,7 +332,7 @@ async function checkOverwrite(
   remotePath: string,
   options: FileTransferOptions | undefined
 ): Promise<OverwriteDecision> {
-  const exists = await remotePathExists(client, remotePath)
+  const exists = await remotePathExists(client, remotePath, options?.sessionKey)
   if (!exists) {
     return { proceed: true, targetPath: remotePath, strategy: options?.overwrite ?? "overwrite", existed: false }
   }
@@ -325,7 +352,7 @@ async function checkOverwrite(
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000, splitSemicolons: false })
+      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey })
       return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
@@ -334,7 +361,7 @@ async function checkOverwrite(
       do {
         newPath = `${remotePath}.${counter}`
         counter++
-      } while (await remotePathExists(client, newPath))
+      } while (await remotePathExists(client, newPath, options?.sessionKey))
       log("transfer", `Renaming to avoid overwrite: ${remotePath} -> ${newPath}`)
       return { proceed: true, targetPath: newPath, strategy, existed: true, renamed: true }
     
@@ -345,11 +372,11 @@ async function checkOverwrite(
   }
 }
 
-async function resolveRemoteFileTarget(client: Client, localPath: string, remotePath: string): Promise<string> {
+async function resolveRemoteFileTarget(client: Client, localPath: string, remotePath: string, sessionKey?: string): Promise<string> {
   if (remotePath.endsWith("/")) {
     return pathPosix.join(remotePath, basename(localPath))
   }
-  if (await remoteIsDir(client, remotePath)) {
+  if (await remoteIsDir(client, remotePath, sessionKey)) {
     return pathPosix.join(remotePath, basename(localPath))
   }
   return remotePath
@@ -606,7 +633,7 @@ export async function uploadFile(
 
   const statInfo = statSync(localPath)
   const totalSize = statInfo.size
-  const targetRemotePath = await resolveRemoteFileTarget(client, localPath, remotePath)
+  const targetRemotePath = await resolveRemoteFileTarget(client, localPath, remotePath, options?.sessionKey)
 
   const checkResult = await checkOverwrite(client, targetRemotePath, options)
   if (!checkResult.proceed) {
@@ -748,7 +775,8 @@ async function uploadFileDirect(
     const sourceEncoding = options.sourceEncoding ?? "auto"
 
     if (lineEnding === "auto") {
-      lineEnding = process.platform === "win32" ? "crlf" : "lf"
+      // 按远端方言推断换行符：Windows 系远端（PowerShell/cmd）文件为 CRLF
+      lineEnding = getDialect(options.sessionKey).kind !== "posix" ? "crlf" : "lf"
     }
 
     const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
@@ -908,7 +936,7 @@ export async function downloadFile(
         const remoteMode = stats.mode ? ((stats.mode as number) & 0o777) : 0o644
 
         if (options?.skipSymlinks) {
-          const isSymlink = await remoteIsSymlink(client, remotePath)
+          const isSymlink = await remoteIsSymlink(client, remotePath, options?.sessionKey)
           if (isSymlink) {
             log("transfer", `Skipping symbolic link: ${remotePath}`)
               return finishOnce(() => resolve({
@@ -948,7 +976,8 @@ export async function downloadFile(
             const sourceEncoding = options.sourceEncoding ?? "auto"
 
             if (lineEnding === "auto") {
-              lineEnding = process.platform === "win32" ? "crlf" : "lf"
+              // 按远端方言推断换行符：Windows 系远端（PowerShell/cmd）文件为 CRLF
+              lineEnding = getDialect(options.sessionKey).kind !== "posix" ? "crlf" : "lf"
             }
 
             const srcEnc = sourceEncoding === "auto" ? "utf-8" : sourceEncoding
@@ -1091,7 +1120,7 @@ export async function uploadFolder(
     }
     const finalRemotePath = targetDecision.targetPath
 
-    const mkdirResult = await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000, splitSemicolons: false })
+    const mkdirResult = await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
     if (mkdirResult.code !== 0) {
       throw new Error(`Failed to create remote directory ${finalRemotePath}: ${mkdirResult.stderr.trim() || `exit code ${mkdirResult.code}`}`)
     }
@@ -1125,10 +1154,11 @@ export async function uploadFolder(
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (uploading archive)` })
         : undefined,
       timeout,
+      sessionKey: options?.sessionKey,
     })
 
     const extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
-    const extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false })
+    const extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
     if (extractResult.code !== 0) {
       throw new Error(`Failed to extract ${remoteTmp}: ${extractResult.stderr.trim() || `exit code ${extractResult.code}`}`)
     }
@@ -1186,7 +1216,7 @@ export async function downloadFolder(
   let targetDecision: LocalOverwriteDecision | undefined
 
   try {
-    const isDir = await remoteIsDir(client, remotePath)
+    const isDir = await remoteIsDir(client, remotePath, options?.sessionKey)
     if (!isDir) {
       throw new Error(`Remote path is not a directory: ${remotePath}`)
     }
@@ -1209,12 +1239,12 @@ export async function downloadFolder(
     else if (options?.followSymlinks) tarOptions = ["--dereference"]
 
     const compressCmd = `tar -I ${shellQuote(`gzip -${compressionLevel}`)} -cf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
-    const compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false })
+    const compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
     if (compressResult.code !== 0) {
       throw new Error(`Failed to compress ${remotePath}: ${compressResult.stderr.trim() || `exit code ${compressResult.code}`}`)
     }
 
-    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000, splitSemicolons: false })
+    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
     if (sizeResult.code !== 0) {
       throw new Error(`Failed to determine archive size ${remoteTmp}: ${sizeResult.stderr.trim() || `exit code ${sizeResult.code}`}`)
     }
@@ -1229,6 +1259,7 @@ export async function downloadFolder(
         ? (p) => options.onProgress!({ ...p, filename: `${folderName}/ (downloading archive)` })
         : undefined,
       timeout,
+      sessionKey: options?.sessionKey,
     })
     const archiveChecksum = await sha256File(tmpFile)
 
@@ -1307,6 +1338,7 @@ export async function upload(
     lineEnding: options?.lineEnding,
     encoding: options?.encoding,
     sourceEncoding: options?.sourceEncoding,
+    sessionKey: options?.sessionKey,
   }
   return uploadFile(client, localPath, remotePath, fileOptions)
 }
@@ -1324,7 +1356,7 @@ export async function download(
   localPath: string,
   options?: FolderTransferOptions,
 ): Promise<TransferResult> {
-  const isDir = await remoteIsDir(client, remotePath)
+  const isDir = await remoteIsDir(client, remotePath, options?.sessionKey)
   if (isDir) {
     return downloadFolder(client, remotePath, localPath, options)
   }
@@ -1338,6 +1370,7 @@ export async function download(
     lineEnding: options?.lineEnding,
     encoding: options?.encoding,
     sourceEncoding: options?.sourceEncoding,
+    sessionKey: options?.sessionKey,
   }
   return downloadFile(client, remotePath, localPath, fileOptions)
 }

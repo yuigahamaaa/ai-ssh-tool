@@ -16,6 +16,7 @@ import { rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 import { MAX_READ_FILE_BYTES } from "../remote-file-tools.js"
+import { clearDialectCache, putCachedDialect } from "../remote-dialect/cache.js"
 
 const testDataDir = join(tmpdir(), `remote-tools-${Date.now()}-${process.pid}`)
 const origDataDir = process.env.SSH_TOOL_DATA_DIR
@@ -203,6 +204,36 @@ describe("RemoteTools", () => {
       assert.deepEqual(tools.exec.parameters.required, ["command"])
 
       tools.dispose()
+    })
+
+    it("uses the session key dialect for tool exec (powershell wrapper)", async () => {
+      putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+      try {
+        let receivedCmd = ""
+        const client = createMockClient({
+          execHandler: (cmd: string, cb: Function) => {
+            receivedCmd = cmd
+            const stream = new EventEmitter() as any
+            stream.stderr = new EventEmitter()
+            stream.write = mock.fn(() => {})
+            stream.close = mock.fn(() => stream.emit("close", 0))
+            cb(null, stream)
+            process.nextTick(() => stream.emit("close", 0))
+          },
+        })
+        const tools = await createRemoteTools({
+          sessionId: "s",
+          client,
+          cwd: "/tmp",
+          sessionKey: "u@h:22",
+        })
+        const result = await tools.exec.execute({ command: "echo hi" })
+        assert.equal(result.code, 0)
+        assert.match(receivedCmd, /^powershell -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand /)
+        tools.dispose()
+      } finally {
+        clearDialectCache()
+      }
     })
   })
 

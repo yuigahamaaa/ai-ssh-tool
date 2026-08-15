@@ -11,12 +11,15 @@ import type { TransferResult } from "../file-transfer.js"
 import type { SSHHostConfig } from "../types.js"
 
 import { createStableEd25519KeyPair } from "./ssh-test-key.js"
+import { clearDialectCache, putCachedDialect } from "../remote-dialect/cache.js"
 
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
 const memFs = new Map<string, Buffer>()
 const remoteExecResults = new Map<string, { stdout: string, stderr: string }>()
 const remoteExecQueue: Array<{ stdout: string, stderr?: string }> = []
+/** 记录 server 收到的原始 exec 命令（wrapper 未解开），供方言断言使用。 */
+const execCommands: string[] = []
 
 function enqueueExecResponse(stdout: string, stderr = "") {
   remoteExecQueue.push({ stdout, stderr })
@@ -37,6 +40,17 @@ function unwrapExecCommand(raw: string): string {
   const quoted = raw.slice(prefix.length)
   if (!quoted.startsWith("'") || !quoted.endsWith("'")) return raw
   return quoted.slice(1, -1).replace(/'\\''/g, "'")
+}
+
+/** 解码 PowerShell -EncodedCommand 的 base64（UTF-16LE），供方言断言使用。 */
+function decodePsEncodedCommand(raw: string): string | null {
+  const match = raw.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)
+  if (!match) return null
+  try {
+    return Buffer.from(match[1], "base64").toString("utf16le")
+  } catch {
+    return null
+  }
 }
 
 function createTestServer(): Promise<{
@@ -62,6 +76,7 @@ function createTestServer(): Promise<{
           })
           session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
             const stream = acceptExec()
+            execCommands.push(String(info?.command ?? ""))
             const queuedResult = remoteExecQueue.shift()
             const testResult = remoteExecResults.get("test")
             if (queuedResult) {
@@ -391,6 +406,32 @@ describe("File Transfer - Download Basic", () => {
     assert.equal(result.success, true)
     assert.equal(result.path, expectedPath)
     assert.equal(readFileSync(expectedPath, "utf8"), "report content")
+  })
+
+  it("uses PowerShell-aware remote probes when the session dialect is powershell", async () => {
+    putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+    try {
+      execCommands.length = 0
+      memFs.set("/remote/win.txt", Buffer.from("win data"))
+      const localPath = join(tmpDir, `dl-win-${Date.now()}.txt`)
+      try {
+        const result = await downloadFile(conn.getFinalClient(), "/remote/win.txt", localPath, {
+          skipSymlinks: true,
+          sessionKey: "u@h:22",
+        })
+        assert.equal(result.success, true)
+      } finally {
+        try { unlinkSync(localPath) } catch {}
+      }
+      // skipSymlinks 触发的软链探测应使用 PS 语义（Get-Item），而非 POSIX test -L。
+      // 协议层看到的是 -EncodedCommand 包装，需先解码再断言。
+      assert.ok(
+        execCommands.some((c) => (decodePsEncodedCommand(c) ?? c).includes("Get-Item -LiteralPath")),
+        `expected PowerShell symlink probe, got: ${JSON.stringify(execCommands)}`,
+      )
+    } finally {
+      clearDialectCache()
+    }
   })
 })
 

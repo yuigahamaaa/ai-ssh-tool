@@ -161,7 +161,7 @@ export class SSHGateway {
 
     const client = connection.getFinalClient()
     const tools = await createRemoteTools(
-      { sessionId, client, cwd: `~` },
+      { sessionId, client, cwd: `~`, sessionKey: connection.getHostId() },
       this.config.securityPolicy,
     )
 
