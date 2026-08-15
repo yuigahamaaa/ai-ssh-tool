@@ -10,6 +10,7 @@
 import { Client, type ClientChannel, type ConnectConfig } from "ssh2"
 import { EventEmitter } from "events"
 import { log, logError } from "./logger.js"
+import { resolvePrivateKeyContent } from "./private-key.js"
 import type {
   ConnectionEvent,
   ConnectionOptions,
@@ -308,7 +309,9 @@ export class SSHConnection extends EventEmitter {
       config.password = host.auth.password
     }
     if (host.auth.privateKey) {
-      config.privateKey = host.auth.privateKey
+      // 兼容历史 profile 把私钥"路径"存进 privateKey 字段的情况：
+      // 路径→读文件取内容，内容→归一化换行，公钥/坏头→明确报错。
+      config.privateKey = resolvePrivateKeyContent(host.auth.privateKey)
     }
     if (host.auth.passphrase) {
       config.passphrase = host.auth.passphrase
