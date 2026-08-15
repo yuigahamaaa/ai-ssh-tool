@@ -708,6 +708,15 @@ async function uploadFolderSftp(
   }
   walk(localPath, "")
 
+  // 嵌套文件的远端父目录必须逐一递归 mkdir，否则真实 SFTP put 会 ENOENT
+  const parents = new Set(entries.map((e) => dirname(`${root}/${e.rel}`)))
+  const sftp2 = await openSftp(client)
+  try {
+    for (const parent of parents) await sftpMkdirP(sftp2, parent)
+  } finally {
+    try { sftp2.end() } catch { /* best-effort */ }
+  }
+
   const total = entries.reduce((sum, e) => sum + e.size, 0)
   for (const e of entries) {
     const remoteTarget = `${root}/${e.rel}`

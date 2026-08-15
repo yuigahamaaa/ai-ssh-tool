@@ -45,7 +45,7 @@ import {
 import { randomUUID } from "crypto"
 import { assertOctalMode, shellQuote } from "./shell-quote.js"
 import { getDialect } from "./remote-dialect/index.js"
-import { psQuote } from "./remote-dialect/powershell.js"
+import { psQuote, encodePS } from "./remote-dialect/powershell.js"
 import { remoteParentDir } from "./remote-path.js"
 import {
   handleMcpFind,
@@ -244,7 +244,9 @@ export function buildExistsCommand(path: string, sessionKey?: string): string {
     case "powershell":
       return `if (Test-Path -LiteralPath ${psQuote(path)}) { 'exists' } else { 'not_found' }`
     case "cmd":
-      return `if exist ${shellQuote(path)} (echo exists) else (echo not_found)`
+      // cmd 只认双引号（单引号会被当成路径字面量的一部分，永远 not_found）；
+      // Windows 路径禁止 " 字符，无需内层转义。
+      return `if exist "${path}" (echo exists) else (echo not_found)`
     default:
       return `test -e ${shellQuote(path)} && echo "exists" || echo "not_found"`
   }
@@ -254,14 +256,24 @@ export function buildExistsCommand(path: string, sessionKey?: string): string {
  * Build portable host-load commands for the session's dialect.
  * posix: Linux /proc fallback to BSD sysctl/vm_stat; process count via `ps -e`.
  * powershell: CIM Win32_OperatingSystem (boot time / memory) + process count.
- * cmd: falls through to powershell branch for Windows.
+ * cmd: 无原生负载命令，显式调 powershell -EncodedCommand（避免 cmd /c 内层
+ *       双引号转义问题）；PS 不可用时命令 code=1，调用方按已有逻辑降级。
  */
 export function buildHostLoadCommands(sessionKey?: string): { uptime: string; memory: string; proc: string } {
-  if (getDialect(sessionKey).kind !== "posix") {
+  const kind = getDialect(sessionKey).kind
+  if (kind === "powershell") {
     return {
       uptime: "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString()",
       memory: "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List",
       proc: "(Get-Process | Measure-Object).Count",
+    }
+  }
+  if (kind === "cmd") {
+    const ps = (script: string) => `powershell -NoProfile -EncodedCommand ${encodePS(script)}`
+    return {
+      uptime: ps("(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString()"),
+      memory: ps("Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List"),
+      proc: ps("(Get-Process | Measure-Object).Count"),
     }
   }
   return {

@@ -364,6 +364,17 @@ describe("MCP Server Tool Integration", () => {
       }
     })
 
+    it("builds a cmd exists command with double quotes (cmd ignores single quotes)", () => {
+      putCachedDialect("u@h:22", { kind: "cmd", sub: "powershell", detectedAt: Date.now() })
+      try {
+        const cmd = buildExistsCommand("C:/Users/x/a.txt", "u@h:22")
+        // cmd 只认双引号：单引号会被当成路径字面量的一部分，永远 not_found（现场 188 实测）
+        assert.match(cmd, /^if exist "C:\/Users\/x\/a\.txt" \(echo exists\) else \(echo not_found\)$/, cmd)
+      } finally {
+        clearDialectCache()
+      }
+    })
+
     it("builds portable posix host load commands", () => {
       const c = buildHostLoadCommands()
       assert.ok(c.uptime.includes("/proc/loadavg"), c.uptime)
@@ -378,6 +389,20 @@ describe("MCP Server Tool Integration", () => {
         assert.ok(c.uptime.includes("Get-CimInstance"), c.uptime)
         assert.ok(c.memory.includes("TotalVisibleMemorySize"), c.memory)
         assert.ok(c.proc.includes("Get-Process"), c.proc)
+      } finally {
+        clearDialectCache()
+      }
+    })
+
+    it("builds cmd host load commands via explicit powershell invocation", () => {
+      putCachedDialect("u@h:22", { kind: "cmd", sub: "powershell", detectedAt: Date.now() })
+      try {
+        const c = buildHostLoadCommands("u@h:22")
+        // cmd 无原生负载命令：必须显式调 powershell -EncodedCommand，避免
+        // cmd /c "..." 内层双引号转义问题（现场 188 即 cmd 默认 shell）
+        for (const cmd of [c.uptime, c.memory, c.proc]) {
+          assert.match(cmd, /^powershell -NoProfile -EncodedCommand /, cmd)
+        }
       } finally {
         clearDialectCache()
       }

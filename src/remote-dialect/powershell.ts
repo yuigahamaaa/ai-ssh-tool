@@ -7,7 +7,7 @@ export function psQuote(value: string): string {
 }
 
 /** UTF-16LE→Base64，供 -EncodedCommand 使用（PS 5.1+，无 BOM 可接受）。 */
-function encodePS(script: string): string {
+export function encodePS(script: string): string {
   return Buffer.from(script, "utf16le").toString("base64")
 }
 

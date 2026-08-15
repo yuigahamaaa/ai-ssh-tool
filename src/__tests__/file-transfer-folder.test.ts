@@ -211,6 +211,11 @@ describe("folder transfer via SFTP recursion (non-posix dialect)", () => {
 
       assert.equal(result.success, true)
       assert.ok(calls.mkdirs.length >= 1, `expected remote mkdir calls, got ${JSON.stringify(calls.mkdirs)}`)
+      // 嵌套子目录的父目录必须被递归 mkdir，否则真实 SFTP put 会 ENOENT
+      assert.ok(
+        calls.mkdirs.includes("C:/remote/dir/sub"),
+        `expected nested parent mkdir C:/remote/dir/sub, got ${JSON.stringify(calls.mkdirs)}`,
+      )
       assert.equal(remoteFs.get("C:/remote/dir/a.txt")?.toString(), "aaa")
       assert.equal(remoteFs.get("C:/remote/dir/sub/b.txt")?.toString(), "bbb")
       const execCmds = client.exec.mock.calls.map((c: any) => String(c.arguments[0]))
