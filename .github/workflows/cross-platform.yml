@@ -1,0 +1,68 @@
+name: Cross-Platform Matrix
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  xplat:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+
+      - name: Generate SSH test key
+        shell: bash
+        run: |
+          ssh-keygen -t ed25519 -f "$RUNNER_TEMP/xplat_key" -N "" -q -C xplat-matrix
+          echo "XPLAT_KEY_PATH=$RUNNER_TEMP/xplat_key" >> "$GITHUB_ENV"
+
+      - name: Start sshd and authorize key (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo service ssh start || sudo systemctl start ssh
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          cat "$RUNNER_TEMP/xplat_key.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+
+      - name: Start sshd and authorize key (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo systemsetup -setremotelogin on
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          cat "$RUNNER_TEMP/xplat_key.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+
+      - name: Start sshd with PowerShell default shell (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell `
+            -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -PropertyType String -Force | Out-Null
+          Start-Service sshd
+          $authFile = "C:\ProgramData\ssh\administrators_authorized_keys"
+          Add-Content -Path $authFile -Value (Get-Content "$env:RUNNER_TEMP\xplat_key.pub" -Raw) -NoNewline
+          icacls $authFile /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
+
+      - name: Run cross-platform matrix tests
+        shell: bash
+        env:
+          XPLAT_SSH_HOST: 127.0.0.1
+          XPLAT_SSH_PORT: "22"
+          XPLAT_SSH_USER: ${{ runner.os == 'Windows' && 'runneradmin' || 'runner' }}
+          XPLAT_SSH_KEY: ${{ env.XPLAT_KEY_PATH }}
+        run: npm run test:xplat
