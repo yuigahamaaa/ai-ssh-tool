@@ -5,9 +5,10 @@ import type { DirEntry, RemoteFileStat } from "./remote-fs.js"
 
 export type RemoteFileType = "file" | "directory" | "symlink" | "other"
 
-/** 命令构造选项：kind 缺省 "posix"，传 "powershell" 时生成 PS 语义命令。 */
+/** 命令构造选项：kind 缺省 "posix"，传 "powershell" 时生成 PS 语义命令；strict 启用严格 POSIX 降级。 */
 export interface BuildCommandOptions {
   kind?: DialectKind
+  strict?: boolean
 }
 
 export interface ReadFileMetadata {
@@ -72,7 +73,12 @@ export const MAX_READ_FILE_BYTES = 1024 * 1024
  */
 export const DEFAULT_MAX_RESULTS = 1000
 
-export function buildReadFileMetadataCommand(path: string): string {
+export function buildReadFileMetadataCommand(path: string, opts?: BuildCommandOptions): string {
+  if (opts?.kind === "powershell") {
+    const q = psQuote(path)
+    const outFmt = '"size_bytes=$size`ntotal_lines=$lines`nbinary_detected=false`nencoding=utf-8"'
+    return `$i=Get-Item -LiteralPath ${q} -ErrorAction SilentlyContinue; $size=if($i){$i.Length}else{0}; $lines=(Get-Content -LiteralPath ${q} -ErrorAction SilentlyContinue | Measure-Object -Line).Lines; ${outFmt}`
+  }
   const q = shellQuote(path)
   return [
     `size_bytes=$(wc -c < ${q} 2>/dev/null || echo 0)`,
@@ -82,10 +88,18 @@ export function buildReadFileMetadataCommand(path: string): string {
   ].join("; ")
 }
 
-export function buildReadFileContentCommand(path: string, offset = 0, limit = DEFAULT_READ_LINE_LIMIT): string {
+export function buildReadFileContentCommand(path: string, offset = 0, limit = DEFAULT_READ_LINE_LIMIT, opts?: BuildCommandOptions): string {
   const startLine = Math.max(0, Math.floor(offset)) + 1
   const lineLimit = Math.max(1, Math.floor(limit))
   const endLine = startLine + lineLimit - 1
+  if (opts?.kind === "powershell") {
+    const q = psQuote(path)
+    const joinFmt = '"`n"'
+    return `$lines=Get-Content -LiteralPath ${q}; if($lines.Count -ge ${startLine}){ $lines[(${startLine}-1)..([Math]::Min(${endLine},$lines.Count)-1)] -join ${joinFmt} }`
+  }
+  if (opts?.strict) {
+    return `sed -n '${startLine},${endLine}p' ${shellQuote(path)} | dd bs=1 count=${MAX_READ_FILE_BYTES + 1} 2>/dev/null`
+  }
   return `sed -n '${startLine},${endLine}p' ${shellQuote(path)} | head -c ${MAX_READ_FILE_BYTES + 1}`
 }
 

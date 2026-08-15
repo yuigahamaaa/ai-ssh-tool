@@ -74,6 +74,20 @@ describe("remote file tool command builders", () => {
     assert.ok(cmd.includes("'/x'"), cmd)
   })
 
+  it("builds PowerShell read_file commands when kind is powershell", () => {
+    const meta = buildReadFileMetadataCommand("/x/y.txt", { kind: "powershell" })
+    assert.ok(meta.includes("Get-Item"), meta)
+    assert.ok(meta.includes("Get-Content"), meta)
+    const content = buildReadFileContentCommand("/x/y.txt", 10, 20, { kind: "powershell" })
+    assert.ok(content.includes("Get-Content"), content)
+    assert.ok(content.includes("'/x/y.txt'"), content)
+  })
+
+  it("builds a strict POSIX content command using dd when strict is set", () => {
+    const cmd = buildReadFileContentCommand("/x/y.txt", 10, 20, { strict: true })
+    assert.ok(cmd.includes("dd bs=1 count=1048577"), cmd)
+  })
+
   it("keeps posix builders byte-identical without a kind", () => {
     assert.equal(
       buildStatCommand("/x/y"),

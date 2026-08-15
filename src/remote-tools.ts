@@ -247,7 +247,8 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
           const buffer = await fs.readFile(params.path, { maxBytes: 10 * 1024 * 1024 })
           return (buffer as Buffer).toString("base64")
         }
-        const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path), { timeout: 10000, sessionKey: ctx.sessionKey })
+        const kind = getDialect(ctx.sessionKey).kind
+        const metadataResult = await remoteExec(ctx.client, buildReadFileMetadataCommand(params.path, { kind }), { timeout: 10000, sessionKey: ctx.sessionKey })
         if (metadataResult.code !== 0) {
           throw new Error(`Failed to read metadata for ${params.path}: ${metadataResult.stderr}`)
         }
@@ -257,7 +258,7 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         }
         const contentResult = await remoteExec(
           ctx.client,
-          buildReadFileContentCommand(params.path, params.offset ?? 0, params.limit ?? DEFAULT_READ_LINE_LIMIT),
+          buildReadFileContentCommand(params.path, params.offset ?? 0, params.limit ?? DEFAULT_READ_LINE_LIMIT, { kind }),
           { timeout: 30000, sessionKey: ctx.sessionKey },
         )
         if (contentResult.code !== 0) {
