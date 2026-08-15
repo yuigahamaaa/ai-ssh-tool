@@ -8,9 +8,9 @@
  * - Multiple files in one batch
  */
 
-import type { Client } from "ssh2"
+import type { Client, SFTPWrapper } from "ssh2"
 import { spawn } from "child_process"
-import { createReadStream, createWriteStream, statSync, lstatSync, existsSync, mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "fs"
+import { createReadStream, createWriteStream, statSync, lstatSync, readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "fs"
 import { basename, dirname, join, posix as pathPosix } from "path"
 import { tmpdir } from "os"
 import { createHash, randomUUID } from "crypto"
@@ -611,6 +611,194 @@ function checkLocalDirectoryOverwrite(directoryPath: string, options: FolderTran
   return checkLocalOverwrite(directoryPath, options as FileTransferOptions | undefined)
 }
 
+// --- 非 posix 方言的 SFTP 递归目录传输（替代远端 tar 链） ---
+
+/** 归一化远端路径为 SFTP 友好的正斜杠形式（去尾部斜杠） */
+function normalizeRemoteSftpPath(p: string): string {
+  const normalized = p.replace(/\\/g, "/").replace(/\/+$/, "")
+  return normalized || "/"
+}
+
+/** 打开 SFTP 会话 */
+function openSftp(client: Client): Promise<SFTPWrapper> {
+  return new Promise((resolve, reject) => {
+    client.sftp((err, sftp) => (err ? reject(err) : resolve(sftp)))
+  })
+}
+
+/** 递归 mkdir：逐级创建；已存在（stat 为目录）则忽略；盘符段（如 C:）跳过 */
+async function sftpMkdirP(sftp: SFTPWrapper, dir: string): Promise<void> {
+  const parts = dir.split("/").filter(Boolean)
+  let cur = ""
+  for (const part of parts) {
+    if (/^[A-Za-z]:$/.test(part)) {
+      cur = part
+      continue
+    }
+    cur = cur ? `${cur}/${part}` : part
+    await new Promise<void>((resolve, reject) => {
+      ;(sftp.mkdir as any)(cur, (err: any) => {
+        if (!err) return resolve()
+        sftp.stat(cur, (statErr: any, st: any) => {
+          if (!statErr && typeof st?.isDirectory === "function" && st.isDirectory()) return resolve()
+          reject(err)
+        })
+      })
+    })
+  }
+}
+
+/** SFTP 递归列目录，返回相对路径列表（含子目录） */
+async function sftpReadDirRecursive(sftp: SFTPWrapper, dir: string): Promise<string[]> {
+  const list = await new Promise<Array<{ filename: string; attrs: { isDirectory(): boolean; isSymbolicLink(): boolean } }>>(
+    (resolve, reject) => {
+      sftp.readdir(dir, (err, entries) => (err ? reject(err) : resolve(entries as any)))
+    },
+  )
+  const out: string[] = []
+  for (const it of list) {
+    if (it.attrs.isDirectory()) {
+      const sub = await sftpReadDirRecursive(sftp, dir === "/" ? `/${it.filename}` : `${dir}/${it.filename}`)
+      out.push(...sub.map((s) => `${it.filename}/${s}`))
+    } else {
+      out.push(it.filename)
+    }
+  }
+  return out
+}
+
+/**
+ * SFTP 递归上传（非 posix 方言分支）：本地目录 → 远端目录，逐文件复用 uploadFile
+ * （转码/换行符/校验/进度行为与文件级一致）。
+ */
+async function uploadFolderSftp(
+  client: Client,
+  localPath: string,
+  remotePath: string,
+  options?: FolderTransferOptions,
+): Promise<TransferResult> {
+  const startTime = Date.now()
+  const root = normalizeRemoteSftpPath(remotePath)
+
+  const sftp = await openSftp(client)
+  try {
+    await sftpMkdirP(sftp, root)
+  } finally {
+    try { sftp.end() } catch { /* best-effort */ }
+  }
+
+  // 收集本地文件（相对路径 + 绝对路径 + 字节数），处理 skipSymlinks/followSymlinks
+  const entries: Array<{ rel: string; abs: string; size: number }> = []
+  const walk = (dir: string, rel: string): void => {
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, ent.name)
+      const childRel = rel ? `${rel}/${ent.name}` : ent.name
+      if (ent.isSymbolicLink()) {
+        if (options?.followSymlinks) {
+          const st = statSync(abs)
+          if (st.isDirectory()) walk(abs, childRel)
+          else entries.push({ rel: childRel, abs, size: st.size })
+        }
+        // skipSymlinks 或未 follow：跳过
+        continue
+      }
+      if (ent.isDirectory()) walk(abs, childRel)
+      else entries.push({ rel: childRel, abs, size: statSync(abs).size })
+    }
+  }
+  walk(localPath, "")
+
+  const total = entries.reduce((sum, e) => sum + e.size, 0)
+  for (const e of entries) {
+    const remoteTarget = `${root}/${e.rel}`
+    const res = await uploadFile(client, e.abs, remoteTarget, {
+      onProgress: options?.onProgress ? (p) => options.onProgress!({ ...p, filename: e.rel }) : undefined,
+      timeout: options?.timeout,
+      overwrite: options?.overwrite,
+      fileSizeThreshold: options?.fileSizeThreshold,
+      skipSymlinks: options?.skipSymlinks,
+      lineEnding: options?.lineEnding,
+      encoding: options?.encoding,
+      sourceEncoding: options?.sourceEncoding,
+      sessionKey: options?.sessionKey,
+    })
+    if (res.error) throw new Error(`Failed to upload ${e.rel}: ${res.error}`)
+  }
+  return {
+    success: true,
+    path: root,
+    finalPath: root,
+    requestedPath: remotePath,
+    sourcePath: localPath,
+    action: "uploaded",
+    targetType: "directory",
+    size: total,
+    duration: Date.now() - startTime,
+  }
+}
+
+/**
+ * SFTP 递归下载（非 posix 方言分支）：远端目录 → 本地目录，逐文件复用 downloadFile。
+ */
+async function downloadFolderSftp(
+  client: Client,
+  remotePath: string,
+  localPath: string,
+  options?: FolderTransferOptions,
+): Promise<TransferResult> {
+  const startTime = Date.now()
+  const root = normalizeRemoteSftpPath(remotePath)
+  const folderName = basename(root)
+  const requestedExtractPath = join(localPath, folderName)
+  const targetDecision = checkLocalDirectoryOverwrite(requestedExtractPath, options)
+  if (!targetDecision.proceed) {
+    return {
+      success: true, path: localPath, finalPath: targetDecision.targetPath, requestedPath: localPath,
+      sourcePath: remotePath, action: "skipped", targetType: "directory",
+      overwriteStrategy: targetDecision.strategy, skipped: true, size: 0,
+      duration: Date.now() - startTime,
+    }
+  }
+  const finalExtractPath = targetDecision.targetPath
+
+  const sftp = await openSftp(client)
+  let entries: string[]
+  try {
+    entries = await sftpReadDirRecursive(sftp, root)
+  } finally {
+    try { sftp.end() } catch { /* best-effort */ }
+  }
+
+  for (const rel of entries) {
+    const remoteSrc = `${root}/${rel}`
+    const localTarget = join(finalExtractPath, ...rel.split("/"))
+    mkdirSync(dirname(localTarget), { recursive: true })
+    const res = await downloadFile(client, remoteSrc, localTarget, {
+      onProgress: options?.onProgress ? (p) => options.onProgress!({ ...p, filename: rel }) : undefined,
+      timeout: options?.timeout,
+      overwrite: options?.overwrite,
+      fileSizeThreshold: options?.fileSizeThreshold,
+      skipSymlinks: options?.skipSymlinks,
+      lineEnding: options?.lineEnding,
+      encoding: options?.encoding,
+      sourceEncoding: options?.sourceEncoding,
+      sessionKey: options?.sessionKey,
+    })
+    if (res.error) throw new Error(`Failed to download ${rel}: ${res.error}`)
+  }
+  return {
+    success: true,
+    path: finalExtractPath,
+    finalPath: finalExtractPath,
+    requestedPath: requestedExtractPath,
+    sourcePath: remotePath,
+    action: "downloaded",
+    targetType: "directory",
+    size: 0,
+    duration: Date.now() - startTime,
+  }
+}
+
 /**
  * Upload a single file to remote server via SFTP streaming.
  * Uses streaming for large files - never loads entire file into memory.
@@ -1112,6 +1300,11 @@ export async function uploadFolder(
     throw new Error(`Local path does not exist: ${localPath}`)
   }
 
+  // 非 posix 方言：走 SFTP 递归（远端无可靠 tar 链）
+  if (getDialect(options?.sessionKey).kind !== "posix") {
+    return uploadFolderSftp(client, localPath, remotePath, options)
+  }
+
   const folderName = basename(localPath)
   const tmpFile = join(tmpdir(), `ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`)
   const remoteTmp = `${remoteTempDir(options?.sessionKey)}/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
@@ -1170,8 +1363,14 @@ export async function uploadFolder(
       sessionKey: options?.sessionKey,
     })
 
-    const extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
-    const extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    // GNU tar --overwrite 不可用时（BSD/busybox）降级：清空目标子项后 -xzpf 解压
+    let extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
+    let extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    if (extractResult.code !== 0 && options?.overwrite && finalRemotePath && finalRemotePath !== "/") {
+      await remoteExec(client, `rm -rf ${shellQuote(pathPosix.join(finalRemotePath, "*"))}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
+      extractCmd = `tar -xzpf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)}`
+      extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    }
     if (extractResult.code !== 0) {
       throw new Error(`Failed to extract ${remoteTmp}: ${extractResult.stderr.trim() || `exit code ${extractResult.code}`}`)
     }
@@ -1217,6 +1416,11 @@ export async function downloadFolder(
   const timeout = options?.timeout ?? 5 * 60 * 1000
   const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
+  // 非 posix 方言：走 SFTP 递归（远端无可靠 tar 链）
+  if (getDialect(options?.sessionKey).kind !== "posix") {
+    return downloadFolderSftp(client, remotePath, localPath, options)
+  }
+
   const folderName = basename(remotePath)
   const remoteTmp = `${remoteTempDir(options?.sessionKey)}/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
@@ -1251,8 +1455,13 @@ export async function downloadFolder(
     if (options?.skipSymlinks) tarOptions = ["--no-recursion", "--ignore-failed-read"]
     else if (options?.followSymlinks) tarOptions = ["--dereference"]
 
-    const compressCmd = `tar -I ${shellQuote(`gzip -${compressionLevel}`)} -cf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
-    const compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    // GNU tar -I gzip -N 不可用时（BSD/busybox）降级为 -czf（默认压缩级别）
+    let compressCmd = `tar -I ${shellQuote(`gzip -${compressionLevel}`)} -cf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
+    let compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    if (compressResult.code !== 0) {
+      compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
+      compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    }
     if (compressResult.code !== 0) {
       throw new Error(`Failed to compress ${remotePath}: ${compressResult.stderr.trim() || `exit code ${compressResult.code}`}`)
     }
