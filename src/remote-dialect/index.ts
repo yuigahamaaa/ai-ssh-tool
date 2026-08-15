@@ -1,17 +1,20 @@
 import type { Client } from "ssh2"
 import { log } from "../logger.js"
 import { posixDialect } from "./posix.js"
+import { powershellDialect } from "./powershell.js"
 import { probeAndDetect, type DetectedDialect } from "./detect.js"
 import { getCachedDialect, putCachedDialect, hostIdOf } from "./cache.js"
 import type { DialectKind, DialectSpec } from "./types.js"
 
 export type { DialectKind, DialectSpec } from "./types.js"
 export { posixDialect } from "./posix.js"
+export { powershellDialect } from "./powershell.js"
 export { classifyProbeOutput, probeAndDetect, type DetectedDialect } from "./detect.js"
 export { clearDialectCache, getCachedDialect } from "./cache.js"
 
-/** Phase 2：仅 posix 方言已实现；powershell/cmd 在 P3/P4 落地后切换。 */
+/** P3：powershell 已落地；cmd 在 P4 接入。 */
 function dialectForKind(kind: DialectKind): DialectSpec {
+  if (kind === "powershell") return powershellDialect
   return posixDialect
 }
 
