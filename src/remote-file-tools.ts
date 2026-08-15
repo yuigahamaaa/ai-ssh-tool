@@ -1,7 +1,14 @@
 import { shellQuote } from "./shell-quote.js"
+import { psQuote } from "./remote-dialect/powershell.js"
+import type { DialectKind } from "./remote-dialect/types.js"
 import type { DirEntry, RemoteFileStat } from "./remote-fs.js"
 
 export type RemoteFileType = "file" | "directory" | "symlink" | "other"
+
+/** 命令构造选项：kind 缺省 "posix"，传 "powershell" 时生成 PS 语义命令。 */
+export interface BuildCommandOptions {
+  kind?: DialectKind
+}
 
 export interface ReadFileMetadata {
   sizeBytes: number
@@ -150,7 +157,13 @@ export function formatReadFileResult(params: {
   }
 }
 
-export function buildListDirCommand(path: string, showHidden = false): string {
+export function buildListDirCommand(path: string, showHidden = false, opts?: BuildCommandOptions): string {
+  if (opts?.kind === "powershell") {
+    const q = psQuote(path)
+    const fmt = '"{0}`t{1}`t{2}`t{3}`t{4}`t{5}"'
+    const hiddenFilter = showHidden ? "" : " | Where-Object { -not $_.Name.StartsWith('.') }"
+    return `Get-ChildItem -LiteralPath ${q} -Force -ErrorAction SilentlyContinue${hiddenFilter} | ForEach-Object { $t=if($_.PSIsContainer){'d'}else{'f'}; $mt=[int][double]$_.LastWriteTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalSeconds; ${fmt} -f $_.Name,$t,$_.Length,'0',$mt,$_.FullName }`
+  }
   const hiddenFilter = showHidden ? "" : " ! -name '.*'"
   return `find ${shellQuote(path)} -maxdepth 1 -mindepth 1${hiddenFilter} -printf '%f\\t%y\\t%s\\t%m\\t%T@\\t%p\\n'`
 }
@@ -206,7 +219,12 @@ export function fallbackListDirFromEntries(basePath: string, entries: DirEntry[]
   return { path: basePath, entries: list, raw, strategy: "sftp" }
 }
 
-export function buildStatCommand(path: string): string {
+export function buildStatCommand(path: string, opts?: BuildCommandOptions): string {
+  if (opts?.kind === "powershell") {
+    const q = psQuote(path)
+    const fmt = '"{0}`t{1}`t{2}`t{3}`t{4}`t{5}`t{6}"'
+    return `$i=Get-Item -LiteralPath ${q} -ErrorAction SilentlyContinue; if(-not $i){exit 1}; $t=if($i.PSIsContainer){'directory'}else{'file'}; $mt=[int][double]$i.LastWriteTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalSeconds; ${fmt} -f $t,$i.Length,'0','','',$mt,$i.FullName`
+  }
   return `stat -c '%F\\t%s\\t%a\\t%U\\t%G\\t%Y\\t%n' ${shellQuote(path)}`
 }
 

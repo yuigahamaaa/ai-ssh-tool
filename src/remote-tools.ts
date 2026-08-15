@@ -13,6 +13,7 @@
 import type { Client } from "ssh2"
 import { createRemoteFs, type RemoteFs } from "./remote-fs.js"
 import { remoteExec, type ExecResult } from "./remote-shell.js"
+import { getDialect } from "./remote-dialect/index.js"
 import type { SecurityPolicy } from "./types.js"
 import { shellQuote } from "./shell-quote.js"
 import {
@@ -347,7 +348,8 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string; showHidden?: boolean }) {
-        const result = await remoteExec(ctx.client, buildListDirCommand(params.path, Boolean(params.showHidden)), { timeout: 15000, sessionKey: ctx.sessionKey })
+        const kind = getDialect(ctx.sessionKey).kind
+        const result = await remoteExec(ctx.client, buildListDirCommand(params.path, Boolean(params.showHidden), { kind }), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code === 0) {
           return { ...parseListDirOutput(params.path, result.stdout), strategy: "gnu" as const }
         }
@@ -388,7 +390,8 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         required: ["path"],
       },
       async execute(params: { path: string }) {
-        const result = await remoteExec(ctx.client, buildStatCommand(params.path), { timeout: 10000, sessionKey: ctx.sessionKey })
+        const kind = getDialect(ctx.sessionKey).kind
+        const result = await remoteExec(ctx.client, buildStatCommand(params.path, { kind }), { timeout: 10000, sessionKey: ctx.sessionKey })
         if (result.code === 0) {
           return { ...parseStatOutput(result.stdout), raw: result.stdout, strategy: "gnu" as const }
         }

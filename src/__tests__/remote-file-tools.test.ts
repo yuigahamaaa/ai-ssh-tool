@@ -49,6 +49,29 @@ describe("remote file tool command builders", () => {
     assert.match(buildFindCommand({ path: "/repo", name: "*.ts", type: "f", maxDepth: 2 }), /-printf/)
   })
 
+  it("builds a PowerShell stat command when kind is powershell", () => {
+    const cmd = buildStatCommand("/x/y", { kind: "powershell" })
+    assert.ok(cmd.includes("Get-Item"), cmd)
+    assert.ok(cmd.includes("'/x/y'"), cmd)
+  })
+
+  it("builds a PowerShell list_dir command when kind is powershell", () => {
+    const cmd = buildListDirCommand("/x/y", false, { kind: "powershell" })
+    assert.ok(cmd.includes("Get-ChildItem"), cmd)
+    assert.ok(cmd.includes("'/x/y'"), cmd)
+  })
+
+  it("keeps posix builders byte-identical without a kind", () => {
+    assert.equal(
+      buildStatCommand("/x/y"),
+      "stat -c '%F\\t%s\\t%a\\t%U\\t%G\\t%Y\\t%n' '/x/y'",
+    )
+    assert.equal(
+      buildListDirCommand("/x/y", false),
+      "find '/x/y' -maxdepth 1 -mindepth 1 ! -name '.*' -printf '%f\\t%y\\t%s\\t%m\\t%T@\\t%p\\n'",
+    )
+  })
+
   it("builds portable fallback commands when GNU flags are unavailable", () => {
     assert.match(buildListDirFallbackCommand("/var/log", false), /^sh -c /)
     assert.match(buildListDirFallbackCommand("/var/log", false), /case "\$name" in/)
