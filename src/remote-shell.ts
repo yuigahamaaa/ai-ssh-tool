@@ -7,6 +7,7 @@ import type { Client } from "ssh2"
 import { getGlobalTaskManager, type ExecResult } from "./exec-task-manager.js"
 import { log } from "./logger.js"
 import { getDialect } from "./remote-dialect/index.js"
+import { psQuote } from "./remote-dialect/powershell.js"
 import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 
 /**
@@ -17,7 +18,7 @@ import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 function remoteExecSingle(
   client: Client,
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; sessionKey?: string },
 ): Promise<ExecResult> {
   const taskManager = getGlobalTaskManager()
   const { id, promise } = taskManager.start(client, command, {
@@ -26,6 +27,7 @@ function remoteExecSingle(
     env: options?.env,
     timeout: options?.timeout,
     host: options?.host,
+    sessionKey: options?.sessionKey,
   })
 
   log("exec", `[${id}] Starting: ${command.slice(0, 100)}${command.length > 100 ? "..." : ""}`)
@@ -39,9 +41,11 @@ function remoteExecSingle(
 export async function remoteExec(
   client: Client,
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean; sessionKey?: string },
 ): Promise<ExecResult> {
-  const commands = options?.splitSemicolons === false ? [command] : splitTopLevelSemicolonCommands(command)
+  const dialect = getDialect(options?.sessionKey)
+  const split = options?.splitSemicolons !== false && dialect.supportsSemicolonSplit()
+  const commands = split ? splitTopLevelSemicolonCommands(command) : [command]
   if (commands.length <= 1) return remoteExecSingle(client, command, options)
 
   let stdout = ""
@@ -66,7 +70,7 @@ export async function remoteExec(
 export function execOnChain(
   clients: { client: Client }[],
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; sessionKey?: string },
 ): Promise<ExecResult> {
   if (clients.length === 0) {
     throw new Error("No SSH clients in chain")
@@ -75,16 +79,27 @@ export function execOnChain(
   return remoteExec(finalClient, command, options)
 }
 
-export async function resolveRemoteCwd(client: Client, path: string, baseCwd?: string): Promise<string> {
-  const command = baseCwd
-    ? `cd ${shellQuote(baseCwd)} && cd ${shellQuote(path)} && pwd -P`
-    : `cd ${shellQuote(path)} && pwd -P`
-  const result = await execRemote(client, command, { timeout: 30000 })
+export async function resolveRemoteCwd(
+  client: Client,
+  path: string,
+  baseCwd?: string,
+  sessionKey?: string,
+): Promise<string> {
+  const dialect = getDialect(sessionKey)
+  let command: string
+  if (dialect.kind === "posix") {
+    command = `${baseCwd ? `cd ${shellQuote(baseCwd)} && ` : ""}cd ${shellQuote(path)} && pwd -P`
+  } else if (dialect.kind === "powershell") {
+    command = `${baseCwd ? `Set-Location -LiteralPath ${psQuote(baseCwd)}; ` : ""}Set-Location -LiteralPath ${psQuote(path)}; (Get-Location).Path`
+  } else {
+    command = `${baseCwd ? `cd /d "${baseCwd}" && ` : ""}cd /d "${path}" && cd`
+  }
+  const result = await execRemote(client, command, { timeout: 30000, sessionKey })
   if (result.code !== 0) {
     throw new Error(result.stderr.trim() || `Unable to change directory to ${path}`)
   }
   const cwd = result.stdout.replace(/\r?\n$/, "")
-  if (!cwd || !cwd.startsWith("/")) {
+  if (!cwd || !dialect.isValidAbsPath(cwd)) {
     throw new Error(`Remote directory resolution returned an invalid path for ${path}`)
   }
   return cwd
@@ -101,18 +116,19 @@ export async function resolveRemoteCwd(client: Client, path: string, baseCwd?: s
  */
 /** Best-effort remote process termination. Never waits, never throws, and
  *  must not override the main exec's settled result. */
-function killRemoteProcess(client: Client, pid: number): void {
-  const killCmd = getDialect().buildKill(pid)
+function killRemoteProcess(client: Client, pid: number, sessionKey?: string): void {
+  const killCmd = getDialect(sessionKey).buildKill(pid)
   client.exec(killCmd, () => {})
 }
 
 export function execRemote(
   client: Client,
   command: string,
-  options?: { timeout?: number; maxBufferBytes?: number },
+  options?: { timeout?: number; maxBufferBytes?: number; sessionKey?: string },
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string; stdoutTruncated?: boolean; stderrTruncated?: boolean; remoteProcessMayContinue?: boolean }> {
   const timeoutMs = options?.timeout
   const maxBufferBytes = options?.maxBufferBytes ?? 10 * 1024 * 1024
+  const sessionKey = options?.sessionKey
   return new Promise((resolve, reject) => {
     const stdout: string[] = []
     const stderr: string[] = []
@@ -136,7 +152,7 @@ export function execRemote(
     if (timeoutMs) {
       timer = setTimeout(() => {
         settle(() => {
-          if (pid) killRemoteProcess(client, pid)
+          if (pid) killRemoteProcess(client, pid, sessionKey)
           // Best-effort: close the channel so the remote command doesn't run
           // forever after the caller has already moved on.
           if (streamRef) {
@@ -155,7 +171,7 @@ export function execRemote(
       }, timeoutMs)
     }
 
-    const wrappedCommand = getDialect().buildExec(command)
+    const wrappedCommand = getDialect(sessionKey).buildExec(command)
     client.exec(wrappedCommand, (err: Error | undefined, stream: import("ssh2").ClientChannel) => {
       if (err) {
         settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
@@ -175,7 +191,7 @@ export function execRemote(
             ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
             ...(stderrTruncated ? { stderrTruncated: true } : {}),
           }))
-          if (pid) killRemoteProcess(client, pid)
+          if (pid) killRemoteProcess(client, pid, sessionKey)
           try { stream.close() } catch { /* best-effort */ }
           return
         }
@@ -185,7 +201,7 @@ export function execRemote(
         if (stderrTruncated) return
         const text = data.toString()
         if (!pidCaptured) {
-          const pidMatch = text.match(getDialect().pidMarkerPattern())
+          const pidMatch = text.match(getDialect(sessionKey).pidMarkerPattern())
           if (pidMatch) {
             pid = parseInt(pidMatch[1], 10)
             pidCaptured = true
@@ -220,7 +236,7 @@ export function execRemote(
             ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
             ...(stderrTruncated ? { stderrTruncated: true } : {}),
           }))
-          if (pid) killRemoteProcess(client, pid)
+          if (pid) killRemoteProcess(client, pid, sessionKey)
           try { stream.close() } catch { /* best-effort */ }
           return
         }

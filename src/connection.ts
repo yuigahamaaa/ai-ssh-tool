@@ -11,6 +11,7 @@ import { Client, type ClientChannel, type ConnectConfig } from "ssh2"
 import { EventEmitter } from "events"
 import { log, logError } from "./logger.js"
 import { resolvePrivateKeyContent } from "./private-key.js"
+import { hostIdOf } from "./remote-dialect/cache.js"
 import type {
   ConnectionEvent,
   ConnectionOptions,
@@ -267,6 +268,13 @@ export class SSHConnection extends EventEmitter {
   getFinalHost(): SSHHostConfig {
     if (this.hops.length === 0) throw new Error("Not connected")
     return this.hops[this.hops.length - 1].host
+  }
+
+  /** 目标主机的方言缓存键（user@host:port）。未连接返回空串。 */
+  getHostId(): string {
+    if (this.hops.length === 0) return ""
+    const h = this.hops[this.hops.length - 1].host
+    return hostIdOf(h.host, h.port, h.auth.username)
   }
 
   /** Get the hop chain clients (for advanced use) */

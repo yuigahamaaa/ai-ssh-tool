@@ -11,6 +11,8 @@
 import { SSHSessionManager } from "./session-manager.js"
 import { ProfileManager } from "./profile-manager.js"
 import { createRemoteTools, type RemoteTools } from "./remote-tools.js"
+import { detectAndCache } from "./remote-dialect/index.js"
+import { log } from "./logger.js"
 import type {
   ConnectionOptions,
   SSHConnectionChain,
@@ -68,7 +70,21 @@ export class SSHGateway {
       name,
       timeout: this.config.connectionTimeout,
     }
-    return this.sessions.connect(opts)
+    const session = await this.sessions.connect(opts)
+    this.probeRemoteDialect(session).catch(() => {})
+    return session
+  }
+
+  /** 连接成功后探测远端 shell 方言（best-effort，失败静默回退 posix，不阻塞连接）。 */
+  private async probeRemoteDialect(session: SSHSession): Promise<void> {
+    try {
+      const connection = this.sessions.getConnection(session.id)
+      if (!connection || !connection.isConnected()) return
+      const host = connection.getFinalHost()
+      await detectAndCache(connection.getFinalClient(), host.host, host.port, host.auth.username)
+    } catch (err) {
+      log("gateway", `dialect probe failed for session ${session.id.slice(0, 8)}: ${(err as Error).message}`)
+    }
   }
 
   /** Connect using a simple inline config (convenience for direct / single-hop) */

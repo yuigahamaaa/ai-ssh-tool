@@ -16,6 +16,7 @@ import { EventEmitter } from "events"
 import { rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
+import { clearDialectCache, putCachedDialect } from "../remote-dialect/cache.js"
 
 const testDataDir = join(tmpdir(), `remote-shell-${Date.now()}-${process.pid}`)
 const origDataDir = process.env.SSH_TOOL_DATA_DIR
@@ -226,6 +227,40 @@ describe("remoteExec", () => {
     const result = await remoteExec(client, "sleep 999")
     assert.equal(result.signal, "SIGTERM")
   })
+
+  it("uses the dialect cached for the session key (powershell wrapper)", async () => {
+    putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+    try {
+      let received = ""
+      const client = createMockClient((cmd, cb) => {
+        received = cmd
+        const stream = createMockStream()
+        cb(null, stream)
+        stream.emit("close", 0)
+      })
+      await remoteExec(client, "echo hi", { sessionKey: "u@h:22" })
+      assert.match(received, /^powershell -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand /)
+    } finally {
+      clearDialectCache()
+    }
+  })
+
+  it("does not split semicolons when the dialect does not support it", async () => {
+    putCachedDialect("c@h:22", { kind: "cmd", sub: "cmd", detectedAt: Date.now() })
+    try {
+      let execCount = 0
+      const client = createMockClient((_cmd, cb) => {
+        execCount++
+        const stream = createMockStream()
+        cb(null, stream)
+        stream.emit("close", 0)
+      })
+      await remoteExec(client, "echo a; echo b", { sessionKey: "c@h:22" })
+      assert.equal(execCount, 1)
+    } finally {
+      clearDialectCache()
+    }
+  })
 })
 
 describe("resolveRemoteCwd", () => {
@@ -321,6 +356,26 @@ describe("execRemote", () => {
 
     assert.match(receivedCmd, /^echo "SSH_TOOL_PID:\$\$" >&2; exec sh -c /)
     assert.equal(result.stderr, "real stderr\n")
+  })
+
+  it("execRemote uses the dialect for the session key", async () => {
+    putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+    try {
+      let receivedCmd = ""
+      const client = createMockClient((cmd, cb) => {
+        receivedCmd = cmd
+        const stream = createMockStream()
+        cb(null, stream)
+        process.nextTick(() => stream.emit("close", 0))
+      })
+
+      const result = await execRemote(client, "echo hi", { sessionKey: "u@h:22" })
+
+      assert.equal(result.code, 0)
+      assert.match(receivedCmd, /^powershell -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand /)
+    } finally {
+      clearDialectCache()
+    }
   })
 
   it("terminates the captured remote process when the command times out", async () => {

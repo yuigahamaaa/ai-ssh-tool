@@ -96,9 +96,10 @@ function execScheduledStreamSingle(
   timeoutMs: number,
   onOutput?: (stdout: string, stderr: string) => void,
   onPid?: (pid: number) => void,
+  sessionKey?: string,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
   return new Promise((resolve, reject) => {
-    const wrappedCommand = getDialect().buildExec(command)
+    const wrappedCommand = getDialect(sessionKey).buildExec(command)
     let pid: number | null = null
     let pidCaptured = false
     let settled = false
@@ -120,7 +121,7 @@ function execScheduledStreamSingle(
       timer = setTimeout(() => {
         if (settled) return
         if (pid) {
-          const killCmd = getDialect().buildKill(pid)
+          const killCmd = getDialect(sessionKey).buildKill(pid)
           client.exec(killCmd, () => {})
         }
         try { stream.close() } catch {}
@@ -134,7 +135,7 @@ function execScheduledStreamSingle(
       stream.stderr.on("data", (data: Buffer) => {
         const text = data.toString()
         if (!pidCaptured) {
-          const pidMatch = text.match(getDialect().pidMarkerPattern())
+          const pidMatch = text.match(getDialect(sessionKey).pidMarkerPattern())
           if (pidMatch) {
             pid = parseInt(pidMatch[1], 10)
             onPid?.(pid)
@@ -165,11 +166,12 @@ export async function execScheduledStream(
   onOutput?: (stdout: string, stderr: string) => void,
   onPid?: (pid: number) => void,
   cwd?: string,
+  sessionKey?: string,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
   const commands = splitTopLevelSemicolonCommands(command)
   if (commands.length <= 1) {
     const singleCommand = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command
-    return execScheduledStreamSingle(client, singleCommand, timeoutMs, onOutput, onPid)
+    return execScheduledStreamSingle(client, singleCommand, timeoutMs, onOutput, onPid, sessionKey)
   }
 
   let stdout = ""
@@ -178,7 +180,7 @@ export async function execScheduledStream(
   let signal: string | undefined
   for (const commandPart of commands) {
     const currentCommand = cwd ? `cd ${shellQuote(cwd)} && ${commandPart}` : commandPart
-    const result = await execScheduledStreamSingle(client, currentCommand, timeoutMs, onOutput, onPid)
+    const result = await execScheduledStreamSingle(client, currentCommand, timeoutMs, onOutput, onPid, sessionKey)
     stdout += result.stdout
     stderr += result.stderr
     code = result.code
@@ -251,7 +253,7 @@ export class SSHDaemon {
           const client = conn.getFinalClient()
           return execScheduledStream(client, task.command, task.timeoutMs ?? 120_000, onOutput, (pid) => {
             task.pid = pid
-          }, task.effectiveCwd)
+          }, task.effectiveCwd, task.hostId)
         },
         cancel: (task) => {
           // Backstop cancel: if the scheduler's own background-task
@@ -266,7 +268,7 @@ export class SSHDaemon {
           const direct = this.gateway.sessions.getConnection(task.sessionId)
           if (!direct || !direct.isConnected()) return false
           const client = direct.getFinalClient()
-          const killCmd = getDialect().buildKill(task.pid, { group: true })
+          const killCmd = getDialect(direct.getHostId()).buildKill(task.pid, { group: true })
           client.exec(killCmd, () => {})
           return true
         },
@@ -278,12 +280,13 @@ export class SSHDaemon {
           const conn = this.resolveTaskConnection(task)
           if (!conn) throw new Error(`Session ${task.sessionId} not found for background task`)
           const client = conn.getFinalClient()
+          const hostId = conn.getHostId()
 
           let fullCommand = task.command
           if (task.effectiveCwd) {
             fullCommand = `cd ${shellQuote(task.effectiveCwd)} && ${fullCommand}`
           }
-          const wrappedCommand = getDialect().buildBackground(fullCommand)
+          const wrappedCommand = getDialect(hostId).buildBackground(fullCommand)
 
           let currentPid: number | null = null
           let pidCaptured = false
@@ -333,7 +336,7 @@ export class SSHDaemon {
             stream.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                const pidMatch = text.match(getDialect().pidMarkerPattern())
+                const pidMatch = text.match(getDialect(hostId).pidMarkerPattern())
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
                   task.pid = currentPid
@@ -351,7 +354,7 @@ export class SSHDaemon {
             stream.stderr.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                const pidMatch = text.match(getDialect().pidMarkerPattern())
+                const pidMatch = text.match(getDialect(hostId).pidMarkerPattern())
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
                   task.pid = currentPid
@@ -381,7 +384,7 @@ export class SSHDaemon {
             stop: () => {
               if (closed) return
               if (currentPid) {
-                const killCmd = getDialect().buildKill(currentPid, { group: true })
+                const killCmd = getDialect(hostId).buildKill(currentPid, { group: true })
                 client.exec(killCmd, () => {})
               }
               finalize(128 + 15, "SIGTERM")
@@ -1006,7 +1009,7 @@ export class SSHDaemon {
 
     try {
       const client = connection.getFinalClient()
-      const result = await remoteExec(client, command, { timeout: timeout ?? 30000 })
+      const result = await remoteExec(client, command, { timeout: timeout ?? 30000, sessionKey: connection.getHostId() })
       return { id: req.id, ok: true, data: result }
     } catch (err: any) {
       // Connection might be dead, clean up

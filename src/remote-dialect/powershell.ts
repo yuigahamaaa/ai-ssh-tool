@@ -2,7 +2,7 @@ import { assertEnvName } from "../shell-quote.js"
 import type { DialectSpec } from "./types.js"
 
 /** PS 单引号字符串：唯一特殊字符是 '，转义为 ''。 */
-function psQuote(value: string): string {
+export function psQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
 

@@ -2,6 +2,7 @@ import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "events"
 import { execScheduledStream } from "../daemon.js"
+import { clearDialectCache, putCachedDialect } from "../remote-dialect/cache.js"
 
 class FakeChannel extends EventEmitter {
   stderr = new EventEmitter()
@@ -76,5 +77,27 @@ describe("daemon scheduled streaming runner", () => {
       { stdout: "", stderr: "stderr-1\n" },
     ])
     assert.ok(client.executed[0].includes("exec sh -c"))
+  })
+
+  it("uses the dialect for the task hostId (powershell wrapper)", async () => {
+    putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+    try {
+      const client = new FakeClient()
+      const resultPromise = execScheduledStream(
+        client as any,
+        "echo hi",
+        5000,
+        undefined,
+        undefined,
+        undefined,
+        "u@h:22",
+      )
+      await new Promise(resolve => setImmediate(resolve))
+      client.streams[0]!.emit("close", 0, undefined)
+      await resultPromise
+      assert.match(client.executed[0]!, /^powershell -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand /)
+    } finally {
+      clearDialectCache()
+    }
   })
 })

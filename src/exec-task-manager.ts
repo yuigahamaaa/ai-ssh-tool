@@ -40,6 +40,8 @@ export interface ExecTask {
   updatedAt: number
   profileKey?: string
   sessionId?: string
+  /** 远端方言缓存键（user@host:port），用于选择 cancel 时的 kill 方言。 */
+  sessionKey?: string
   cwd?: string
 }
 
@@ -233,6 +235,8 @@ export class ExecTaskManager {
       /** Explicit host name. Preferred over the ssh2-reflection fallback
        *  in getHostIdentifier. New callers should always pass this. */
       host?: string
+      /** 远端方言缓存键（user@host:port），用于选择远端 shell 方言。 */
+      sessionKey?: string
     }
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
@@ -251,7 +255,7 @@ export class ExecTaskManager {
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null
     const stopCurrent = (): void => {
       if (pid) {
-        const killCmd = getDialect().buildKill(pid)
+        const killCmd = getDialect(options?.sessionKey).buildKill(pid)
         client.exec(killCmd, () => {})
       }
       if (stream) {
@@ -289,7 +293,7 @@ export class ExecTaskManager {
         onClose: (code: number, signal?: string) => void,
         onError: (err: Error) => void,
       ): void => {
-        const wrappedCommand = getDialect().buildExec(command, {
+        const wrappedCommand = getDialect(options?.sessionKey).buildExec(command, {
           cwd: options?.cwd,
           env: options?.env,
         })
@@ -312,8 +316,7 @@ export class ExecTaskManager {
             openedStream.stderr.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                let pidMatch = text.match(getDialect().pidMarkerPattern())
-                if (!pidMatch) pidMatch = text.match(/SSH_TOOL_NOHUP_PID:(\d+)/)
+                const pidMatch = text.match(getDialect(options?.sessionKey).pidMarkerPattern())
                 if (pidMatch) {
                   pid = parseInt(pidMatch[1])
                   pidCaptured = true
@@ -464,7 +467,7 @@ export class ExecTaskManager {
 
     const pid = entry.task.pid
     if (pid && client) {
-      const killCmd = getDialect().buildKill(pid, { signal })
+      const killCmd = getDialect(entry.task.sessionKey).buildKill(pid, { signal })
       log("exec-task", `Cancelling task ${id} PID ${pid}`)
       client.exec(killCmd, () => {})
     }
