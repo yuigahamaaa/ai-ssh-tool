@@ -24,10 +24,16 @@ describe("posixDialect", () => {
     )
   })
 
-  it("buildBackground reproduces the setsid form", () => {
-    assert.equal(
-      posixDialect.buildBackground("sleep 10"),
-      `setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool 'sleep 10'`,
+  it("buildBackground prefers setsid and falls back to nohup when unavailable", () => {
+    const cmd = posixDialect.buildBackground("sleep 10")
+    assert.ok(cmd.startsWith("if command -v setsid >/dev/null 2>&1; then"), cmd)
+    assert.ok(
+      cmd.includes(`setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool 'sleep 10'`),
+      cmd,
+    )
+    assert.ok(
+      cmd.endsWith(`nohup sh -c 'sleep 10' >/dev/null 2>&1 & echo "SSH_TOOL_PID:$!" >&2; fi`),
+      cmd,
     )
   })
 

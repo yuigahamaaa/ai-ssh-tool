@@ -19,7 +19,10 @@ export const posixDialect: DialectSpec = {
   buildBackground(command, opts) {
     let full = command
     if (opts?.cwd) full = `cd ${shellQuote(opts.cwd)} && ${full}`
-    return `setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool ${shellQuote(full)}`
+    // setsid 缺失的环境（macOS 等）退回 nohup：`$!` 即被 exec 的最终命令 PID。
+    const setsidForm = `setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool ${shellQuote(full)}`
+    const nohupForm = `nohup sh -c ${shellQuote(full)} >/dev/null 2>&1 & echo "SSH_TOOL_PID:$!" >&2`
+    return `if command -v setsid >/dev/null 2>&1; then ${setsidForm}; else ${nohupForm}; fi`
   },
 
   buildKill(pid, opts) {
