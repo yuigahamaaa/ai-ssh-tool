@@ -425,12 +425,13 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         caseInsensitive?: boolean
       }) {
         validateCommand("grep", policy)
+        const kind = getDialect(ctx.sessionKey).kind
         let result = await remoteExec(ctx.client, buildGrepCommand({
           pattern: params.pattern,
           path: params.path,
           glob: params.glob,
           caseInsensitive: Boolean(params.caseInsensitive),
-        }), { timeout: 15000, sessionKey: ctx.sessionKey })
+        }, { kind }), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code > 1) {
           result = await remoteExec(ctx.client, buildGrepFallbackCommand({
             pattern: params.pattern,
@@ -474,12 +475,13 @@ export async function createRemoteTools(ctx: RemoteToolContext, policy?: Securit
         maxDepth?: number
       }) {
         validateCommand("find", policy)
+        const kind = getDialect(ctx.sessionKey).kind
         let result = await remoteExec(ctx.client, buildFindCommand({
           path: params.path,
           name: params.name,
           type: params.type as "f" | "d" | "l" | undefined,
           maxDepth: params.maxDepth,
-        }), { timeout: 15000, sessionKey: ctx.sessionKey })
+        }, { kind }), { timeout: 15000, sessionKey: ctx.sessionKey })
         if (result.code !== 0) {
           result = await remoteExec(ctx.client, buildFindFallbackCommand({
             path: params.path,

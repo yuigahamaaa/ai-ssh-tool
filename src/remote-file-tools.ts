@@ -265,7 +265,12 @@ export interface GrepCommandParams {
   caseInsensitive?: boolean
 }
 
-export function buildGrepCommand(params: GrepCommandParams): string {
+export function buildGrepCommand(params: GrepCommandParams, opts?: BuildCommandOptions): string {
+  if (opts?.kind === "powershell") {
+    const caseOpt = params.caseInsensitive ? "" : " -CaseSensitive"
+    const fmt = '"{0}:{1}:{2}"'
+    return `Select-String -Path ${psQuote(params.path)} -Pattern ${psQuote(params.pattern)} -Recurse${caseOpt} -ErrorAction SilentlyContinue | ForEach-Object { ${fmt} -f $_.Path,$_.LineNumber,$_.Line }`
+  }
   let cmd = "grep -RInIZ"
   if (params.caseInsensitive) cmd += "i"
   if (params.glob) cmd += ` --include=${shellQuote(params.glob)}`
@@ -301,7 +306,16 @@ export interface FindCommandParams {
   maxDepth?: number
 }
 
-export function buildFindCommand(params: FindCommandParams): string {
+export function buildFindCommand(params: FindCommandParams, opts?: BuildCommandOptions): string {
+  if (opts?.kind === "powershell") {
+    let cmd = `Get-ChildItem -LiteralPath ${psQuote(params.path)} -Recurse -ErrorAction SilentlyContinue`
+    if (params.maxDepth !== undefined) cmd += ` -Depth ${Math.max(0, Math.floor(params.maxDepth))}`
+    if (params.type) cmd += ` | Where-Object { $_.PSIsContainer -eq $(${params.type === "d"}) }`
+    if (params.name) cmd += ` | Where-Object { $_.Name -like ${psQuote(params.name)} }`
+    const fmt = '"{0}`t{1}`t{2}`t{3}"'
+    cmd += ` | ForEach-Object { $t=if($_.PSIsContainer){'d'}else{'f'}; $mt=[int][double]$_.LastWriteTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalSeconds; ${fmt} -f $_.FullName,$t,$_.Length,$mt }`
+    return cmd
+  }
   let cmd = `find ${shellQuote(params.path)}`
   if (params.maxDepth !== undefined) cmd += ` -maxdepth ${Math.max(0, Math.floor(params.maxDepth))}`
   if (params.type) cmd += ` -type ${params.type}`

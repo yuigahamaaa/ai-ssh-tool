@@ -61,6 +61,19 @@ describe("remote file tool command builders", () => {
     assert.ok(cmd.includes("'/x/y'"), cmd)
   })
 
+  it("builds a PowerShell grep command when kind is powershell", () => {
+    const cmd = buildGrepCommand({ path: "/x", pattern: "needle" }, { kind: "powershell" })
+    assert.ok(cmd.includes("Select-String"), cmd)
+    assert.ok(cmd.includes("'/x'"), cmd)
+    assert.ok(cmd.includes("-CaseSensitive"), cmd)
+  })
+
+  it("builds a PowerShell find command when kind is powershell", () => {
+    const cmd = buildFindCommand({ path: "/x", type: "f", maxDepth: 2 }, { kind: "powershell" })
+    assert.ok(cmd.includes("Get-ChildItem"), cmd)
+    assert.ok(cmd.includes("'/x'"), cmd)
+  })
+
   it("keeps posix builders byte-identical without a kind", () => {
     assert.equal(
       buildStatCommand("/x/y"),
