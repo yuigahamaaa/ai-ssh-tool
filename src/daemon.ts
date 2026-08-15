@@ -38,6 +38,7 @@ import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persisten
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
 import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
+import { getDialect } from "./remote-dialect/index.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 import { SshExecCoordinatorTransport, RemoteCoordinatorClient } from "./coordinator/client.js"
 import { CoordinatorTaskScope } from "./coordinator/task-scope.js"
@@ -97,7 +98,7 @@ function execScheduledStreamSingle(
   onPid?: (pid: number) => void,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
   return new Promise((resolve, reject) => {
-    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(command)}`
+    const wrappedCommand = getDialect().buildExec(command)
     let pid: number | null = null
     let pidCaptured = false
     let settled = false
@@ -119,7 +120,7 @@ function execScheduledStreamSingle(
       timer = setTimeout(() => {
         if (settled) return
         if (pid) {
-          const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+          const killCmd = getDialect().buildKill(pid)
           client.exec(killCmd, () => {})
         }
         try { stream.close() } catch {}
@@ -133,7 +134,7 @@ function execScheduledStreamSingle(
       stream.stderr.on("data", (data: Buffer) => {
         const text = data.toString()
         if (!pidCaptured) {
-          const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+          const pidMatch = text.match(getDialect().pidMarkerPattern())
           if (pidMatch) {
             pid = parseInt(pidMatch[1], 10)
             onPid?.(pid)
@@ -265,7 +266,7 @@ export class SSHDaemon {
           const direct = this.gateway.sessions.getConnection(task.sessionId)
           if (!direct || !direct.isConnected()) return false
           const client = direct.getFinalClient()
-          const killCmd = `kill -TERM -${task.pid} 2>/dev/null || kill -TERM ${task.pid} 2>/dev/null; sleep 0.5; kill -9 -${task.pid} 2>/dev/null || kill -9 ${task.pid} 2>/dev/null; true`
+          const killCmd = getDialect().buildKill(task.pid, { group: true })
           client.exec(killCmd, () => {})
           return true
         },
@@ -282,7 +283,7 @@ export class SSHDaemon {
           if (task.effectiveCwd) {
             fullCommand = `cd ${shellQuote(task.effectiveCwd)} && ${fullCommand}`
           }
-          const wrappedCommand = `setsid sh -c 'echo "SSH_TOOL_PID:$$" >&2; exec sh -c "$1"' ssh-tool ${shellQuote(fullCommand)}`
+          const wrappedCommand = getDialect().buildBackground(fullCommand)
 
           let currentPid: number | null = null
           let pidCaptured = false
@@ -332,7 +333,7 @@ export class SSHDaemon {
             stream.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                const pidMatch = text.match(getDialect().pidMarkerPattern())
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
                   task.pid = currentPid
@@ -350,7 +351,7 @@ export class SSHDaemon {
             stream.stderr.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                const pidMatch = text.match(getDialect().pidMarkerPattern())
                 if (pidMatch) {
                   currentPid = parseInt(pidMatch[1])
                   task.pid = currentPid
@@ -380,7 +381,7 @@ export class SSHDaemon {
             stop: () => {
               if (closed) return
               if (currentPid) {
-                const killCmd = `kill -TERM -${currentPid} 2>/dev/null || kill -TERM ${currentPid} 2>/dev/null; sleep 0.5; kill -9 -${currentPid} 2>/dev/null || kill -9 ${currentPid} 2>/dev/null; true`
+                const killCmd = getDialect().buildKill(currentPid, { group: true })
                 client.exec(killCmd, () => {})
               }
               finalize(128 + 15, "SIGTERM")

@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdir
 import { log } from "./logger.js"
 import { SchedulerService } from "./scheduler/scheduler-service.js"
 import type { ScheduleRequest, TaskRunner } from "./scheduler/types.js"
-import { assertEnvName, shellQuote } from "./shell-quote.js"
+import { getDialect } from "./remote-dialect/index.js"
 import { getExecTasksDir, ensureDir } from "./paths.js"
 
 export type TaskType = "exec" | "background"
@@ -238,17 +238,6 @@ export class ExecTaskManager {
     const id = randomUUID().slice(0, 12)
     const taskType = options?.type ?? "exec"
 
-    let fullCommand = command
-    if (options?.cwd) {
-      fullCommand = `cd ${shellQuote(options.cwd)} && ${fullCommand}`
-    }
-    if (options?.env) {
-      const envPrefix = Object.entries(options.env)
-        .map(([k, v]) => `export ${assertEnvName(k)}=${shellQuote(v)}`)
-        .join(" ")
-      fullCommand = `${envPrefix}; ${fullCommand}`
-    }
-
     // Explicit host from caller takes priority; only fall back to the
     // (ssh2-internals) reflection if the caller didn't supply one.
     const hostname = options?.host ?? getHostIdentifier(client)
@@ -262,7 +251,7 @@ export class ExecTaskManager {
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null
     const stopCurrent = (): void => {
       if (pid) {
-        const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+        const killCmd = getDialect().buildKill(pid)
         client.exec(killCmd, () => {})
       }
       if (stream) {
@@ -300,7 +289,10 @@ export class ExecTaskManager {
         onClose: (code: number, signal?: string) => void,
         onError: (err: Error) => void,
       ): void => {
-        const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(fullCommand)}`
+        const wrappedCommand = getDialect().buildExec(command, {
+          cwd: options?.cwd,
+          env: options?.env,
+        })
         try {
           client.exec(wrappedCommand, (err, openedStream) => {
             if (err) {
@@ -320,7 +312,7 @@ export class ExecTaskManager {
             openedStream.stderr.on("data", (data: Buffer) => {
               const text = data.toString()
               if (!pidCaptured) {
-                let pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+                let pidMatch = text.match(getDialect().pidMarkerPattern())
                 if (!pidMatch) pidMatch = text.match(/SSH_TOOL_NOHUP_PID:(\d+)/)
                 if (pidMatch) {
                   pid = parseInt(pidMatch[1])
@@ -472,7 +464,7 @@ export class ExecTaskManager {
 
     const pid = entry.task.pid
     if (pid && client) {
-      const killCmd = `kill -${signal} ${pid} 2>/dev/null; sleep 0.1; kill -9 ${pid} 2>/dev/null; true`
+      const killCmd = getDialect().buildKill(pid, { signal })
       log("exec-task", `Cancelling task ${id} PID ${pid}`)
       client.exec(killCmd, () => {})
     }

@@ -6,6 +6,7 @@
 import type { Client } from "ssh2"
 import { getGlobalTaskManager, type ExecResult } from "./exec-task-manager.js"
 import { log } from "./logger.js"
+import { getDialect } from "./remote-dialect/index.js"
 import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 
 /**
@@ -101,7 +102,7 @@ export async function resolveRemoteCwd(client: Client, path: string, baseCwd?: s
 /** Best-effort remote process termination. Never waits, never throws, and
  *  must not override the main exec's settled result. */
 function killRemoteProcess(client: Client, pid: number): void {
-  const killCmd = `kill -TERM ${pid} 2>/dev/null; sleep 0.1; kill -KILL ${pid} 2>/dev/null; true`
+  const killCmd = getDialect().buildKill(pid)
   client.exec(killCmd, () => {})
 }
 
@@ -154,7 +155,7 @@ export function execRemote(
       }, timeoutMs)
     }
 
-    const wrappedCommand = `echo "SSH_TOOL_PID:$$" >&2; exec sh -c ${shellQuote(command)}`
+    const wrappedCommand = getDialect().buildExec(command)
     client.exec(wrappedCommand, (err: Error | undefined, stream: import("ssh2").ClientChannel) => {
       if (err) {
         settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
@@ -184,7 +185,7 @@ export function execRemote(
         if (stderrTruncated) return
         const text = data.toString()
         if (!pidCaptured) {
-          const pidMatch = text.match(/SSH_TOOL_PID:(\d+)/)
+          const pidMatch = text.match(getDialect().pidMarkerPattern())
           if (pidMatch) {
             pid = parseInt(pidMatch[1], 10)
             pidCaptured = true
