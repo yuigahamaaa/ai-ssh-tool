@@ -100,6 +100,8 @@ export interface SSHProfile {
   chain: Omit<SSHHostConfig, "id">[]
   tags?: string[]
   lastUsed?: number
+  /** 声明式远端 shell 提示，设置后跳过自动探测（受限环境旁路）。 */
+  remoteShellHint?: "posix" | "powershell" | "cmd"
 }
 
 /** Security policy for remote tool operations */
