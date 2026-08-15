@@ -629,13 +629,13 @@ function openSftp(client: Client): Promise<SFTPWrapper> {
 /** 递归 mkdir：逐级创建；已存在（stat 为目录）则忽略；盘符段（如 C:）跳过 */
 async function sftpMkdirP(sftp: SFTPWrapper, dir: string): Promise<void> {
   const parts = dir.split("/").filter(Boolean)
-  let cur = ""
+  let cur = dir.startsWith("/") ? "/" : ""
   for (const part of parts) {
     if (/^[A-Za-z]:$/.test(part)) {
       cur = part
       continue
     }
-    cur = cur ? `${cur}/${part}` : part
+    cur = cur === "/" ? `/${part}` : cur ? `${cur}/${part}` : part
     await new Promise<void>((resolve, reject) => {
       ;(sftp.mkdir as any)(cur, (err: any) => {
         if (!err) return resolve()

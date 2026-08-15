@@ -22,6 +22,7 @@ import { lstatSync, readFileSync } from "fs"
 import { resolve } from "path"
 import { SSHGateway } from "./gateway.js"
 import { remoteExec } from "./remote-shell.js"
+import { createRemoteFs } from "./remote-fs.js"
 import { upload, download } from "./file-transfer.js"
 import { PortForwardManager } from "./port-forwarding.js"
 import { ProfileManager, sanitizeProfile } from "./profile-manager.js"
@@ -147,6 +148,7 @@ interface ClientCacheEntry {
   client: any
   forwardManager: PortForwardManager
   sessionId: string
+  hostId: string
 }
 
 const MCP_AGENT_ID = `mcp-${randomUUID().slice(0, 8)}`
@@ -181,6 +183,52 @@ export function assertLocalPathSafeForTransfer(localPath: string, operation: str
     if (err?.code === "ENOENT") return
     throw err
   }
+}
+
+/** SFTP 递归 mkdir（逐级；已存在则忽略；盘符段跳过）。 */
+async function sftpMkdirP(client: any, dir: string): Promise<void> {
+  if (!dir || dir === "/") return
+  const sftp = await new Promise<any>((resolve, reject) => {
+    client.sftp((err: any, s: any) => (err ? reject(err) : resolve(s)))
+  })
+  try {
+    const parts = dir.split("/").filter(Boolean)
+    let cur = dir.startsWith("/") ? "/" : ""
+    for (const part of parts) {
+      if (/^[A-Za-z]:$/.test(part)) {
+        cur = part
+        continue
+      }
+      cur = cur === "/" ? `/${part}` : cur ? `${cur}/${part}` : part
+      await new Promise<void>((resolve, reject) => {
+        sftp.mkdir(cur, (err: any) => {
+          if (!err) return resolve()
+          sftp.stat(cur, (statErr: any, st: any) => {
+            if (!statErr && typeof st?.isDirectory === "function" && st.isDirectory()) return resolve()
+            reject(err)
+          })
+        })
+      })
+    }
+  } finally {
+    try { sftp.end() } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Write a remote file via SFTP (create parent dirs + writeFile). Replaces
+ * the `echo <b64> | base64 -d > path` pipeline: no ARG_MAX limit, no
+ * dependence on remote base64, and works on Windows OpenSSH.
+ */
+export async function writeRemoteFileViaSftp(
+  client: any,
+  path: string,
+  content: string | Buffer,
+  mode?: string,
+): Promise<void> {
+  const fs = await createRemoteFs(client)
+  await sftpMkdirP(client, remoteParentDir(path))
+  await fs.writeFile(path, content, mode ? { mode: parseInt(assertOctalMode(mode), 8) } : undefined)
 }
 
 async function main() {
@@ -221,14 +269,14 @@ async function main() {
   // first-time calls for the same profile share ONE underlying SSH connect
   // instead of each racing to build its own full chain (which would create
   // C×hopCount clients and leak all but the last into the session map).
-  const pendingConnections = new Map<string, Promise<{ client: any; forwardManager: PortForwardManager }>>()
+  const pendingConnections = new Map<string, Promise<{ client: any; forwardManager: PortForwardManager; hostId: string }>>()
 
   // Helper: Get or create SSH connection for a profile
   async function getClientForProfile(
     profileName: string | undefined,
     profileJson: string | undefined,
     profileFile: string | undefined,
-  ): Promise<{ client: any; forwardManager: PortForwardManager }> {
+  ): Promise<{ client: any; forwardManager: PortForwardManager; hostId: string }> {
     let profile: SSHProfile | undefined
 
     if (profileName) {
@@ -351,8 +399,8 @@ async function main() {
       const forwardManager = new PortForwardManager(client)
       log("mcp", `Connected to ${targetHost.host} (profile: ${currentProfile.name})`)
 
-      clientCache.set(cacheKey, { client, forwardManager, sessionId: session.id })
-      return { client, forwardManager }
+      clientCache.set(cacheKey, { client, forwardManager, sessionId: session.id, hostId: connection.getHostId() })
+      return { client, forwardManager, hostId: connection.getHostId() }
     })().finally(() => {
       // Drop the in-flight entry only if it's still the one we registered
       // (a later re-registration after eviction must not be clobbered).
@@ -435,13 +483,13 @@ async function main() {
     profileName: string | undefined,
     profileJson: string | undefined,
     profileFile: string | undefined,
-    fn: (client: any) => Promise<T>,
+    fn: (client: any, sessionKey?: string) => Promise<T>,
   ): Promise<T> {
     let lastError: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
-      const { client } = await getClientForProfile(profileName, profileJson, profileFile)
+      const { client, hostId } = await getClientForProfile(profileName, profileJson, profileFile)
       try {
-        return await fn(client)
+        return await fn(client, hostId)
       } catch (err: unknown) {
         lastError = err
         if (attempt === 0 && isConnectionError(err)) {
@@ -909,17 +957,12 @@ async function main() {
       assertPathAllowed(path)
       const outcome = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
         await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
-        const dirCmd = `mkdir -p ${shellQuote(remoteParentDir(path))}`
-        await remoteExec(client, dirCmd, { timeout: 10000 })
-        const b64 = Buffer.from(content).toString("base64")
-        const writeCmd = mode
-          ? `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)} && chmod ${assertOctalMode(mode)} ${shellQuote(path)}`
-          : `echo ${shellQuote(b64)} | base64 -d > ${shellQuote(path)}`
-        const result = await remoteExec(client, writeCmd, { timeout: 30000 })
-        if (result.code !== 0) {
-          return { ok: false as const, stderr: result.stderr }
+        try {
+          await writeRemoteFileViaSftp(client, path, content, mode)
+          return { ok: true as const }
+        } catch (e) {
+          return { ok: false as const, stderr: (e as Error).message }
         }
-        return { ok: true as const }
       })
       if (!outcome.ok) {
         return { content: [{ type: "text" as const, text: jsonText(mcpErrorEnvelope("file_result", `Error writing file: ${outcome.stderr}`)) }] }

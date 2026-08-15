@@ -4,6 +4,7 @@ import ssh2 from "ssh2"
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
+import { Writable } from "stream"
 import { SSHConnection } from "../connection.js"
 import { remoteExec } from "../remote-shell.js"
 import { getGlobalTaskManager } from "../exec-task-manager.js"
@@ -12,7 +13,7 @@ import { createRemoteTools } from "../remote-tools.js"
 import type { SSHHostConfig } from "../types.js"
 
 import { createStableEd25519KeyPair } from "./ssh-test-key.js"
-import { buildCwdGuidance, assertLocalPathSafeForTransfer } from "../mcp-server.js"
+import { buildCwdGuidance, assertLocalPathSafeForTransfer, writeRemoteFileViaSftp } from "../mcp-server.js"
 
 const { Server } = ssh2
 const hostKey = createStableEd25519KeyPair()
@@ -316,6 +317,34 @@ describe("MCP Server Tool Integration", () => {
       writeFileSync(target, "secret")
       symlinkSync(target, link)
       assert.throws(() => assertLocalPathSafeForTransfer(link, "upload"), /symbolic link/)
+    })
+  })
+
+  describe("ssh_write_file via SFTP", () => {
+    it("mkdirs parents and writes via sftp without a base64 echo pipeline", async () => {
+      const mkdirs: string[] = []
+      const writes: Array<{ path: string; data: string }> = []
+      const sftp: any = {
+        mkdir: (p: string, cb: any) => { mkdirs.push(String(p)); cb(null) },
+        stat: (_p: string, cb: any) => cb(new Error("not found")),
+        createWriteStream: (p: string) => {
+          const w = new Writable({
+            write(chunk, _enc, cb) { writes.push({ path: String(p), data: chunk.toString() }); cb() },
+          })
+          return w
+        },
+        end: () => {},
+      }
+      const client: any = {
+        sftp: (cb: any) => cb(null, sftp),
+        exec: () => { throw new Error("exec must not be called") },
+      }
+
+      await writeRemoteFileViaSftp(client, "/remote/deep/file.txt", "hello", "644")
+
+      assert.ok(mkdirs.includes("/remote/deep"), `expected recursive mkdir, got: ${JSON.stringify(mkdirs)}`)
+      assert.equal(writes[0]?.path, "/remote/deep/file.txt")
+      assert.equal(writes[0]?.data, "hello")
     })
   })
 })
