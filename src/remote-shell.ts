@@ -18,7 +18,7 @@ import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
 function remoteExecSingle(
   client: Client,
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; sessionKey?: string },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; sessionKey?: string; force?: boolean },
 ): Promise<ExecResult> {
   const taskManager = getGlobalTaskManager()
   const { id, promise } = taskManager.start(client, command, {
@@ -28,6 +28,7 @@ function remoteExecSingle(
     timeout: options?.timeout,
     host: options?.host,
     sessionKey: options?.sessionKey,
+    force: options?.force,
   })
 
   log("exec", `[${id}] Starting: ${command.slice(0, 100)}${command.length > 100 ? "..." : ""}`)
@@ -41,7 +42,7 @@ function remoteExecSingle(
 export async function remoteExec(
   client: Client,
   command: string,
-  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean; sessionKey?: string },
+  options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean; sessionKey?: string; force?: boolean },
 ): Promise<ExecResult> {
   const dialect = getDialect(options?.sessionKey)
   const split = options?.splitSemicolons !== false && dialect.supportsSemicolonSplit()

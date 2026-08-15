@@ -1340,7 +1340,15 @@ export async function uploadFolder(
       { timeout, scope },
     )
     if (compress.code !== 0) {
-      throw new Error(`Failed to compress ${localPath}: ${compress.stderr.trim()}`)
+      // BSD/bsdtar（macOS 等）不支持 -I 压缩程序参数：降级 -czf（默认压缩级别）
+      log("transfer", `tar -I gzip failed locally, retrying with -czf: ${compress.stderr.trim()}`)
+      const plainCompress = await runTar(
+        ["-czf", tmpFile, ...tarOptions, "-C", localPath, "."],
+        { timeout, scope },
+      )
+      if (plainCompress.code !== 0) {
+        throw new Error(`Failed to compress ${localPath}: ${plainCompress.stderr.trim()}`)
+      }
     }
 
     const localStat = statSync(tmpFile)
@@ -1367,7 +1375,7 @@ export async function uploadFolder(
     let extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
     let extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
     if (extractResult.code !== 0 && options?.overwrite && finalRemotePath && finalRemotePath !== "/") {
-      await remoteExec(client, `rm -rf ${shellQuote(pathPosix.join(finalRemotePath, "*"))}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
+      await remoteExec(client, `rm -rf ${shellQuote(pathPosix.join(finalRemotePath, "*"))}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
       extractCmd = `tar -xzpf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)}`
       extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
     }

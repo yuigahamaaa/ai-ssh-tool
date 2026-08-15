@@ -237,6 +237,8 @@ export class ExecTaskManager {
       host?: string
       /** 远端方言缓存键（user@host:port），用于选择远端 shell 方言。 */
       sessionKey?: string
+      /** 内部受控操作（如传输管线的守卫清理）跳过 scheduler 风险确认。 */
+      force?: boolean
     }
   ): { id: string; promise: Promise<ExecResult> } {
     const id = randomUUID().slice(0, 12)
@@ -411,6 +413,7 @@ export class ExecTaskManager {
         scheduler: "bypass",
         reason: "exec-task-manager facade",
         background: taskType === "background",
+        ...(options?.force === true ? { force: true } : {}),
       }, runner)
 
       if (decision.action !== "run_now" && decision.action !== "queued") {
