@@ -326,6 +326,19 @@ function buildTransformChain(options?: FileTransferOptions): Transform[] {
   return chain
 }
 
+/** 按远端方言构造移动/重命名命令 */
+function remoteMoveCommand(src: string, dst: string, sessionKey?: string): string {
+  const kind = getDialect(sessionKey).kind
+  if (kind === "powershell") return `Move-Item -LiteralPath ${psQuote(src)} -Destination ${psQuote(dst)}`
+  if (kind === "cmd") return `move /Y "${src}" "${dst}"`
+  return `mv ${shellQuote(src)} ${shellQuote(dst)}`
+}
+
+/** 远端临时目录：仅 posix 需要远端 tar 临时文件；非 posix 走 SFTP 递归不产生 remoteTmp */
+function remoteTempDir(sessionKey?: string): string {
+  return getDialect(sessionKey).kind === "posix" ? "/tmp" : "."
+}
+
 /** Check overwrite strategy and decide action */
 async function checkOverwrite(
   client: Client,
@@ -352,7 +365,7 @@ async function checkOverwrite(
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, `mv ${shellQuote(remotePath)} ${shellQuote(backupPath)}`, { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey })
+      await remoteExec(client, remoteMoveCommand(remotePath, backupPath, options?.sessionKey), { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey })
       return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
@@ -1101,7 +1114,7 @@ export async function uploadFolder(
 
   const folderName = basename(localPath)
   const tmpFile = join(tmpdir(), `ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`)
-  const remoteTmp = `/tmp/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
+  const remoteTmp = `${remoteTempDir(options?.sessionKey)}/ssh-upload-${randomUUID().slice(0, 8)}.tar.gz`
   const scope = createTransferScope()
   scope.localTempFiles.push(tmpFile)
   scope.remoteTempPaths.push(remoteTmp)
@@ -1205,7 +1218,7 @@ export async function downloadFolder(
   const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
   const folderName = basename(remotePath)
-  const remoteTmp = `/tmp/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
+  const remoteTmp = `${remoteTempDir(options?.sessionKey)}/ssh-download-${randomUUID().slice(0, 8)}.tar.gz`
   const tmpFile = join(tmpdir(), `ssh-download-${randomUUID().slice(0, 8)}.tar.gz`)
   const scope = createTransferScope()
   scope.localTempFiles.push(tmpFile)

@@ -291,6 +291,31 @@ describe("File Transfer - Overwrite Strategies", () => {
     assert.equal(result.requestedPath, "/remote/uploads/")
     assert.equal(memFs.get("/remote/uploads/skip-dir-target.txt")?.toString(), "old content")
   })
+
+  it("uses a PowerShell Move-Item for the backup overwrite when the session dialect is powershell", async () => {
+    putCachedDialect("u@h:22", { kind: "powershell", sub: "powershell", detectedAt: Date.now() })
+    try {
+      const localPath = join(tmpDir, "ps-backup.txt")
+      writeFileSync(localPath, "new content")
+      memFs.set("/remote/ps-backup.txt", Buffer.from("old content"))
+      execCommands.length = 0
+      // 探测序列：remoteIsDir(FILE) → remotePathExists(YES) → backup move
+      remoteExecQueue.push({ stdout: "FILE\n" })
+      remoteExecQueue.push({ stdout: "YES\n" })
+      remoteExecQueue.push({ stdout: "" })
+      const result = await uploadFile(conn.getFinalClient(), localPath, "/remote/ps-backup.txt", {
+        overwrite: "backup",
+        sessionKey: "u@h:22",
+      })
+      assert.equal(result.success, true)
+      assert.ok(
+        execCommands.some((c) => (decodePsEncodedCommand(c) ?? c).includes("Move-Item -LiteralPath")),
+        `expected PowerShell Move-Item backup, got: ${JSON.stringify(execCommands)}`,
+      )
+    } finally {
+      clearDialectCache()
+    }
+  })
 })
 
 describe("File Transfer - Line Ending Conversion", () => {
