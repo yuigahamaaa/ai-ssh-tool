@@ -1,4 +1,5 @@
 import { createHash } from "crypto"
+import { ProfileManager } from "./profile-manager.js"
 import type { SSHProfile } from "./types.js"
 import type {
   AgentIdentity,
@@ -27,7 +28,7 @@ export interface McpScheduleRequestInput {
 }
 
 export function profileToLegacyConfigJson(profile: SSHProfile): string {
-  const chain = profile.chain
+  const chain = ProfileManager.chainFromProfile(profile)
   const target = chain[chain.length - 1]
   const gateways = chain.slice(0, -1)
 
@@ -38,6 +39,8 @@ export function profileToLegacyConfigJson(profile: SSHProfile): string {
       username: g.auth.username,
       password: g.auth.password,
       privateKey: g.auth.privateKey,
+      ...(g.strictHostKeyChecking !== undefined ? { strictHostKeyChecking: g.strictHostKeyChecking } : {}),
+      ...(g.knownHostsPath !== undefined ? { knownHostsPath: g.knownHostsPath } : {}),
     })),
     target: {
       host: target.host,
@@ -45,6 +48,8 @@ export function profileToLegacyConfigJson(profile: SSHProfile): string {
       username: target.auth.username,
       password: target.auth.password,
       privateKey: target.auth.privateKey,
+      ...(target.strictHostKeyChecking !== undefined ? { strictHostKeyChecking: target.strictHostKeyChecking } : {}),
+      ...(target.knownHostsPath !== undefined ? { knownHostsPath: target.knownHostsPath } : {}),
     },
   })
 }

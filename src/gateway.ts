@@ -20,6 +20,7 @@ import type {
   SSHProfile,
   SSHSession,
   SSHHostConfig,
+  SSHHostKeyOptions,
 } from "./types.js"
 
 export class SSHGateway {
@@ -94,16 +95,18 @@ export class SSHGateway {
     username: string
     password?: string
     privateKey?: string
+    strictHostKeyChecking?: SSHHostKeyOptions["strictHostKeyChecking"]
+    knownHostsPath?: string
     /**
      * Jump hosts to connect through. If not provided, uses defaultGateways from config.
      * Pass `jumpHosts: []` explicitly to skip default gateways and connect directly.
      */
-    jumpHosts?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[]
+    jumpHosts?: (SSHHostKeyOptions & { host: string; port?: number; username: string; password?: string; privateKey?: string })[]
     name?: string
   }): Promise<SSHSession> {
     const chain = buildSimpleChain(params, this.config.defaultGateways)
-  return this.connectByChain(chain, params.name)
-}
+    return this.connectByChain(chain, params.name)
+  }
 
   /** Connect by resolving a hostname through ~/.ssh/config */
   async connectBySSHConfig(
@@ -141,6 +144,8 @@ export class SSHGateway {
     username: string
     password?: string
     privateKey?: string
+    strictHostKeyChecking?: SSHHostKeyOptions["strictHostKeyChecking"]
+    knownHostsPath?: string
   }[]): void {
     this.config.defaultGateways = gateways
   }
@@ -209,10 +214,12 @@ export function buildSimpleChain(
     username: string
     password?: string
     privateKey?: string
-    jumpHosts?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[]
+    strictHostKeyChecking?: SSHHostKeyOptions["strictHostKeyChecking"]
+    knownHostsPath?: string
+    jumpHosts?: (SSHHostKeyOptions & { host: string; port?: number; username: string; password?: string; privateKey?: string })[]
     name?: string
   },
-  defaultGateways?: { host: string; port?: number; username: string; password?: string; privateKey?: string }[],
+  defaultGateways?: (SSHHostKeyOptions & { host: string; port?: number; username: string; password?: string; privateKey?: string })[],
 ): SSHConnectionChain {
   const chain: SSHConnectionChain = []
 
@@ -231,6 +238,8 @@ export function buildSimpleChain(
       name: gw.host,
       host: gw.host,
       port: gw.port ?? 22,
+      strictHostKeyChecking: gw.strictHostKeyChecking,
+      knownHostsPath: gw.knownHostsPath,
       auth: {
         username: gw.username,
         password: gw.password,
@@ -245,6 +254,8 @@ export function buildSimpleChain(
     name: params.host,
     host: params.host,
     port: params.port ?? 22,
+    strictHostKeyChecking: params.strictHostKeyChecking,
+    knownHostsPath: params.knownHostsPath,
     auth: {
       username: params.username,
       password: params.password,

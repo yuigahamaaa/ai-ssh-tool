@@ -36,10 +36,10 @@ import { upload, download } from "../file-transfer.js"
 import { enableDebug, log, logError, printErrorAndLogPath } from "../logger.js"
 import type { ScheduleRequest, AgentIdentity, HostIdentity, TaskIntent, TaskCost, TaskUrgency } from "../scheduler/types.js"
 import { ProfileManager } from "../profile-manager.js"
-import type { SSHProfile } from "../types.js"
+import type { SSHHostKeyOptions, SSHProfile } from "../types.js"
 import { targetIdentityHash } from "../mcp-scheduler-contract.js"
 
-interface HostConfig {
+interface HostConfig extends SSHHostKeyOptions {
   host: string
   port?: number
   username: string
@@ -218,7 +218,7 @@ Profile 格式:
  * Convert a profile (or legacy config) to SshExecConfig
  */
 function profileToLegacyConfig(profile: SSHProfile): SshExecConfig {
-  const chain = profile.chain
+  const chain = ProfileManager.chainFromProfile(profile)
   const target = chain[chain.length - 1]
   const gateways = chain.slice(0, -1)
   
@@ -228,14 +228,18 @@ function profileToLegacyConfig(profile: SSHProfile): SshExecConfig {
       port: g.port,
       username: g.auth.username,
       password: g.auth.password,
-      privateKey: g.auth.privateKey
+      privateKey: g.auth.privateKey,
+      ...(g.strictHostKeyChecking !== undefined ? { strictHostKeyChecking: g.strictHostKeyChecking } : {}),
+      ...(g.knownHostsPath !== undefined ? { knownHostsPath: g.knownHostsPath } : {}),
     })),
     target: {
       host: target.host,
       port: target.port,
       username: target.auth.username,
       password: target.auth.password,
-      privateKey: target.auth.privateKey
+      privateKey: target.auth.privateKey,
+      ...(target.strictHostKeyChecking !== undefined ? { strictHostKeyChecking: target.strictHostKeyChecking } : {}),
+      ...(target.knownHostsPath !== undefined ? { knownHostsPath: target.knownHostsPath } : {}),
     }
   }
 }
@@ -300,6 +304,8 @@ async function execCommand(config: SshExecConfig, command: string): Promise<void
       username: g.username,
       password: g.password,
       privateKey: g.privateKey,
+      strictHostKeyChecking: g.strictHostKeyChecking,
+      knownHostsPath: g.knownHostsPath,
     }))
 
     log("exec", "Connecting...")
@@ -309,6 +315,8 @@ async function execCommand(config: SshExecConfig, command: string): Promise<void
       username: config.target.username,
       password: config.target.password,
       privateKey: config.target.privateKey,
+      strictHostKeyChecking: config.target.strictHostKeyChecking,
+      knownHostsPath: config.target.knownHostsPath,
       jumpHosts,
       name: `exec-${Date.now()}`,
     })
@@ -351,6 +359,8 @@ async function interactiveShell(config: SshExecConfig): Promise<void> {
       username: g.username,
       password: g.password,
       privateKey: g.privateKey,
+      strictHostKeyChecking: g.strictHostKeyChecking,
+      knownHostsPath: g.knownHostsPath,
     }))
 
     const session = await gw.connectSimple({
@@ -359,6 +369,8 @@ async function interactiveShell(config: SshExecConfig): Promise<void> {
       username: config.target.username,
       password: config.target.password,
       privateKey: config.target.privateKey,
+      strictHostKeyChecking: config.target.strictHostKeyChecking,
+      knownHostsPath: config.target.knownHostsPath,
       jumpHosts,
       name: `shell-${Date.now()}`,
     })

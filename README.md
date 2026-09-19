@@ -102,6 +102,47 @@ AI coding agents (Claude, Cursor, Copilot, etc.) need to work on remote servers 
 | Password obfuscation | XOR obfuscation (NOT encryption, just prevents casual viewing) |
 | Task file permissions | Task JSON files have 600 permissions |
 
+#### SSH host-key verification
+
+Every SSH hop uses `strictHostKeyChecking: "accept-new"` by default. The first
+key is appended to `known_hosts`; a later key change is rejected with the
+algorithm, old/new SHA256 fingerprints, and the exact line to review. The
+known-hosts file defaults to `~/.ssh/known_hosts`, but can be overridden per
+profile or per hop with `knownHostsPath`.
+
+```json
+{
+  "name": "prod-through-bastion",
+  "strictHostKeyChecking": "accept-new",
+  "knownHostsPath": "~/.ssh/known_hosts",
+  "chain": [
+    {
+      "name": "pooled-bastion",
+      "host": "bastion.corp.com",
+      "port": 22,
+      "strictHostKeyChecking": "no",
+      "auth": { "username": "ops", "privateKey": "..." }
+    },
+    {
+      "name": "target",
+      "host": "10.3.3.3",
+      "port": 22,
+      "auth": { "username": "root", "privateKey": "..." }
+    }
+  ]
+}
+```
+
+The profile value is the default for its hops; a hop value wins. Use
+`"yes"` to require a matching entry, or explicitly use `"no"` for a pooled or
+shared-address jump host whose members intentionally have different keys.
+Host-key verification checks the server identity and is orthogonal to login
+authentication: it does not ask for another password or key and does not
+change the existing profile authentication format. If the file is missing or
+cannot be updated, ssh-tool emits a warning and continues; it never replaces
+an existing entry. For a changed key, verify the new fingerprint, delete the
+reported `known_hosts` line, or set that hop to `strictHostKeyChecking: "no"`.
+
 ---
 
 ### Quick Start
@@ -442,6 +483,8 @@ All MCP file tools return a JSON envelope with `ok`, `kind`, `data`, `error`, an
 | `target.port` | No | 22 | SSH port |
 | `target.privateKey` | No | — | Private key content |
 | `gateways` | No | [] | Jump host chain |
+| `strictHostKeyChecking` | No | `accept-new` | Host-key policy (`accept-new`, `yes`, or `no`) |
+| `knownHostsPath` | No | `~/.ssh/known_hosts` | Known-hosts file path; profile/hop override |
 | `timeout` | No | 30000 | Connection timeout (ms) |
 
 ---
@@ -644,6 +687,44 @@ AI 编程助手（Claude、Cursor、Copilot 等）需要通过 SSH 操作远程�
 | 目录权限 | 平台数据目录下的 `profiles/` 权限为 700（仅所有者可访问）；旧版 `~/.opencode/ssh/` 仍可读取 |
 | 密码混淆 | XOR 混淆（非加密，仅防随手看） |
 | 任务文件权限 | 任务 JSON 文件权限为 600 |
+
+#### SSH 主机密钥校验
+
+每一跳默认使用 `strictHostKeyChecking: "accept-new"`：首次连接会把主机
+密钥追加到 `known_hosts`，之后指纹变化会拒绝连接，并提示算法、新旧
+SHA256 指纹以及应检查的具体行。默认路径是 `~/.ssh/known_hosts`，也可以
+在 profile 或单独某一跳设置 `knownHostsPath`。
+
+```json
+{
+  "name": "prod-through-bastion",
+  "strictHostKeyChecking": "accept-new",
+  "knownHostsPath": "~/.ssh/known_hosts",
+  "chain": [
+    {
+      "name": "pooled-bastion",
+      "host": "bastion.corp.com",
+      "port": 22,
+      "strictHostKeyChecking": "no",
+      "auth": { "username": "ops", "privateKey": "..." }
+    },
+    {
+      "name": "target",
+      "host": "10.3.3.3",
+      "port": 22,
+      "auth": { "username": "root", "privateKey": "..." }
+    }
+  ]
+}
+```
+
+profile 级策略会作为各跳默认值，单跳字段优先；`"yes"` 要求已有匹配条目，
+池化/共享地址的跳转机可显式设 `"no"` 维持原有行为。主机密钥校验与登录
+认证正交：它只校验服务器身份，不关心跳转机有没有密码、客户端使用密码还是
+密钥/agent，不需要用户额外输入凭据，也不改变现有 profile 认证字段。文件
+不存在或不可写时只告警并继续，已有条目不会被覆盖。指纹变化时，请先核验新
+指纹，再删除错误提示中的 `known_hosts` 行，或把该跳设为
+`strictHostKeyChecking: "no"`。
 
 ---
 

@@ -382,6 +382,39 @@ describe("ProfileManager", () => {
         { message: /missing chain/ },
       )
     })
+
+    it("applies profile host-key defaults to each hop while preserving hop overrides and auth", () => {
+      const profile = ProfileManager.normalizeProfile({
+        id: "host-key-profile",
+        name: "host-key-profile",
+        strictHostKeyChecking: "accept-new",
+        knownHostsPath: "/tmp/profile-known_hosts",
+        chain: [
+          {
+            name: "pooled-gateway",
+            host: "10.0.0.1",
+            port: 22,
+            strictHostKeyChecking: "no",
+            auth: { username: "jump", privateKey: "JUMP_KEY" },
+          },
+          {
+            name: "target",
+            host: "10.0.0.2",
+            port: 2222,
+            auth: { username: "deploy", password: "TARGET_PASSWORD" },
+          },
+        ],
+      } as any)
+
+      const chain = ProfileManager.chainFromProfile(profile)
+
+      assert.equal(chain[0].strictHostKeyChecking, "no")
+      assert.equal(chain[1].strictHostKeyChecking, "accept-new")
+      assert.equal(chain[0].knownHostsPath, "/tmp/profile-known_hosts")
+      assert.equal(chain[1].knownHostsPath, "/tmp/profile-known_hosts")
+      assert.deepEqual(chain[0].auth, { username: "jump", privateKey: "JUMP_KEY" })
+      assert.deepEqual(chain[1].auth, { username: "deploy", password: "TARGET_PASSWORD" })
+    })
   })
 
   describe("sanitizeProfile", () => {

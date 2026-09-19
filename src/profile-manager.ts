@@ -85,6 +85,8 @@ export function sanitizeProfile(profile: SSHProfile): SSHProfile {
         name: hop.name,
         host: hop.host,
         port: hop.port,
+        strictHostKeyChecking: hop.strictHostKeyChecking,
+        knownHostsPath: hop.knownHostsPath,
         auth: {
           username: auth.username ?? "",
           hasPassword: Boolean(auth.password),
@@ -317,7 +319,11 @@ export class ProfileManager {
    * Convert a profile's chain to SSHHostConfig[]
    */
   static chainFromProfile(profile: SSHProfile): SSHHostConfig[] {
-    return profile.chain.map(ProfileManager.hostFromProfile)
+    return profile.chain.map((host) => ProfileManager.hostFromProfile({
+      ...host,
+      strictHostKeyChecking: host.strictHostKeyChecking ?? profile.strictHostKeyChecking,
+      knownHostsPath: host.knownHostsPath ?? profile.knownHostsPath,
+    }))
   }
 
   /**

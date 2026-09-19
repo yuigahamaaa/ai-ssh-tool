@@ -90,6 +90,29 @@ describe("MCP scheduler contract", () => {
     })
   })
 
+  it("preserves profile host-key defaults and per-hop overrides in legacy config", () => {
+    const source = {
+      ...profile(),
+      strictHostKeyChecking: "accept-new" as const,
+      knownHostsPath: "/tmp/profile-known_hosts",
+      chain: [
+        {
+          ...profile().chain[0],
+          strictHostKeyChecking: "no" as const,
+          knownHostsPath: "/tmp/gateway-known_hosts",
+        },
+        profile().chain[1],
+      ],
+    }
+
+    const config = JSON.parse(profileToLegacyConfigJson(source))
+
+    assert.equal(config.gateways[0].strictHostKeyChecking, "no")
+    assert.equal(config.gateways[0].knownHostsPath, "/tmp/gateway-known_hosts")
+    assert.equal(config.target.strictHostKeyChecking, "accept-new")
+    assert.equal(config.target.knownHostsPath, "/tmp/profile-known_hosts")
+  })
+
   it("targetIdentityHash is stable for the same target identity", () => {
     const base = { host: "target.example.com", port: 2222, username: "deploy" }
     assert.equal(targetIdentityHash(base), targetIdentityHash({ ...base }))

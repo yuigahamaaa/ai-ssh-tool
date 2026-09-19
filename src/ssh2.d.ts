@@ -12,6 +12,8 @@ declare module "ssh2" {
     passphrase?: string
     readyTimeout?: number
     sock?: Socket | Readable
+    /** Verify the remote server host key before authentication. */
+    hostVerifier?: (key: Buffer, verify?: (permitted: boolean) => void) => boolean | void
     /** Path to SSH agent socket or 'pageant' on Windows, or an Agent instance */
     agent?: string | BaseAgent
     /** Enable agent forwarding (requires `agent` to be set) */

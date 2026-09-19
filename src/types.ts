@@ -15,8 +15,19 @@ export interface SSHCredentials {
   agentForward?: boolean
 }
 
+/** Host-key verification policy for one SSH hop or a profile default. */
+export type StrictHostKeyChecking = "accept-new" | "yes" | "no"
+
+/** Host-key settings shared by profiles and individual hops. */
+export interface SSHHostKeyOptions {
+  /** Accept and remember new keys, require known keys, or disable checking. */
+  strictHostKeyChecking?: StrictHostKeyChecking
+  /** Optional OpenSSH known_hosts file used for this hop. */
+  knownHostsPath?: string
+}
+
 /** A single SSH host in the connection chain */
-export interface SSHHostConfig {
+export interface SSHHostConfig extends SSHHostKeyOptions {
   id: string
   name: string
   host: string
@@ -98,6 +109,10 @@ export interface SSHProfile {
   alias?: string
   /** Ordered host chain */
   chain: Omit<SSHHostConfig, "id">[]
+  /** Default host-key policy copied to hops that do not override it. */
+  strictHostKeyChecking?: StrictHostKeyChecking
+  /** Default known_hosts path copied to hops that do not override it. */
+  knownHostsPath?: string
   tags?: string[]
   lastUsed?: number
   /** 声明式远端 shell 提示，设置后跳过自动探测（受限环境旁路）。 */
@@ -143,13 +158,13 @@ export interface SSHGatewayPluginConfig {
    * Then `connectSimple({ host: "10.0.0.50", username: "deploy" })` will automatically
    * connect through gw.corp.com -> bastion.local -> 10.0.0.50
    */
-  defaultGateways?: {
+  defaultGateways?: (SSHHostKeyOptions & {
     host: string
     port?: number
     username: string
     password?: string
     privateKey?: string
-  }[]
+  })[]
   /** Security policy applied to all remote tool operations */
   securityPolicy?: SecurityPolicy
   /** Path to SSH config file (default: ~/.ssh/config) */

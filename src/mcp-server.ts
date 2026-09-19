@@ -28,7 +28,7 @@ import { PortForwardManager } from "./port-forwarding.js"
 import { ProfileManager, sanitizeProfile } from "./profile-manager.js"
 import { enableDebug, log } from "./logger.js"
 import { checkDeps } from "./check-deps.js"
-import type { SSHProfile, SSHHostConfig, SecurityPolicy } from "./types.js"
+import type { SSHProfile, SSHHostConfig, SSHHostKeyOptions, SecurityPolicy } from "./types.js"
 import { DaemonClient } from "./daemon-client.js"
 import type { AgentIdentity, CwdSource, HostIdentity, TaskIntent, TaskCost, TaskUrgency, ScheduleDecision } from "./scheduler/types.js"
 import { createMcpScheduleRequest, profileToLegacyConfigJson, targetIdentityHash } from "./mcp-scheduler-contract.js"
@@ -57,7 +57,7 @@ import {
 import { CommandRegistryStore, type CommandExecutionMode } from "./command-registry.js"
 import { assertRemotePathAllowedWithSymlinkCheck, checkBlockedPath, checkReadOnly, validateCommand } from "./remote-tools.js"
 
-interface HostConfig {
+interface HostConfig extends SSHHostKeyOptions {
   host: string
   port?: number
   username: string
@@ -362,6 +362,8 @@ async function main() {
             name: g.host,
             host: g.host,
             port: g.port ?? 22,
+            strictHostKeyChecking: g.strictHostKeyChecking,
+            knownHostsPath: g.knownHostsPath,
             auth: {
               username: g.username,
               password: g.password,
@@ -372,6 +374,8 @@ async function main() {
             name: initialConfig.target.host,
             host: initialConfig.target.host,
             port: initialConfig.target.port ?? 22,
+            strictHostKeyChecking: initialConfig.target.strictHostKeyChecking,
+            knownHostsPath: initialConfig.target.knownHostsPath,
             auth: {
               username: initialConfig.target.username,
               password: initialConfig.target.password,
@@ -425,24 +429,9 @@ async function main() {
 
     const connectPromise = (async () => {
       const currentProfile = profile
-      const jumpHosts = currentProfile.chain.slice(0, -1).map((h) => ({
-        host: h.host,
-        port: h.port ?? 22,
-        username: h.auth.username,
-        password: h.auth.password,
-        privateKey: h.auth.privateKey,
-      }))
-
-      const targetHost = currentProfile.chain[currentProfile.chain.length - 1]
-      const session = await gw.connectSimple({
-        host: targetHost.host,
-        port: targetHost.port ?? 22,
-        username: targetHost.auth.username,
-        password: targetHost.auth.password,
-        privateKey: targetHost.auth.privateKey,
-        jumpHosts,
-        name: `mcp-${currentProfile.name}`,
-      })
+      const chain = ProfileManager.chainFromProfile(currentProfile)
+      const targetHost = chain[chain.length - 1]
+      const session = await gw.connectByChain(chain, `mcp-${currentProfile.name}`)
 
       const connection = gw.sessions.getConnection(session.id)
       if (!connection) throw new Error("Failed to establish SSH connection")
@@ -719,12 +708,16 @@ async function main() {
             name: g.host,
             host: g.host,
             port: g.port ?? 22,
+            strictHostKeyChecking: g.strictHostKeyChecking,
+            knownHostsPath: g.knownHostsPath,
             auth: { username: g.username, password: g.password, privateKey: g.privateKey },
           })),
           {
             name: initialConfig.target.host,
             host: initialConfig.target.host,
             port: initialConfig.target.port ?? 22,
+            strictHostKeyChecking: initialConfig.target.strictHostKeyChecking,
+            knownHostsPath: initialConfig.target.knownHostsPath,
             auth: { username: initialConfig.target.username, password: initialConfig.target.password, privateKey: initialConfig.target.privateKey },
           },
         ],

@@ -139,6 +139,24 @@ describe("SSHGateway", () => {
       assert.equal(chain.length - 1, 2)
       assert.equal(chain.map((h) => h.name).join(" -> "), "gw1.com -> gw2.com -> target.com")
     })
+
+    it("should preserve host-key settings on target and jump hops", () => {
+      const chain = buildSimpleChain({
+        ...makeGateway("target.com"),
+        strictHostKeyChecking: "accept-new",
+        knownHostsPath: "/tmp/target-known_hosts",
+        jumpHosts: [{
+          ...makeGateway("pooled-gw.com"),
+          strictHostKeyChecking: "no",
+          knownHostsPath: "/tmp/gateway-known_hosts",
+        }],
+      }, [])
+
+      assert.equal(chain[0].strictHostKeyChecking, "no")
+      assert.equal(chain[0].knownHostsPath, "/tmp/gateway-known_hosts")
+      assert.equal(chain[1].strictHostKeyChecking, "accept-new")
+      assert.equal(chain[1].knownHostsPath, "/tmp/target-known_hosts")
+    })
   })
 
   describe("connectSimple", () => {

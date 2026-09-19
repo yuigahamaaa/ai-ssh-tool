@@ -801,6 +801,8 @@ export class SSHDaemon {
       username: g.username,
       password: g.password,
       privateKey: g.privateKey,
+      strictHostKeyChecking: g.strictHostKeyChecking,
+      knownHostsPath: g.knownHostsPath,
     }))
 
     try {
@@ -811,6 +813,8 @@ export class SSHDaemon {
           username: config.target.username,
           password: config.target.password,
           privateKey: config.target.privateKey,
+          strictHostKeyChecking: config.target.strictHostKeyChecking,
+          knownHostsPath: config.target.knownHostsPath,
           jumpHosts,
           name: `daemon-${config.target.host}`,
         })

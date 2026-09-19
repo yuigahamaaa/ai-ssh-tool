@@ -18,6 +18,49 @@
 12. 输出被截断时读 `stdoutPath` / `stderrPath`，不要重跑命令。
 13. 跨调用保持目录用 `ssh_cd` 或显式 `cwd`，不要依赖远端 shell 的 `cd`。
 
+## 主机密钥校验
+
+ssh-tool 对每一跳默认使用 `strictHostKeyChecking: "accept-new"`。首次连接
+会把服务器主机密钥追加到 `known_hosts`；已记录主机的指纹变化会拒绝连接，
+并返回 host:port、算法、新旧 SHA256 fingerprint、`known_hosts` 行号以及
+修复指引。
+
+profile 可以提供默认值，单独一跳可以覆盖它：
+
+```json
+{
+  "name": "prod",
+  "strictHostKeyChecking": "accept-new",
+  "knownHostsPath": "~/.ssh/known_hosts",
+  "chain": [
+    {
+      "name": "pooled-bastion",
+      "host": "192.168.50.7",
+      "port": 22,
+      "strictHostKeyChecking": "no",
+      "auth": { "username": "ops", "privateKey": "..." }
+    },
+    {
+      "name": "target",
+      "host": "10.0.0.20",
+      "port": 22,
+      "auth": { "username": "deploy", "privateKey": "..." }
+    }
+  ]
+}
+```
+
+- `strictHostKeyChecking: "accept-new"`：未知主机追加，已知指纹变化拒绝。
+- `strictHostKeyChecking: "yes"`：要求已有匹配条目。
+- `strictHostKeyChecking: "no"`：显式关闭该跳校验，适用于池化/共享地址跳转机，行为与旧版本一致。
+- `knownHostsPath`：自定义文件路径，支持 `~`；普通和 hashed host 条目都能匹配。
+
+主机密钥校验与登录认证正交：`hostVerifier` 校验的是服务器身份，与跳转机
+是否有密码、客户端使用密码还是私钥/agent 无关。开启后不需要额外输入凭据，
+也不改变现有 profile 的认证字段。文件不存在或不可写时只输出警告并继续；
+已有条目不会被覆盖。遇到指纹变化时，先核验新指纹，再删除错误提示指定的
+`known_hosts` 行，或对该跳设置 `strictHostKeyChecking: "no"`。
+
 ## 返回结构读取规则
 
 调度相关 MCP 工具统一返回 JSON envelope。AI 应优先读取这些字段：

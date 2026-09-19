@@ -12,6 +12,7 @@ import { EventEmitter } from "events"
 import { log, logError } from "./logger.js"
 import { resolvePrivateKeyContent } from "./private-key.js"
 import { hostIdOf } from "./remote-dialect/cache.js"
+import { DEFAULT_STRICT_HOST_KEY_CHECKING, KnownHostsStore } from "./known-hosts.js"
 import type {
   ConnectionEvent,
   ConnectionOptions,
@@ -97,6 +98,7 @@ export class SSHConnection extends EventEmitter {
   /** Direct TCP connection to a host */
   private connectDirect(client: Client, host: SSHHostConfig, timeout: number): Promise<void> {
     return new Promise((resolve, reject) => {
+      let hostKeyVerificationError: Error | undefined
       const timer = setTimeout(() => {
         client.destroy()
         reject(new Error(`Connection to ${host.host}:${host.port} timed out`))
@@ -113,13 +115,15 @@ export class SSHConnection extends EventEmitter {
         clearTimeout(timer)
         client.removeListener("ready", onReady)
         client.destroy()
-        reject(new Error(`Failed to connect to ${host.host}:${host.port}: ${err.message}`))
+        reject(hostKeyVerificationError ?? new Error(`Failed to connect to ${host.host}:${host.port}: ${err.message}`))
       }
 
       client.once("ready", onReady)
       client.once("error", onError)
 
-      client.connect(this.toConnectConfig(host, timeout))
+      client.connect(this.toConnectConfig(host, timeout, (error) => {
+        hostKeyVerificationError = error
+      }))
     })
   }
 
@@ -133,6 +137,7 @@ export class SSHConnection extends EventEmitter {
     const throughClient = this.hops[throughHopIndex].client
 
     return new Promise((resolve, reject) => {
+      let hostKeyVerificationError: Error | undefined
       const timer = setTimeout(() => {
         client.destroy()
         reject(new Error(`Tunnel to ${host.host}:${host.port} via hop ${throughHopIndex} timed out`))
@@ -163,14 +168,16 @@ export class SSHConnection extends EventEmitter {
             clearTimeout(timer)
             client.removeListener("ready", onReady)
             client.destroy()
-            reject(new Error(`Failed to connect to ${host.host}:${host.port} through tunnel: ${clientErr.message}`))
+            reject(hostKeyVerificationError ?? new Error(`Failed to connect to ${host.host}:${host.port} through tunnel: ${clientErr.message}`))
           }
 
           client.once("ready", onReady)
           client.once("error", onError)
 
           client.connect({
-            ...this.toConnectConfig(host),
+            ...this.toConnectConfig(host, undefined, (error) => {
+              hostKeyVerificationError = error
+            }),
             sock: stream,
           })
         },
@@ -303,7 +310,11 @@ export class SSHConnection extends EventEmitter {
 
   /** Convert SSHHostConfig to ssh2 ConnectConfig. `readyTimeoutMs` lets callers
    *  (e.g. tests) override the default 10-second handshake timeout. */
-  private toConnectConfig(host: SSHHostConfig, readyTimeoutMs?: number): ConnectConfig {
+  private toConnectConfig(
+    host: SSHHostConfig,
+    readyTimeoutMs?: number,
+    onHostKeyError?: (error: Error) => void,
+  ): ConnectConfig {
     const config: ConnectConfig = {
       host: host.host,
       port: host.port,
@@ -311,6 +322,20 @@ export class SSHConnection extends EventEmitter {
       readyTimeout: readyTimeoutMs ?? 10000,
       keepaliveInterval: 30000,
       keepaliveCountMax: 3,
+    }
+
+    const strictHostKeyChecking = host.strictHostKeyChecking ?? DEFAULT_STRICT_HOST_KEY_CHECKING
+    if (strictHostKeyChecking !== "no") {
+      const knownHosts = new KnownHostsStore(host.knownHostsPath)
+      config.hostVerifier = (key: Buffer) => {
+        const result = knownHosts.verify(host.host, host.port, key, strictHostKeyChecking)
+        if (!result.accepted) {
+          const error = result.error ?? new Error(`Host key verification failed for ${host.host}:${host.port}`)
+          onHostKeyError?.(error)
+          return false
+        }
+        return true
+      }
     }
 
     if (host.auth.password) {
