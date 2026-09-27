@@ -57,6 +57,14 @@ describe("SSHDaemon", () => {
     rmSync(tmpDir, { recursive: true, force: true })
   })
 
+  it("keeps remote coordination disabled unless explicitly opted in", async () => {
+    daemon = new SSHDaemon({ pipePath })
+    assert.equal((daemon as any).coordinatorEnabled, false)
+    const enabled = new SSHDaemon({ pipePath: `${pipePath}.enabled`, enableCoordinator: true })
+    assert.equal((enabled as any).coordinatorEnabled, true)
+    await enabled.shutdown()
+  })
+
   describe("concurrent connectJson dedup", () => {
     it("deduplicates concurrent connectHostJson requests for the same config", async () => {
       daemon = new SSHDaemon({ pipePath, idleTimeoutMs: 60000 })

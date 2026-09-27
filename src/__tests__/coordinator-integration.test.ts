@@ -37,4 +37,22 @@ describe("coordinator task integration", () => {
     assert.equal(metadata.coordinationUnavailable, true)
     await scope.finish("failed")
   })
+
+  it("releases a lease that arrives after the task has already finished", async () => {
+    const calls: string[] = []
+    let releaseBegin!: (value: any) => void
+    const client = new RemoteCoordinatorClient({
+      async request(request) {
+        calls.push(request.action)
+        if (request.action === "beginTask") return await new Promise(resolve => { releaseBegin = resolve })
+        return { ok: true, data: {} }
+      },
+    })
+    const scope = new CoordinatorTaskScope(client, { clientId: "00000000-0000-4000-8000-000000000002", workspace: "/srv/app", kind: "write", summary: "edit", ttlMs: 60_000 })
+    const begin = scope.begin()
+    await scope.finish("success")
+    releaseBegin({ ok: true, data: { taskId: "00000000-0000-4000-8000-000000000003", leaseToken: "late-token" } })
+    await begin
+    assert.deepEqual(calls, ["beginTask", "finishTask"])
+  })
 })

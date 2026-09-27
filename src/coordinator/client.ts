@@ -39,31 +39,68 @@ export class UnixSocketCoordinatorTransport implements CoordinatorTransport {
 }
 
 export class SshExecCoordinatorTransport implements CoordinatorTransport {
-  constructor(private readonly client: Client, private readonly helperCommand = "ssh-tool-coordinator-helper") {}
+  constructor(
+    private readonly client: Client,
+    private readonly helperCommand = "ssh-tool-coordinator-helper",
+    private readonly timeoutMs = 3000,
+  ) {}
 
   request(request: CoordinatorRequest): Promise<CoordinatorResponse> {
     return new Promise((resolve, reject) => {
       const command = `${this.helperCommand}`
-      this.client.exec(command, (error, stream) => {
-        if (error) { reject(error); return }
-        let stdout = ""
-        let stderr = ""
-        let settled = false
-        const finish = (failure?: Error): void => {
-          if (settled) return
-          settled = true
-          if (failure) reject(failure)
-          else {
-            try { resolve(JSON.parse(stdout.trim()) as CoordinatorResponse) }
-            catch { reject(new Error(`COORDINATION_PROTOCOL_ERROR: ${stderr || "invalid helper response"}`)) }
-          }
+      let stdout = ""
+      let stderr = ""
+      let settled = false
+      let streamRef: any = null
+      const maxResponseBytes = 256 * 1024
+      const finish = (failure?: Error): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (failure) {
+          try { streamRef?.close?.() } catch {}
+          reject(failure)
+          return
         }
-        stream.on("data", (chunk: Buffer | string) => { stdout += chunk.toString() })
-        stream.stderr?.on("data", (chunk: Buffer | string) => { stderr += chunk.toString() })
-        stream.on("error", (streamError: Error) => finish(streamError))
-        stream.on("close", (code?: number) => code && code !== 0 ? finish(new Error(`COORDINATION_UNAVAILABLE: helper exited ${code}`)) : finish())
-        stream.write(`${JSON.stringify(request)}\\n`)
-      })
+        try { resolve(JSON.parse(stdout.trim()) as CoordinatorResponse) }
+        catch { reject(new Error(`COORDINATION_PROTOCOL_ERROR: ${stderr || "invalid helper response"}`)) }
+      }
+      const timer = setTimeout(() => finish(new Error("COORDINATION_UNAVAILABLE: helper request timed out")), this.timeoutMs)
+
+      try {
+        this.client.exec(command, (error, stream) => {
+          if (error) { finish(new Error(`COORDINATION_UNAVAILABLE: ${error.message}`)); return }
+          streamRef = stream
+          if (settled) {
+            try { stream.close?.() } catch {}
+            return
+          }
+          stream.on("data", (chunk: Buffer | string) => {
+            if (settled) return
+            stdout += chunk.toString()
+            if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxResponseBytes) {
+              finish(new Error("COORDINATION_PROTOCOL_ERROR: helper response exceeds limit"))
+            }
+          })
+          stream.stderr?.on("data", (chunk: Buffer | string) => {
+            if (settled) return
+            stderr += chunk.toString()
+            if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxResponseBytes) {
+              finish(new Error("COORDINATION_PROTOCOL_ERROR: helper response exceeds limit"))
+            }
+          })
+          stream.on("error", (streamError: Error) => finish(new Error(`COORDINATION_UNAVAILABLE: ${streamError.message}`)))
+          stream.on("close", (code?: number) => code && code !== 0
+            ? finish(new Error(`COORDINATION_UNAVAILABLE: helper exited ${code}`))
+            : finish())
+          // The helper reads one newline-delimited request from stdin. Use a
+          // real newline and close stdin so it can dispatch immediately.
+          stream.write(`${JSON.stringify(request)}\n`)
+          ;(stream as any).end?.()
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 }

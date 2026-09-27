@@ -37,7 +37,7 @@ import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
-import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
+import { shellQuote } from "./shell-quote.js"
 import { getDialect } from "./remote-dialect/index.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 import { SshExecCoordinatorTransport, RemoteCoordinatorClient } from "./coordinator/client.js"
@@ -104,6 +104,7 @@ function execScheduledStreamSingle(
     let pidCaptured = false
     let settled = false
     let timer: ReturnType<typeof setTimeout> | null = null
+    let streamRef: ClientChannel | null = null
 
     const settle = (fn: () => void): void => {
       if (settled) return
@@ -112,50 +113,67 @@ function execScheduledStreamSingle(
       fn()
     }
 
-    client.exec(wrappedCommand, (err: Error | undefined, stream: ClientChannel) => {
-      if (err) {
-        settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
-        return
+    // Start the deadline before asking ssh2 to open a channel. A dead or
+    // half-open connection can leave the exec callback pending forever.
+    timer = setTimeout(() => {
+      if (pid) {
+        const killCmd = getDialect(sessionKey).buildKill(pid)
+        try { client.exec(killCmd, () => {}) } catch {}
       }
+      if (streamRef) {
+        try { streamRef.close() } catch {}
+      }
+      settle(() => resolve({ code: 124, stdout: "", stderr: "", signal: "TERM" }))
+    }, timeoutMs)
 
-      timer = setTimeout(() => {
-        if (settled) return
-        if (pid) {
-          const killCmd = getDialect(sessionKey).buildKill(pid)
-          client.exec(killCmd, () => {})
+    try {
+      client.exec(wrappedCommand, (err: Error | undefined, stream: ClientChannel) => {
+        if (err) {
+          settle(() => reject(new Error(`Failed to exec: ${err.message}`)))
+          return
         }
-        try { stream.close() } catch {}
-        settle(() => resolve({ code: 124, stdout: "", stderr: "", signal: "TERM" }))
-      }, timeoutMs)
+        streamRef = stream
+        if (settled) {
+          try { stream.close() } catch {}
+          return
+        }
 
-      stream.on("data", (data: Buffer) => {
-        onOutput?.(data.toString(), "")
-      })
+        stream.on("data", (data: Buffer) => {
+          if (!settled) onOutput?.(data.toString(), "")
+        })
 
-      stream.stderr.on("data", (data: Buffer) => {
-        const text = data.toString()
-        if (!pidCaptured) {
-          const pidMatch = text.match(getDialect(sessionKey).pidMarkerPattern())
-          if (pidMatch) {
-            pid = parseInt(pidMatch[1], 10)
-            onPid?.(pid)
-            pidCaptured = true
-            const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, "")
-            if (remaining) onOutput?.("", remaining)
+        stream.stderr.on("data", (data: Buffer) => {
+          if (settled) return
+          const text = data.toString()
+          if (!pidCaptured) {
+            const pidMatch = text.match(getDialect(sessionKey).pidMarkerPattern())
+            if (pidMatch) {
+              pid = parseInt(pidMatch[1], 10)
+              onPid?.(pid)
+              pidCaptured = true
+              const remaining = text.replace(/SSH_TOOL_PID:\d+\n?/, "")
+              if (remaining) onOutput?.("", remaining)
+              return
+            }
+          }
+          onOutput?.("", text)
+        })
+
+        stream.on("close", (code?: number, signal?: string) => {
+          if (code === undefined) {
+            settle(() => reject(new Error("Stream closed without an exit code (connection may have dropped)")))
             return
           }
-        }
-        onOutput?.("", text)
-      })
+          settle(() => resolve({ code, stdout: "", stderr: "", signal }))
+        })
 
-      stream.on("close", (code?: number, signal?: string) => {
-        settle(() => resolve({ code: code ?? 0, stdout: "", stderr: "", signal }))
+        stream.on("error", (streamErr: Error) => {
+          settle(() => reject(new Error(`Stream error: ${streamErr.message}`)))
+        })
       })
-
-      stream.on("error", (streamErr: Error) => {
-        settle(() => reject(new Error(`Stream error: ${streamErr.message}`)))
-      })
-    })
+    } catch (err) {
+      settle(() => reject(err instanceof Error ? err : new Error(String(err))))
+    }
   })
 }
 
@@ -168,25 +186,10 @@ export async function execScheduledStream(
   cwd?: string,
   sessionKey?: string,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
-  const commands = splitTopLevelSemicolonCommands(command)
-  if (commands.length <= 1) {
-    const singleCommand = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command
-    return execScheduledStreamSingle(client, singleCommand, timeoutMs, onOutput, onPid, sessionKey)
-  }
-
-  let stdout = ""
-  let stderr = ""
-  let code = 0
-  let signal: string | undefined
-  for (const commandPart of commands) {
-    const currentCommand = cwd ? `cd ${shellQuote(cwd)} && ${commandPart}` : commandPart
-    const result = await execScheduledStreamSingle(client, currentCommand, timeoutMs, onOutput, onPid, sessionKey)
-    stdout += result.stdout
-    stderr += result.stderr
-    code = result.code
-    signal = result.signal
-  }
-  return { code, stdout, stderr, ...(signal ? { signal } : {}) }
+  const fullCommand = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command
+  // Keep the entire user command in one remote shell. Splitting on `;` here
+  // changes shell state and makes the timeout apply once per segment.
+  return execScheduledStreamSingle(client, fullCommand, timeoutMs, onOutput, onPid, sessionKey)
 }
 
 export class SSHDaemon {
@@ -210,6 +213,7 @@ export class SSHDaemon {
   private coordinatorClientId = randomUUID()
   private coordinatorInstallationId = randomUUID()
   private coordinatorRegisteredClients = new Set<string>()
+  private readonly coordinatorEnabled: boolean
   private scheduler: SchedulerService
   private stopping = false
   private resourceLimits: DaemonResourceLimits
@@ -222,9 +226,13 @@ export class SSHDaemon {
   }
   private readonly signalShutdownHandler = () => { this.shutdown().catch((err) => log("daemon", `signal shutdown failed: ${err.message}`)) }
 
-  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService; resourceLimits?: Partial<DaemonResourceLimits> }) {
+  constructor(opts?: { pipePath?: string; idleTimeoutMs?: number; scheduler?: SchedulerService; resourceLimits?: Partial<DaemonResourceLimits>; enableCoordinator?: boolean }) {
     this.pipePath = opts?.pipePath ?? getPipePath()
     this.idleTimeoutMs = opts?.idleTimeoutMs ?? 10 * 60 * 1000 // 10 min default
+    // Remote coordination is an opt-in feature. A missing helper should not
+    // add an SSH exec attempt to normal command execution, and deployments
+    // that do not use the coordinator remain on the original fast path.
+    this.coordinatorEnabled = opts?.enableCoordinator ?? process.env.SSH_TOOL_ENABLE_COORDINATOR === "1"
     this.resourceLimits = { ...DEFAULT_DAEMON_RESOURCE_LIMITS, ...opts?.resourceLimits }
     for (const key of ["maxInflightPerSocket", "maxInflightExec", "maxInflightTransfers", "maxInflightWaits"] as const) {
       const value = this.resourceLimits[key]
@@ -852,6 +860,7 @@ export class SSHDaemon {
    * rebinding cannot duplicate side effects.
    */
   private beginCoordinatorTask(task: ScheduledTask): void {
+    if (!this.coordinatorEnabled) return
     if (task.classification.intent === "inspect" || task.classification.intent === "search") return
     const connection = this.resolveTaskConnection(task)
     if (!connection) return
@@ -1271,14 +1280,15 @@ export class SSHDaemon {
       return { id: req.id, ok: false, error: `Session ${sessionId} is not connected` }
     }
     const client = connection.getFinalClient()
+    const transferOptions = { ...(options ?? {}), sessionKey: options?.sessionKey ?? connection.getHostId() }
     try {
       let result
       switch (action) {
         case "upload":
-          result = await upload(client, localPath, remotePath, options)
+          result = await upload(client, localPath, remotePath, transferOptions)
           break
         case "download":
-          result = await download(client, remotePath, localPath, options)
+          result = await download(client, remotePath, localPath, transferOptions)
           break
         default:
           return { id: req.id, ok: false, error: `Unknown transfer action: ${action}` }
@@ -1571,6 +1581,7 @@ Options:
   --debug                   Enable debug logging (logs to <skill>/logs/debug-daemon-<time>.log)
   --idle-timeout <seconds>  Idle timeout in seconds (default: 600)
   --pipe <path>             IPC pipe/socket path (default: auto)
+  SSH_TOOL_ENABLE_COORDINATOR=1  Opt in to remote coordination (default: disabled)
   --help, -h                Show this help
 `)
     process.exit(0)

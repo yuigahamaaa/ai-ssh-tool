@@ -27,23 +27,17 @@ class FakeClient {
 }
 
 describe("daemon scheduled streaming runner", () => {
-  it("executes semicolon commands one at a time", async () => {
+  it("executes semicolon commands in one remote shell", async () => {
     const client = new FakeClient()
     const resultPromise = execScheduledStream(client as any, "echo one; echo two", 5000)
 
     await new Promise(resolve => setImmediate(resolve))
     client.streams[0]!.emit("close", 0, undefined)
-    await new Promise<void>((resolve) => {
-      const check = () => client.streams.length === 2 ? resolve() : setImmediate(check)
-      check()
-    })
-    assert.equal(client.executed.length, 2)
-    client.streams[1]!.emit("close", 0, undefined)
+    assert.equal(client.executed.length, 1)
 
     const result = await resultPromise
     assert.equal(result.code, 0)
-    assert.match(client.executed[0]!, /echo one/)
-    assert.match(client.executed[1]!, /echo two/)
+    assert.match(client.executed[0]!, /echo one; echo two/)
   })
 
   it("streams stdout/stderr through callback and returns no aggregated output", async () => {
@@ -99,5 +93,19 @@ describe("daemon scheduled streaming runner", () => {
     } finally {
       clearDialectCache()
     }
+  })
+
+  it("times out when ssh2 never opens the exec channel", async () => {
+    const client = { exec: () => {} }
+    const result = await execScheduledStream(client as any, "echo never-opens", 15)
+    assert.equal(result.code, 124)
+  })
+
+  it("rejects a channel close that has no exit code", async () => {
+    const client = new FakeClient()
+    const promise = execScheduledStream(client as any, "echo dropped", 5000)
+    await new Promise(resolve => setImmediate(resolve))
+    client.streams[0]!.emit("close")
+    await assert.rejects(promise, /without an exit code/)
   })
 })

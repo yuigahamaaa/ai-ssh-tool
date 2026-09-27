@@ -1132,15 +1132,16 @@ async function main() {
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
       encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion (target encoding). Omit for normal/binary transfers."),
       source_encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Source file encoding for text-only conversion. For upload: local file encoding; for download: remote file encoding. Default auto=utf8. Set when the source is not utf-8 (e.g. remote gbk file) to avoid data corruption."),
+      timeout: z.number().positive().optional().describe("Overall transfer deadline in milliseconds"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_upload", async ({ local_path, remote_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, timeout, profile_name, profile_json, profile_file }) => {
       assertWriteAllowed("upload")
       assertPathAllowed(remote_path)
       if (!skip_symlinks) assertLocalPathSafeForTransfer(local_path, "upload")
-      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client, sessionKey) => {
         await assertRemotePathAllowedWithSymlinkCheck(client, remote_path, policy ?? undefined)
         return upload(client, local_path, remote_path, {
           compressionLevel: compression_level,
@@ -1149,6 +1150,8 @@ async function main() {
           lineEnding: line_ending as any,
           encoding: encoding as any,
           sourceEncoding: source_encoding as any,
+          sessionKey,
+          timeout,
         })
       })
       return {
@@ -1172,14 +1175,15 @@ async function main() {
       line_ending: z.enum(["auto", "lf", "crlf", "binary"]).optional().describe("Optional text-only line ending conversion: auto (platform), lf (Unix), crlf (Windows), binary (no conversion). Omit for normal/binary transfers."),
       encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Optional text-only file encoding conversion (target encoding). Omit for normal/binary transfers."),
       source_encoding: z.enum(["auto", "utf8", "gbk", "latin1"]).optional().describe("Source file encoding for text-only conversion. For upload: local file encoding; for download: remote file encoding. Default auto=utf8. Set when the source is not utf-8 (e.g. remote gbk file) to avoid data corruption."),
+      timeout: z.number().positive().optional().describe("Overall transfer deadline in milliseconds"),
       profile_name: z.string().optional().describe("Name or alias of the SSH profile to use"),
       profile_json: z.string().optional().describe("JSON string of SSH profile"),
       profile_file: z.string().optional().describe("Path to a JSON file containing SSH profile"),
     },
-    wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, profile_name, profile_json, profile_file }) => {
+    wrapTool("ssh_download", async ({ remote_path, local_path, compression_level, overwrite, skip_symlinks, line_ending, encoding, source_encoding, timeout, profile_name, profile_json, profile_file }) => {
       assertPathAllowed(remote_path)
       assertLocalPathSafeForTransfer(local_path, "download")
-      const result = await withReconnect(profile_name, profile_json, profile_file, async (client) => {
+      const result = await withReconnect(profile_name, profile_json, profile_file, async (client, sessionKey) => {
         await assertRemotePathAllowedWithSymlinkCheck(client, remote_path, policy ?? undefined)
         return download(client, remote_path, local_path, {
           compressionLevel: compression_level,
@@ -1188,6 +1192,8 @@ async function main() {
           lineEnding: line_ending as any,
           encoding: encoding as any,
           sourceEncoding: source_encoding as any,
+          sessionKey,
+          timeout,
         })
       })
       return {

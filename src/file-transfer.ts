@@ -137,7 +137,7 @@ async function remoteIsDir(client: Client, remotePath: string, sessionKey?: stri
         : kind === "cmd"
           ? `if exist "${remotePath}\\" (echo DIR) else (echo FILE)`
           : `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`
-    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "DIR"
   } catch {
     return false
@@ -154,7 +154,7 @@ async function remotePathExists(client: Client, remotePath: string, sessionKey?:
         : kind === "cmd"
           ? `if exist "${remotePath}" (echo YES) else (echo NO)`
           : `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
-    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -170,7 +170,7 @@ async function remoteIsSymlink(client: Client, remotePath: string, sessionKey?: 
       kind === "powershell"
         ? `if ((Get-Item -LiteralPath ${psQuote(remotePath)} -ErrorAction SilentlyContinue).Attributes -band [IO.FileAttributes]::ReparsePoint) { 'YES' } else { 'NO' }`
         : `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
-    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey })
+    const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "YES"
   } catch {
     return false
@@ -365,7 +365,7 @@ async function checkOverwrite(
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, remoteMoveCommand(remotePath, backupPath, options?.sessionKey), { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey })
+      await remoteExec(client, remoteMoveCommand(remotePath, backupPath, options?.sessionKey), { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
       return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
@@ -464,7 +464,7 @@ function cleanupTransferScope(scope: TransferScope, client: Client): Promise<voi
   scope.localTempFiles = []
   const cleanups: Promise<unknown>[] = []
   for (const remote of scope.remoteTempPaths) {
-    cleanups.push(remoteExec(client, `rm -f ${shellQuote(remote)}`, { timeout: 10000, splitSemicolons: false }).catch(() => {}))
+    cleanups.push(remoteExec(client, `rm -f ${shellQuote(remote)}`, { timeout: 10000, splitSemicolons: false, force: true }).catch(() => {}))
   }
   scope.remoteTempPaths = []
   return Promise.allSettled(cleanups).then(() => {})
@@ -619,10 +619,34 @@ function normalizeRemoteSftpPath(p: string): string {
   return normalized || "/"
 }
 
-/** 打开 SFTP 会话 */
-function openSftp(client: Client): Promise<SFTPWrapper> {
+/** 打开 SFTP 会话，超时覆盖 ssh2 的 channel-open 阶段。 */
+function openSftp(client: Client, timeoutMs?: number): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => (err ? reject(err) : resolve(sftp)))
+    let settled = false
+    const timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          settled = true
+          reject(new Error(`SFTP open timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+      : null
+    const finish = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      fn()
+    }
+    try {
+      client.sftp((err, sftp) => {
+        if (settled) {
+          try { sftp?.end() } catch {}
+          return
+        }
+        if (err) finish(() => reject(err))
+        else finish(() => resolve(sftp))
+      })
+    } catch (error) {
+      finish(() => reject(error instanceof Error ? error : new Error(String(error))))
+    }
   })
 }
 
@@ -680,7 +704,7 @@ async function uploadFolderSftp(
   const startTime = Date.now()
   const root = normalizeRemoteSftpPath(remotePath)
 
-  const sftp = await openSftp(client)
+  const sftp = await openSftp(client, options?.timeout)
   try {
     await sftpMkdirP(sftp, root)
   } finally {
@@ -710,7 +734,7 @@ async function uploadFolderSftp(
 
   // 嵌套文件的远端父目录必须逐一递归 mkdir，否则真实 SFTP put 会 ENOENT
   const parents = new Set(entries.map((e) => dirname(`${root}/${e.rel}`)))
-  const sftp2 = await openSftp(client)
+  const sftp2 = await openSftp(client, options?.timeout)
   try {
     for (const parent of parents) await sftpMkdirP(sftp2, parent)
   } finally {
@@ -770,7 +794,7 @@ async function downloadFolderSftp(
   }
   const finalExtractPath = targetDecision.targetPath
 
-  const sftp = await openSftp(client)
+  const sftp = await openSftp(client, options?.timeout)
   let entries: string[]
   try {
     entries = await sftpReadDirRecursive(sftp, root)
@@ -874,30 +898,39 @@ export async function uploadFile(
 
   // Use streaming with pipeline for better error handling
   return new Promise((resolve, reject) => {
-    client.sftp(async (err, sftp) => {
+    const timeoutMs = options?.timeout
+    let sftpRef: SFTPWrapper | null = null
+    let sftpEnded = false
+    let settled = false
+    const endSftp = (): void => {
+      if (sftpEnded || !sftpRef) return
+      sftpEnded = true
+      try { sftpRef.end() } catch { /* best-effort */ }
+    }
+    const finishOnce = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      fn()
+    }
+    const timer = timeoutMs ? setTimeout(() => {
+      finishOnce(() => {
+        endSftp()
+        reject(new Error(`${sftpRef ? "Upload" : "SFTP open"} timed out after ${timeoutMs}ms: ${localPath}`))
+      })
+    }, timeoutMs) : null
+
+    try {
+      client.sftp(async (err, sftp) => {
       if (err) {
-        reject(new Error(`Failed to open SFTP: ${err.message}`))
+        finishOnce(() => reject(new Error(`Failed to open SFTP: ${err.message}`)))
         return
       }
-
-      const timeoutMs = options?.timeout
-      let settled = false
-      const finishOnce = (fn: () => void): void => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        fn()
+      sftpRef = sftp
+      if (settled) {
+        try { sftp.end() } catch {}
+        return
       }
-      // Overall transfer deadline. Without it a half-open SFTP session
-      // (server stopped responding, channel never closes) would hold the
-      // promise + file descriptor + SSH channel forever, even though the
-      // FileTransferOptions.timeout contract promises a bounded operation.
-      const timer = timeoutMs ? setTimeout(() => {
-        finishOnce(() => {
-          try { sftp.end() } catch { /* best-effort */ }
-          reject(new Error(`Upload timed out after ${timeoutMs}ms: ${localPath}`))
-        })
-      }, timeoutMs) : null
 
       try {
         const readStream = createReadStream(localPath)
@@ -956,9 +989,12 @@ export async function uploadFile(
       } finally {
         // Always release the SFTP channel, even on success/error paths.
         // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
-        if (!settled) { try { sftp.end() } catch { /* best-effort cleanup */ } }
+        endSftp()
       }
-    })
+      })
+    } catch (error) {
+      finishOnce(() => reject(error instanceof Error ? error : new Error(String(error))))
+    }
   })
 }
 
@@ -1003,24 +1039,37 @@ async function uploadFileDirect(
   }
 
   return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
+    const timeoutMs = options?.timeout
+    let sftpRef: SFTPWrapper | null = null
+    let sftpEnded = false
+    let settled = false
+    const endSftp = (): void => {
+      if (sftpEnded || !sftpRef) return
+      sftpEnded = true
+      try { sftpRef.end() } catch { /* best-effort */ }
+    }
+    const finishOnce = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      endSftp()
+      fn()
+    }
+    const timer = timeoutMs ? setTimeout(() => {
+      finishOnce(() => reject(new Error(`${sftpRef ? "Upload" : "SFTP open"} timed out after ${timeoutMs}ms: ${localPath}`)))
+    }, timeoutMs) : null
+
+    try {
+      client.sftp((err, sftp) => {
       if (err) {
-        reject(new Error(`Failed to open SFTP: ${err.message}`))
+        finishOnce(() => reject(new Error(`Failed to open SFTP: ${err.message}`)))
         return
       }
-
-      let settled = false
-      const finishOnce = (fn: () => void) => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        try { sftp.end() } catch { /* best-effort cleanup */ }
-        fn()
+      sftpRef = sftp
+      if (settled) {
+        endSftp()
+        return
       }
-      const timeoutMs = options?.timeout
-      const timer = timeoutMs ? setTimeout(() => {
-        finishOnce(() => reject(new Error(`Upload timed out after ${timeoutMs}ms: ${localPath}`)))
-      }, timeoutMs) : null
 
       try {
         const writeStream = sftp.createWriteStream(remotePath, {
@@ -1067,7 +1116,10 @@ async function uploadFileDirect(
       } catch (streamErr: any) {
         finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
       }
-    })
+      })
+    } catch (error) {
+      finishOnce(() => reject(error instanceof Error ? error : new Error(String(error))))
+    }
   })
 }
 
@@ -1086,6 +1138,7 @@ export async function downloadFile(
   const requestedLocalPath = resolveLocalFileTarget(remotePath, localPath)
   const localDecision = checkLocalOverwrite(requestedLocalPath, options)
   const targetLocalPath = localDecision.targetPath
+  const stagingLocalPath = `${targetLocalPath}.ssh-tool-tmp-${randomUUID().slice(0, 8)}`
 
   const dir = dirname(targetLocalPath)
   if (!existsSync(dir)) {
@@ -1109,28 +1162,44 @@ export async function downloadFile(
   }
 
   return new Promise((resolve, reject) => {
-    client.sftp(async (err, sftp) => {
+    const timeoutMs = options?.timeout
+    let sftpRef: SFTPWrapper | null = null
+    let sftpEnded = false
+    let settled = false
+    const endSftp = (): void => {
+      if (sftpEnded || !sftpRef) return
+      sftpEnded = true
+      try { sftpRef.end() } catch { /* best-effort */ }
+    }
+    const finishOnce = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      endSftp()
+      fn()
+    }
+    const timer = timeoutMs ? setTimeout(() => {
+      finishOnce(() => {
+        try { unlinkSync(stagingLocalPath) } catch {}
+        reject(new Error(`${sftpRef ? "Download" : "SFTP open"} timed out after ${timeoutMs}ms: ${remotePath}`))
+      })
+    }, timeoutMs) : null
+
+    try {
+      client.sftp(async (err, sftp) => {
       if (err) {
-        reject(new Error(`Failed to open SFTP: ${err.message}`))
+        finishOnce(() => reject(new Error(`Failed to open SFTP: ${err.message}`)))
+        return
+      }
+      sftpRef = sftp
+      if (settled) {
+        endSftp()
         return
       }
 
-      let settled = false
-      const finishOnce = (fn: () => void): void => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        try { sftp.end() } catch { /* best-effort cleanup */ }
-        fn()
-      }
-      const timeoutMs = options?.timeout
       // Overall transfer deadline — mirrors uploadFile. Without it a stuck
       // SFTP channel (server stopped responding) would hold the promise and
       // the SSH channel forever despite the documented timeout contract.
-      const timer = timeoutMs ? setTimeout(() => {
-        finishOnce(() => reject(new Error(`Download timed out after ${timeoutMs}ms: ${remotePath}`)))
-      }, timeoutMs) : null
-
       try {
         const stats = await new Promise<{ size: number; mode?: number }>((resolve, reject) => {
           sftp.stat(remotePath, (statErr, stats) => {
@@ -1203,7 +1272,8 @@ export async function downloadFile(
             }
           }
 
-          writeFileSync(targetLocalPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
+          writeFileSync(stagingLocalPath, data as unknown as Buffer, { mode: options?.mode ?? remoteMode })
+          renameSync(stagingLocalPath, targetLocalPath)
 
           const duration = Date.now() - startTime
           log("transfer", `Download (direct) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
@@ -1232,7 +1302,7 @@ export async function downloadFile(
         const readStream = sftp.createReadStream(remotePath)
         const chain = buildTransformChain(options)
 
-        const writeStream = createWriteStream(targetLocalPath, {
+        const writeStream = createWriteStream(stagingLocalPath, {
           mode: options?.mode ?? remoteMode,
         })
 
@@ -1258,6 +1328,8 @@ export async function downloadFile(
           await pipelineAsync(readStream, writeStream)
         }
 
+        renameSync(stagingLocalPath, targetLocalPath)
+
         const duration = Date.now() - startTime
         log("transfer", `Download (streaming) complete: ${remotePath} -> ${targetLocalPath} (${totalSize} bytes, ${duration}ms)`)
         const destinationChecksum = await sha256File(targetLocalPath)
@@ -1281,13 +1353,18 @@ export async function downloadFile(
           duration,
         }))
       } catch (error: any) {
+        try { unlinkSync(stagingLocalPath) } catch {}
         finishOnce(() => reject(new Error(`Download failed: ${error.message}`)))
       } finally {
         // Always release the SFTP channel, even on success/error paths.
         // Wrapping in try/catch ensures a faulty end() can't mask the real failure.
-        if (!settled) { try { sftp.end() } catch { /* best-effort cleanup */ } }
+        endSftp()
+        try { unlinkSync(stagingLocalPath) } catch {}
       }
-    })
+      })
+    } catch (error) {
+      finishOnce(() => reject(error instanceof Error ? error : new Error(String(error))))
+    }
   })
 }
 
@@ -1335,7 +1412,7 @@ export async function uploadFolder(
     }
     const finalRemotePath = targetDecision.targetPath
 
-    const mkdirResult = await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
+    const mkdirResult = await remoteExec(client, `mkdir -p ${shellQuote(finalRemotePath)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     if (mkdirResult.code !== 0) {
       throw new Error(`Failed to create remote directory ${finalRemotePath}: ${mkdirResult.stderr.trim() || `exit code ${mkdirResult.code}`}`)
     }
@@ -1382,11 +1459,11 @@ export async function uploadFolder(
 
     // GNU tar --overwrite 不可用时（BSD/busybox）降级：清空目标子项后 -xzpf 解压
     let extractCmd = `tar -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)} ${options?.overwrite ? "--overwrite" : ""}`
-    let extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    let extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     if (extractResult.code !== 0 && options?.overwrite && finalRemotePath && finalRemotePath !== "/") {
       await remoteExec(client, `rm -rf ${shellQuote(pathPosix.join(finalRemotePath, "*"))}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
       extractCmd = `tar -xzpf ${shellQuote(remoteTmp)} -C ${shellQuote(finalRemotePath)}`
-      extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+      extractResult = await remoteExec(client, extractCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     }
     if (extractResult.code !== 0) {
       throw new Error(`Failed to extract ${remoteTmp}: ${extractResult.stderr.trim() || `exit code ${extractResult.code}`}`)
@@ -1474,16 +1551,16 @@ export async function downloadFolder(
 
     // GNU tar -I gzip -N 不可用时（BSD/busybox）降级为 -czf（默认压缩级别）
     let compressCmd = `tar -I ${shellQuote(`gzip -${compressionLevel}`)} -cf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
-    let compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+    let compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     if (compressResult.code !== 0) {
       compressCmd = `tar -czf ${shellQuote(remoteTmp)} ${tarOptions.join(" ")} -C ${shellQuote(remoteParent)} ${shellQuote(folderName)}`
-      compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey })
+      compressResult = await remoteExec(client, compressCmd, { timeout, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     }
     if (compressResult.code !== 0) {
       throw new Error(`Failed to compress ${remotePath}: ${compressResult.stderr.trim() || `exit code ${compressResult.code}`}`)
     }
 
-    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey })
+    const sizeResult = await remoteExec(client, `stat -c %s ${shellQuote(remoteTmp)} 2>/dev/null || wc -c < ${shellQuote(remoteTmp)}`, { timeout: 10000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
     if (sizeResult.code !== 0) {
       throw new Error(`Failed to determine archive size ${remoteTmp}: ${sizeResult.stderr.trim() || `exit code ${sizeResult.code}`}`)
     }

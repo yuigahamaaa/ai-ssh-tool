@@ -299,10 +299,25 @@ export class ExecTaskManager {
           cwd: options?.cwd,
           env: options?.env,
         })
+        let timedOut = false
+        if (options?.timeout && options.timeout > 0) {
+          // Start the deadline before client.exec(). ssh2 can leave its
+          // channel-open callback pending when a connection is half-open.
+          timeoutTimer = setTimeout(() => {
+            timedOut = true
+            stopCurrent()
+            onClose(124, "TERM")
+          }, options.timeout)
+        }
         try {
           client.exec(wrappedCommand, (err, openedStream) => {
             if (err) {
               onError(new Error(`Failed to exec: ${err.message}`))
+              return
+            }
+
+            if (settled) {
+              try { openedStream.close() } catch {}
               return
             }
 
@@ -338,19 +353,21 @@ export class ExecTaskManager {
             })
 
             openedStream.on("close", (code?: number, signal?: string) => {
-              onClose(code ?? 0, signal ?? undefined)
+              if (timedOut) {
+                onClose(124, "TERM")
+                return
+              }
+              if (code === undefined) {
+                onError(new Error("Stream closed without an exit code (connection may have dropped)"))
+                return
+              }
+              onClose(code, signal ?? undefined)
             })
 
             openedStream.on("error", (streamErr: Error) => {
               onError(new Error(`Stream error: ${streamErr.message}`))
             })
 
-            if (options?.timeout && options.timeout > 0) {
-              timeoutTimer = setTimeout(() => {
-                stopCurrent()
-                onError(new Error(`Command timed out after ${options.timeout}ms`))
-              }, options.timeout)
-            }
           })
         } catch (err) {
           onError(err instanceof Error ? err : new Error(String(err)))

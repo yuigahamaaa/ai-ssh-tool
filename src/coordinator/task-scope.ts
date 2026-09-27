@@ -37,6 +37,21 @@ export class CoordinatorTaskScope {
     const data = response.data as { taskId: string; leaseToken: string; conflicts?: CoordinationConflict[]; observed?: Array<Record<string, unknown>> }
     this.taskId = data.taskId
     this.leaseToken = data.leaseToken
+    if (this.finished) {
+      // The task can finish while the remote coordinator is still opening its
+      // request channel. Release a lease that arrived too late instead of
+      // leaving an orphaned active task and heartbeat.
+      await this.client.finishTask(data.taskId, data.leaseToken, "cancelled")
+      this.metadata = {
+        available: true,
+        taskId: data.taskId,
+        workspace: this.task.workspace,
+        warning: "task finished before coordinator lease was acquired",
+        conflicts: data.conflicts ?? [],
+        observed: data.observed ?? [],
+      }
+      return this.metadata
+    }
     this.metadata = { available: true, taskId: data.taskId, workspace: this.task.workspace, conflicts: data.conflicts ?? [], observed: data.observed ?? [], ...((data.conflicts?.length || data.observed?.length) ? { warning: "workspace has active observed activity" } : {}) }
     this.heartbeatTimer = setInterval(() => { void this.heartbeat() }, this.heartbeatMs)
     this.heartbeatTimer.unref()

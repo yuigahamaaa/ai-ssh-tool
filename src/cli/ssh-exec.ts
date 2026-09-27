@@ -181,8 +181,9 @@ function parseArgs(): {
 	  --overwrite ask|skip|overwrite|rename|backup
 	  --compression-level 1-9
 	  --skip-symlinks
-	  --line-ending auto|lf|crlf|binary
-	  --encoding auto|utf8|gbk|latin1
+		  --line-ending auto|lf|crlf|binary
+		  --encoding auto|utf8|gbk|latin1
+		  --timeout <ms>              Transfer deadline in milliseconds
 
 	--debug                   开启调试日志
 
@@ -526,6 +527,7 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
   let skipSymlinks: boolean | undefined
   let lineEnding: "auto" | "lf" | "crlf" | "binary" | undefined
   let encoding: "auto" | "utf8" | "gbk" | "latin1" | undefined
+  let timeout: number | undefined
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && i + 1 < args.length) {
@@ -552,6 +554,8 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
       lineEnding = args[++i] as any
     } else if (args[i] === "--encoding" && i + 1 < args.length) {
       encoding = args[++i] as any
+    } else if (args[i] === "--timeout" && i + 1 < args.length) {
+      timeout = parsePositiveInt("--timeout", args[++i])
     }
   }
 
@@ -656,6 +660,7 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
             skipSymlinks,
             lineEnding,
             encoding,
+            timeout,
           },
         }),
         300000,

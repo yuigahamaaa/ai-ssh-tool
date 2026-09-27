@@ -8,7 +8,7 @@ import { getGlobalTaskManager, type ExecResult } from "./exec-task-manager.js"
 import { log } from "./logger.js"
 import { getDialect } from "./remote-dialect/index.js"
 import { psQuote } from "./remote-dialect/powershell.js"
-import { shellQuote, splitTopLevelSemicolonCommands } from "./shell-quote.js"
+import { shellQuote } from "./shell-quote.js"
 
 /**
  * Execute a command on a remote host via an existing SSH client.
@@ -44,24 +44,12 @@ export async function remoteExec(
   command: string,
   options?: { timeout?: number; cwd?: string; env?: Record<string, string>; host?: string; splitSemicolons?: boolean; sessionKey?: string; force?: boolean },
 ): Promise<ExecResult> {
-  const dialect = getDialect(options?.sessionKey)
-  const split = options?.splitSemicolons !== false && dialect.supportsSemicolonSplit()
-  const commands = split ? splitTopLevelSemicolonCommands(command) : [command]
-  if (commands.length <= 1) return remoteExecSingle(client, command, options)
-
-  let stdout = ""
-  let stderr = ""
-  let code = 0
-  let signal: string | undefined
-  for (const currentCommand of commands) {
-    const result = await remoteExecSingle(client, currentCommand, options)
-    stdout += result.stdout
-    stderr += result.stderr
-    code = result.code
-    signal = result.signal
-  }
-
-  return { code, stdout, stderr, ...(signal ? { signal } : {}) }
+  // Preserve the caller's shell semantics. The dialect wrapper already
+  // executes the complete command in one remote shell; splitting `;` into
+  // multiple SSH channels loses variables, cwd changes, short-circuiting and
+  // the requested whole-command timeout. `splitSemicolons` remains accepted
+  // for API compatibility, but no longer changes execution semantics.
+  return remoteExecSingle(client, command, options)
 }
 
 /**

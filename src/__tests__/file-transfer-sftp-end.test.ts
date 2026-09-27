@@ -64,6 +64,15 @@ afterEach(() => {
 })
 
 describe("file-transfer P2-1: sftp.end() always released", () => {
+  it("times out while the SFTP channel is opening", async () => {
+    const localPath = join(testDir, "open-timeout.txt")
+    const client = { sftp: () => {} }
+    await assert.rejects(
+      () => downloadFile(client as any, "/remote/x", localPath, { timeout: 15 }),
+      /SFTP open timed out/,
+    )
+  })
+
   it("uploadFile (streaming) calls sftp.end() on success", async () => {
     const sftp = new FakeSftp()
     // We can't easily build a working streaming upload against the FakeSftp

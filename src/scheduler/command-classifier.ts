@@ -54,13 +54,29 @@ const intentToDefaultCost: Record<string, TaskCost> = {
 export function classifyCommand(command: string, opts?: ClassifierOptions): CommandClassification {
   const trimmed = command.trim()
 
-  for (const candidate of commandCandidates(trimmed)) {
-    for (const rule of rules) {
-      if (rule.pattern.test(candidate)) {
-        return buildResult(rule, opts)
-      }
+  // A compound command must be classified from every top-level segment. The
+  // old first-match walk let a harmless prefix such as `echo ok;` hide a
+  // destructive suffix. Keep the strongest policy requirement for the whole
+  // shell invocation so scheduler confirmation and locks cannot be bypassed
+  // with `;`, `&&`, `||`, pipelines, or newlines.
+  const segments = splitTopLevelCommands(trimmed).map((part) => part.trim()).filter(Boolean)
+  if (segments.length > 1) {
+    const segmentRules = segments.map(findRule)
+    if (segmentRules.some((rule, index) => rule === undefined && !isNeutralShellSegment(segments[index]!))) {
+      return buildCompoundFallback(opts)
     }
+    const matchedRules = segmentRules.filter((rule): rule is Rule => rule !== undefined)
+    const strongest = matchedRules.sort(compareRules).at(-1)
+    if (strongest) return buildResult(strongest, opts)
+
+    // A compound command that the parser cannot identify is deliberately
+    // conservative: it may contain redirection, command substitution, or a
+    // shell construct outside our small rule table.
+    return buildCompoundFallback(opts)
   }
+
+  const rule = findRule(trimmed)
+  if (rule) return buildResult(rule, opts)
 
   return {
     intent: opts?.intent ?? "custom",
@@ -73,6 +89,40 @@ export function classifyCommand(command: string, opts?: ClassifierOptions): Comm
       ? "Agent-provided classification for unrecognized command."
       : "Command not recognized; defaulting to medium/custom.",
   }
+}
+
+function isNeutralShellSegment(command: string): boolean {
+  const trimmed = command.trim()
+  return /^(?:cd|export|unset|true|:)\b/.test(trimmed) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(trimmed)
+}
+
+function findRule(command: string): Rule | undefined {
+  for (const candidate of commandCandidates(command)) {
+    for (const rule of rules) {
+      if (rule.pattern.test(candidate)) return rule
+    }
+  }
+  return undefined
+}
+
+function buildCompoundFallback(opts?: ClassifierOptions): CommandClassification {
+  const requestedCost = opts?.cost
+  const finalCost = requestedCost && costRank(requestedCost) >= costRank("large") ? requestedCost : "large"
+  return {
+    intent: opts?.intent ?? "custom",
+    cost: finalCost,
+    blocking: true,
+    mutates: true,
+    risky: true,
+    source: opts?.intent || opts?.cost ? "agent_overridden_by_policy" : "default",
+    reason: "Compound command could not be classified safely; policy requires confirmation before execution.",
+  }
+}
+
+function compareRules(left: Rule, right: Rule): number {
+  const leftScore = Number(left.risky) * 100 + costRank(left.cost) * 10 + Number(left.mutates) * 2 + Number(left.blocking)
+  const rightScore = Number(right.risky) * 100 + costRank(right.cost) * 10 + Number(right.mutates) * 2 + Number(right.blocking)
+  return leftScore - rightScore
 }
 
 function commandCandidates(command: string): string[] {
@@ -163,10 +213,16 @@ function splitTopLevelCommands(command: string): string[] {
       quote = ch
       continue
     }
-    if (ch === ";" || (ch === "&" && command[i + 1] === "&")) {
+    if (ch === "\n" || ch === ";" || ch === "|") {
       parts.push(command.slice(start, i))
-      start = i + (ch === "&" ? 2 : 1)
-      if (ch === "&") i++
+      if (ch === "|") {
+        if (command[i + 1] === ch) i++
+      }
+      start = i + 1
+    } else if (ch === "&" && command[i + 1] === "&") {
+      parts.push(command.slice(start, i))
+      i++
+      start = i + 1
     }
   }
 

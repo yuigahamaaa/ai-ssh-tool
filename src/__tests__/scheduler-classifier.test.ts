@@ -330,5 +330,24 @@ describe("Command Classifier", () => {
       const c = classifyCommand("rm -rf /tmp/foo", { force: true })
       assert.equal(c.risky, true)
     })
+
+    it("uses the strongest rule across compound commands", () => {
+      const c = classifyCommand("echo ok; rm -rf /tmp/foo")
+      assert.equal(c.intent, "cleanup")
+      assert.equal(c.cost, "exclusive")
+      assert.equal(c.mutates, true)
+      assert.equal(c.risky, true)
+    })
+
+    it("detects destructive commands after a pipeline or conditional", () => {
+      assert.equal(classifyCommand("echo ok | rm -rf /tmp/foo").risky, true)
+      assert.equal(classifyCommand("pwd && systemctl restart app").risky, true)
+    })
+
+    it("requires confirmation when a compound segment is unknown", () => {
+      const c = classifyCommand("echo ok; custom-tool --mutate")
+      assert.equal(c.risky, true)
+      assert.equal(c.mutates, true)
+    })
   })
 })
