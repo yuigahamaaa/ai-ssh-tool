@@ -219,7 +219,8 @@ export class SSHConnection extends EventEmitter {
           })
 
           stream.on("close", () => {
-            this.emitDisconnectedOnce()
+            this.shell = null
+            this.emitEvent({ type: "shell-closed", sessionId: this.sessionId })
           })
 
           stream.stderr.on("data", (data: Buffer) => {
@@ -239,7 +240,7 @@ export class SSHConnection extends EventEmitter {
   /** Send data to the remote shell */
   async sendData(data: string | Buffer): Promise<void> {
     if (!this.shell || !this.connected) {
-      throw new Error("Not connected")
+      throw new Error(this.connected ? "Interactive shell is not open" : "Not connected")
     }
     return new Promise((resolve, reject) => {
       this.shell!.write(data, (err) => {

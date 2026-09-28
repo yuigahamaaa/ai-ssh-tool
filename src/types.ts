@@ -74,6 +74,7 @@ export type ConnectionEvent =
   | { type: "connecting"; sessionId: string; hopIndex: number; host: string }
   | { type: "connected"; sessionId: string }
   | { type: "disconnected"; sessionId: string }
+  | { type: "shell-closed"; sessionId: string }
   | { type: "error"; sessionId: string; error: string }
   | { type: "data"; sessionId: string; data: Buffer }
   | { type: "resize"; sessionId: string; cols: number; rows: number }
