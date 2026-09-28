@@ -302,6 +302,12 @@ function defaultExecHandler(command: string): { stdout: string; stderr: string; 
   if (stripped === "false") return { stdout: "", stderr: "", code: 1 }
   if (stripped === "pwd") return { stdout: "/home/testuser\n", stderr: "", code: 0 }
   if (stripped.startsWith("cat ")) return { stdout: "file-content\n", stderr: "", code: 0 }
+  if (stripped.includes("size_bytes=") && stripped.includes("total_lines=")) {
+    return { stdout: "size_bytes=10\ntotal_lines=1\nbinary_detected=false\nencoding=utf-8\n", stderr: "", code: 0 }
+  }
+  if (stripped.includes("sed -n") || stripped.includes("head -c")) {
+    return { stdout: "test data\n", stderr: "", code: 0 }
+  }
   if (stripped === "ls") return { stdout: "file1\nfile2\n", stderr: "", code: 0 }
   // grep and find commands
   if (stripped.startsWith("grep ") || stripped.startsWith("find ")) return { stdout: "match\n", stderr: "", code: 0 }

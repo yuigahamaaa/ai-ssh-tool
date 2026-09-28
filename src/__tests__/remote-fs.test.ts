@@ -19,7 +19,8 @@ function createMockSftp() {
   })
 
   sftp.createReadStream = mock.fn((_path: string) => {
-    const stream = new EventEmitter()
+    const stream: any = new EventEmitter()
+    stream.destroy = mock.fn(() => stream.emit("close"))
     process.nextTick(() => {
       stream.emit("data", Buffer.from("file content line 1\n"))
       stream.emit("data", Buffer.from("file content line 2\n"))

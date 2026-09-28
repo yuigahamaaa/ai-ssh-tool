@@ -49,9 +49,15 @@ function createTestServer(): Promise<{
           session.on("exec", (acceptExec: any, _rejectExec: any, info: any) => {
             const stream = acceptExec()
             stream.on("error", () => {})
-            const command = String(info?.command ?? "").replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, "")
+            const rawCommand = String(info?.command ?? "")
+            const wrapped = rawCommand.match(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+sh\s+-c\s+'([\s\S]*)'$/)
+            const command = (wrapped ? wrapped[1].replace(/'\\''/g, "'") : rawCommand.replace(/^echo\s+"SSH_TOOL_PID:\$\$"\s+>&2;\s+exec\s+/, ""))
             if (command.startsWith("echo ")) {
               stream.write(`${command.slice(5)}\n`)
+            } else if (command.includes("size_bytes=") && command.includes("total_lines=")) {
+              stream.write("size_bytes=9\ntotal_lines=1\nbinary_detected=false\nencoding=utf-8\n")
+            } else if (command.includes("sed -n") || command.includes("head -c")) {
+              stream.write("hello mcp\n")
             } else if (command.startsWith("grep ")) {
               stream.write("mcp match\n")
             } else if (command.startsWith("find ")) {
@@ -178,14 +184,14 @@ describe("MCP Server Tool Integration", () => {
     it("readFile reads content", async () => {
       const tools = await createRemoteTools({ sessionId: "mcp", client: conn.getFinalClient(), cwd: "/tmp" })
       const result = await tools.readFile.execute({ path: "/tmp/mcp-test.txt" })
-      assert.ok(typeof result === "string")
+      assert.equal(typeof result, "object")
       tools.dispose()
     })
 
     it("listDir lists directory", async () => {
       const tools = await createRemoteTools({ sessionId: "mcp", client: conn.getFinalClient(), cwd: "/tmp" })
       const result = await tools.listDir.execute({ path: "/tmp" })
-      assert.ok(typeof result === "string")
+      assert.equal(typeof result, "object")
       tools.dispose()
     })
 
@@ -206,14 +212,14 @@ describe("MCP Server Tool Integration", () => {
     it("grep searches files", async () => {
       const tools = await createRemoteTools({ sessionId: "mcp", client: conn.getFinalClient(), cwd: "/tmp" })
       const result = await tools.grep.execute({ pattern: "mcp", path: "/tmp" })
-      assert.ok(typeof result === "string")
+      assert.equal(typeof result, "object")
       tools.dispose()
     })
 
     it("find finds files", async () => {
       const tools = await createRemoteTools({ sessionId: "mcp", client: conn.getFinalClient(), cwd: "/tmp" })
       const result = await tools.find.execute({ path: "/tmp" })
-      assert.ok(typeof result === "string")
+      assert.equal(typeof result, "object")
       tools.dispose()
     })
 
