@@ -196,6 +196,7 @@ export class SSHSessionManager extends EventEmitter {
         chain: opts.chain,
         terminalSize,
         timeout: opts.timeout,
+        openShell: opts.openShell,
         sessionId: id,
       })
     } catch (err: any) {

@@ -97,6 +97,8 @@ export interface ConnectionOptions {
   terminalSize?: TerminalSize
   /** Connection timeout in ms (per hop) */
   timeout?: number
+  /** Open an interactive PTY shell after transport connection (default: true for direct SSHConnection callers). */
+  openShell?: boolean
   /** Reuse existing session for same config hash (default: true) */
   reuseSession?: boolean
 }
