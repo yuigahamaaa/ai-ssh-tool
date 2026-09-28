@@ -4,6 +4,18 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+# Never let this legacy test runner share the user's persistent scheduler
+# state. Several modules construct SchedulerService during import and perform
+# retention cleanup immediately.
+TEST_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ssh-tool-run-tests.XXXXXX")"
+export SSH_TOOL_DATA_DIR="${TEST_STATE_DIR}/data"
+export SSH_TOOL_CACHE_DIR="${TEST_STATE_DIR}/cache"
+export SSH_TOOL_SOCKET_DIR="${TEST_STATE_DIR}/socket"
+cleanup_test_state() {
+  rm -rf "$TEST_STATE_DIR"
+}
+trap cleanup_test_state EXIT INT TERM
+
 LOG_FILE="${ROOT_DIR}/test-$(date +%Y%m%d-%H%M%S).log"
 NODE_BIN="${NODE_BIN:-node}"
 

@@ -72,7 +72,9 @@ export class SSHGateway {
       timeout: this.config.connectionTimeout,
     }
     const session = await this.sessions.connect(opts)
-    this.probeRemoteDialect(session).catch(() => {})
+    // Resolve the dialect before returning the session so the first command
+    // cannot race the asynchronous probe and fall back to POSIX on Windows.
+    await this.probeRemoteDialect(session)
     return session
   }
 

@@ -37,7 +37,6 @@ import { SchedulerService } from "./scheduler/scheduler-service.js"
 import { BatchedPersistenceStore, PersistenceStore } from "./scheduler/persistence-store.js"
 import { migrateExecTasks } from "./scheduler/migrator.js"
 import type { AgentIdentity, HostIdentity, ScheduleRequest, ScheduledTask, TaskOutputResult } from "./scheduler/types.js"
-import { shellQuote } from "./shell-quote.js"
 import { getDialect } from "./remote-dialect/index.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 import { SshExecCoordinatorTransport, RemoteCoordinatorClient } from "./coordinator/client.js"
@@ -97,9 +96,10 @@ function execScheduledStreamSingle(
   onOutput?: (stdout: string, stderr: string) => void,
   onPid?: (pid: number) => void,
   sessionKey?: string,
+  cwd?: string,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
   return new Promise((resolve, reject) => {
-    const wrappedCommand = getDialect(sessionKey).buildExec(command)
+    const wrappedCommand = getDialect(sessionKey).buildExec(command, cwd ? { cwd } : undefined)
     let pid: number | null = null
     let pidCaptured = false
     let settled = false
@@ -186,10 +186,11 @@ export async function execScheduledStream(
   cwd?: string,
   sessionKey?: string,
 ): Promise<{ code: number; stdout: string; stderr: string; signal?: string }> {
-  const fullCommand = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command
   // Keep the entire user command in one remote shell. Splitting on `;` here
-  // changes shell state and makes the timeout apply once per segment.
-  return execScheduledStreamSingle(client, fullCommand, timeoutMs, onOutput, onPid, sessionKey)
+  // changes shell state and makes the timeout apply once per segment. The
+  // dialect wrapper owns cwd construction so Windows never receives a POSIX
+  // `cd ... &&` prefix.
+  return execScheduledStreamSingle(client, command, timeoutMs, onOutput, onPid, sessionKey, cwd)
 }
 
 export class SSHDaemon {
@@ -261,7 +262,7 @@ export class SSHDaemon {
           const client = conn.getFinalClient()
           return execScheduledStream(client, task.command, task.timeoutMs ?? 120_000, onOutput, (pid) => {
             task.pid = pid
-          }, task.effectiveCwd, task.hostId)
+          }, task.effectiveCwd, conn.getHostId())
         },
         cancel: (task) => {
           // Backstop cancel: if the scheduler's own background-task
@@ -290,11 +291,7 @@ export class SSHDaemon {
           const client = conn.getFinalClient()
           const hostId = conn.getHostId()
 
-          let fullCommand = task.command
-          if (task.effectiveCwd) {
-            fullCommand = `cd ${shellQuote(task.effectiveCwd)} && ${fullCommand}`
-          }
-          const wrappedCommand = getDialect(hostId).buildBackground(fullCommand)
+          const wrappedCommand = getDialect(hostId).buildBackground(task.command, task.effectiveCwd ? { cwd: task.effectiveCwd } : undefined)
 
           let currentPid: number | null = null
           let pidCaptured = false
@@ -1143,7 +1140,7 @@ export class SSHDaemon {
         return { id: req.id, ok: false, error: `Session ${req.params.sessionId} is not connected` }
       }
       const previousCwd = this.scheduler.resolveCwd(req.params.agent.id, req.params.host.id)
-      const cwd = await resolveRemoteCwd(connection.getFinalClient(), req.params.cwd, previousCwd)
+      const cwd = await resolveRemoteCwd(connection.getFinalClient(), req.params.cwd, previousCwd, connection.getHostId())
       this.scheduler.setCwd(req.params.agent.id, req.params.host.id, cwd)
       return { id: req.id, ok: true, data: { success: true, cwd, message: "已设置当前 AI 会话在该 host 上的默认 cwd；不会影响其他 AI。" } }
     } catch (err: any) {

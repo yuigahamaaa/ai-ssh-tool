@@ -54,6 +54,13 @@ const intentToDefaultCost: Record<string, TaskCost> = {
 export function classifyCommand(command: string, opts?: ClassifierOptions): CommandClassification {
   const trimmed = command.trim()
 
+  // This module intentionally does not attempt to be a shell parser. Any
+  // syntax whose execution semantics are not fully represented by the small
+  // rule table is treated as a compound command and must be confirmed. This
+  // prevents a harmless-looking prefix such as `echo` or `cd` from hiding a
+  // redirect or nested command substitution.
+  if (hasUnsafeShellSyntax(trimmed)) return buildCompoundFallback(opts)
+
   // A compound command must be classified from every top-level segment. The
   // old first-match walk let a harmless prefix such as `echo ok;` hide a
   // destructive suffix. Keep the strongest policy requirement for the whole
@@ -93,7 +100,45 @@ export function classifyCommand(command: string, opts?: ClassifierOptions): Comm
 
 function isNeutralShellSegment(command: string): boolean {
   const trimmed = command.trim()
-  return /^(?:cd|export|unset|true|:)\b/.test(trimmed) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(trimmed)
+  if (!/^(?:cd|export|unset|true|:)\b/.test(trimmed) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(trimmed)) return false
+  return !hasUnsafeShellSyntax(trimmed)
+}
+
+function hasUnsafeShellSyntax(command: string): boolean {
+  let quote: `"` | `'` | null = null
+  let escaped = false
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true
+      continue
+    }
+
+    if (quote === "'") {
+      if (ch === "'") quote = null
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null
+      // Command substitution and backticks still execute inside double quotes.
+      if (ch === '`' || (ch === '$' && command[i + 1] === '(')) return true
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+
+    if (ch === '`' || (ch === '$' && command[i + 1] === '(')) return true
+    if (ch === '>' || ch === '<' || ch === '(' || ch === ')' || ch === '\n') return true
+    if (ch === '&' && command[i + 1] !== '&') return true
+  }
+  return false
 }
 
 function findRule(command: string): Rule | undefined {

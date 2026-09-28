@@ -330,6 +330,7 @@ async function execCommand(config: SshExecConfig, command: string): Promise<void
     log("exec", `Executing: ${command}`)
     const result = await remoteExec(client, command, {
       timeout: config.timeout ?? 30000,
+      sessionKey: connection.getHostId(),
     })
     log("exec", `Exit code: ${result.code}, stdout: ${result.stdout.length} bytes, stderr: ${result.stderr.length} bytes`)
 
@@ -648,6 +649,7 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
         console.error(`[ssh-exec] Reconnected, retrying ${action}...`)
       }
 
+      const transferDeadlineMs = timeout ?? 5 * 60 * 1000
       const result = await client.send(
         createRequest("transfer", {
           sessionId,
@@ -663,7 +665,7 @@ export async function handleDaemonTransfer(args: string[]): Promise<void> {
             timeout,
           },
         }),
-        300000,
+        transferDeadlineMs + 10_000,
       )
 
       if (result.ok) {

@@ -24,6 +24,8 @@ import { getDialect } from "./remote-dialect/index.js"
 import { psQuote } from "./remote-dialect/powershell.js"
 
 const pipelineAsync = promisify(pipeline)
+const DEFAULT_FILE_TRANSFER_TIMEOUT_MS = 2 * 60 * 1000
+const DEFAULT_FOLDER_TRANSFER_TIMEOUT_MS = 5 * 60 * 1000
 
 export interface TransferProgress {
   filename: string
@@ -139,8 +141,8 @@ async function remoteIsDir(client: Client, remotePath: string, sessionKey?: stri
           : `test -d ${shellQuote(remotePath)} && echo "DIR" || echo "FILE"`
     const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "DIR"
-  } catch {
-    return false
+  } catch (error) {
+    throw new Error(`Failed to determine remote path type for ${remotePath}: ${(error as Error).message}`)
   }
 }
 
@@ -156,8 +158,8 @@ async function remotePathExists(client: Client, remotePath: string, sessionKey?:
           : `test -e ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
     const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "YES"
-  } catch {
-    return false
+  } catch (error) {
+    throw new Error(`Failed to check remote path ${remotePath}: ${(error as Error).message}`)
   }
 }
 
@@ -172,8 +174,8 @@ async function remoteIsSymlink(client: Client, remotePath: string, sessionKey?: 
         : `test -L ${shellQuote(remotePath)} && echo "YES" || echo "NO"`
     const result = await remoteExec(client, command, { timeout: 5000, splitSemicolons: false, sessionKey, force: true })
     return result.stdout.trim() === "YES"
-  } catch {
-    return false
+  } catch (error) {
+    throw new Error(`Failed to check remote symlink ${remotePath}: ${(error as Error).message}`)
   }
 }
 
@@ -365,7 +367,10 @@ async function checkOverwrite(
     case "backup":
       const backupPath = `${remotePath}.bak`
       log("transfer", `Backing up existing file: ${remotePath} -> ${backupPath}`)
-      await remoteExec(client, remoteMoveCommand(remotePath, backupPath, options?.sessionKey), { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
+      const backupResult = await remoteExec(client, remoteMoveCommand(remotePath, backupPath, options?.sessionKey), { timeout: 5000, splitSemicolons: false, sessionKey: options?.sessionKey, force: true })
+      if (backupResult.code !== 0) {
+        throw new Error(`Failed to back up ${remotePath}: ${backupResult.stderr.trim() || `exit code ${backupResult.code}`}`)
+      }
       return { proceed: true, targetPath: remotePath, strategy, existed: true, backupPath }
     
     case "rename":
@@ -575,7 +580,7 @@ function checkLocalOverwrite(localPath: string, options: FileTransferOptions | u
         }
         renameSync(localPath, backupPath)
       } catch (e) {
-        log("transfer", `Backup failed, continuing with overwrite: ${(e as Error).message}`)
+        throw new Error(`Backup failed for ${localPath}: ${(e as Error).message}`)
       }
       return { proceed: true, targetPath: localPath, requestedPath: localPath, strategy, existed: true, backupPath }
     }
@@ -843,6 +848,7 @@ export async function uploadFile(
   remotePath: string,
   options?: FileTransferOptions,
 ): Promise<TransferResult> {
+  options = { ...options, timeout: options?.timeout ?? DEFAULT_FILE_TRANSFER_TIMEOUT_MS }
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
 
@@ -1133,6 +1139,7 @@ export async function downloadFile(
   localPath: string,
   options?: FileTransferOptions,
 ): Promise<TransferResult> {
+  options = { ...options, timeout: options?.timeout ?? DEFAULT_FILE_TRANSFER_TIMEOUT_MS }
   const startTime = Date.now()
   const fileSizeThreshold = options?.fileSizeThreshold ?? 10 * 1024 * 1024
   const requestedLocalPath = resolveLocalFileTarget(remotePath, localPath)
@@ -1379,7 +1386,8 @@ export async function uploadFolder(
   options?: FolderTransferOptions,
 ): Promise<TransferResult> {
   const startTime = Date.now()
-  const timeout = options?.timeout ?? 5 * 60 * 1000
+  const timeout = options?.timeout ?? DEFAULT_FOLDER_TRANSFER_TIMEOUT_MS
+  options = { ...options, timeout }
   const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
   if (!existsSync(localPath)) {
@@ -1507,7 +1515,8 @@ export async function downloadFolder(
   options?: FolderTransferOptions,
 ): Promise<TransferResult> {
   const startTime = Date.now()
-  const timeout = options?.timeout ?? 5 * 60 * 1000
+  const timeout = options?.timeout ?? DEFAULT_FOLDER_TRANSFER_TIMEOUT_MS
+  options = { ...options, timeout }
   const compressionLevel = validateCompressionLevel(options?.compressionLevel)
 
   // 非 posix 方言：走 SFTP 递归（远端无可靠 tar 链）

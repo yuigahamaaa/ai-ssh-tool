@@ -1049,7 +1049,7 @@ async function main() {
       assertPathAllowed(path)
       const result = await withReconnect(profile_name, profile_json, profile_file, async (client, sessionKey) => {
         await assertRemotePathAllowedWithSymlinkCheck(client, path, policy ?? undefined)
-        return remoteExec(client, buildExistsCommand(path, sessionKey), { timeout: 5000 })
+        return remoteExec(client, buildExistsCommand(path, sessionKey), { timeout: 5000, sessionKey })
       })
       const exists = result.stdout.trim() === "exists"
       return { content: [{ type: "text" as const, text: jsonText(mcpEnvelope("file_result", { path, exists, raw: result.stdout.trim() })) }] }
@@ -1345,9 +1345,9 @@ async function main() {
         const hostname = target.host
         const cmds = buildHostLoadCommands(sessionKey)
 
-        const uptimeResult = await remoteExec(client, cmds.uptime, { timeout: 10000 })
-        const memResult = await remoteExec(client, cmds.memory, { timeout: 10000 })
-        const procResult = await remoteExec(client, cmds.proc, { timeout: 10000 })
+        const uptimeResult = await remoteExec(client, cmds.uptime, { timeout: 10000, sessionKey })
+        const memResult = await remoteExec(client, cmds.memory, { timeout: 10000, sessionKey })
+        const procResult = await remoteExec(client, cmds.proc, { timeout: 10000, sessionKey })
         const queueResp = await daemonClient.queueStatus({ hostId: targetKey })
         return {
           hostname,
