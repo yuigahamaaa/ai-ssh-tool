@@ -56,6 +56,7 @@ import {
 } from "./mcp-file-tools.js"
 import { CommandRegistryStore, type CommandExecutionMode } from "./command-registry.js"
 import { assertRemotePathAllowedWithSymlinkCheck, checkBlockedPath, checkReadOnly, validateCommand } from "./remote-tools.js"
+import { buildInfo } from "./build-info.js"
 
 interface HostConfig extends SSHHostKeyOptions {
   host: string
@@ -730,7 +731,7 @@ async function main() {
 
   const server = new McpServer({
     name: "ssh-tool",
-    version: "2.0.0",
+    version: buildInfo.version,
   })
 
   function commandRegistryGuidance(extra: string[] = []): string[] {

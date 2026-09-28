@@ -41,6 +41,7 @@ import { getDialect } from "./remote-dialect/index.js"
 import { getLegacyExecTasksDir, getSchedulerTasksDir, getSchedulerOutputsDir } from "./paths.js"
 import { SshExecCoordinatorTransport, RemoteCoordinatorClient } from "./coordinator/client.js"
 import { CoordinatorTaskScope } from "./coordinator/task-scope.js"
+import { buildInfo } from "./build-info.js"
 
 interface DaemonSession {
   sessionId: string
@@ -465,6 +466,7 @@ export class SSHDaemon {
 
     console.log(`[daemon] listening on ${this.pipePath}`)
     console.log(`[daemon] idle timeout: ${this.idleTimeoutMs / 1000}s`)
+    console.log(`[daemon] build: ${buildInfo.version} ${buildInfo.commit} ${buildInfo.builtAt}`)
   }
 
   async shutdown(): Promise<void> {
@@ -647,6 +649,7 @@ export class SSHDaemon {
           data: {
             uptime: Math.floor((Date.now() - this.startedAt) / 1000),
             sessionCount: this.gateway.listSessions().length,
+            build: buildInfo,
           },
         }
         break
