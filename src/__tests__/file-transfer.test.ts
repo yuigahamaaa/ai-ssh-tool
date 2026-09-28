@@ -138,6 +138,11 @@ function createTestServer(): Promise<{
               if (entry?.data && entry.path) memFs.set(entry.path, entry.data)
               handles.delete(h); sftpStream.status(reqId, 0)
             })
+            sftpStream.on("RENAME", (reqId: any, oldPath: any, newPath: any) => {
+              const data = memFs.get(oldPath)
+              if (!data) { sftpStream.status(reqId, 2); return }
+              memFs.set(newPath, data); memFs.delete(oldPath); sftpStream.status(reqId, 0)
+            })
             sftpStream.on("STAT", (reqId: any, path: any) => {
               const data = memFs.get(path)
               if (data) sftpStream.attrs(reqId, { mode: 0o100644, size: data.length, uid: 0, gid: 0, atime: 0, mtime: 0 })

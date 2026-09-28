@@ -641,7 +641,7 @@ function openSftp(client: Client, timeoutMs?: number): Promise<SFTPWrapper> {
       fn()
     }
     try {
-      client.sftp((err, sftp) => {
+      client.sftp(async (err, sftp) => {
         if (settled) {
           try { sftp?.end() } catch {}
           return
@@ -652,6 +652,25 @@ function openSftp(client: Client, timeoutMs?: number): Promise<SFTPWrapper> {
     } catch (error) {
       finish(() => reject(error instanceof Error ? error : new Error(String(error))))
     }
+  })
+}
+
+function sftpRename(sftp: SFTPWrapper, source: string, destination: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const rename = (sftp as any).rename
+    if (typeof rename !== "function") {
+      reject(new Error("SFTP server does not support atomic rename"))
+      return
+    }
+    rename.call(sftp, source, destination, (error: Error | undefined) => error ? reject(error) : resolve())
+  })
+}
+
+function sftpUnlink(sftp: SFTPWrapper, path: string): Promise<void> {
+  return new Promise((resolve) => {
+    const unlink = (sftp as any).unlink
+    if (typeof unlink !== "function") { resolve(); return }
+    unlink.call(sftp, path, () => resolve())
   })
 }
 
@@ -892,6 +911,7 @@ export async function uploadFile(
     }
   }
   const finalRemotePath = checkResult.targetPath
+  const stagingRemotePath = `${finalRemotePath}.ssh-tool-tmp-${randomUUID().slice(0, 8)}`
 
   const shouldUseStreaming = totalSize > fileSizeThreshold
 
@@ -899,7 +919,7 @@ export async function uploadFile(
     return uploadFileDirect(client, localPath, finalRemotePath, options, statInfo, {
       ...checkResult,
       requestedPath: remotePath,
-    })
+    }, stagingRemotePath)
   }
 
   // Use streaming with pipeline for better error handling
@@ -937,12 +957,13 @@ export async function uploadFile(
         try { sftp.end() } catch {}
         return
       }
+      const writeRemotePath = typeof (sftp as any).rename === "function" ? stagingRemotePath : finalRemotePath
 
       try {
         const readStream = createReadStream(localPath)
         const chain = buildTransformChain(options)
 
-        const writeStream = sftp.createWriteStream(finalRemotePath, {
+        const writeStream = sftp.createWriteStream(writeRemotePath, {
           mode: options?.mode ?? statInfo.mode,
         })
 
@@ -968,6 +989,10 @@ export async function uploadFile(
           await pipelineAsync(readStream, writeStream)
         }
 
+        if (writeRemotePath !== finalRemotePath) {
+          await sftpRename(sftp, writeRemotePath, finalRemotePath)
+        }
+
         const duration = Date.now() - startTime
         log("transfer", `Upload (streaming) complete: ${localPath} -> ${finalRemotePath} (${totalSize} bytes, ${duration}ms)`)
         const sourceChecksum = await sha256File(localPath)
@@ -991,6 +1016,7 @@ export async function uploadFile(
           duration,
         }))
       } catch (pipelineErr: any) {
+        if (writeRemotePath !== finalRemotePath) await sftpUnlink(sftp, writeRemotePath)
         finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${pipelineErr.message}`)))
       } finally {
         // Always release the SFTP channel, even on success/error paths.
@@ -1015,6 +1041,7 @@ async function uploadFileDirect(
   options: FileTransferOptions | undefined,
   statInfo: { size: number; mode: number },
   transferMeta?: OverwriteDecision & { requestedPath?: string },
+  stagingRemotePath?: string,
 ): Promise<TransferResult> {
   const startTime = Date.now()
   const totalSize = Number(statInfo.size)
@@ -1066,7 +1093,7 @@ async function uploadFileDirect(
     }, timeoutMs) : null
 
     try {
-      client.sftp((err, sftp) => {
+      client.sftp(async (err, sftp) => {
       if (err) {
         finishOnce(() => reject(new Error(`Failed to open SFTP: ${err.message}`)))
         return
@@ -1076,9 +1103,10 @@ async function uploadFileDirect(
         endSftp()
         return
       }
+      const writeRemotePath = stagingRemotePath && typeof (sftp as any).rename === "function" ? stagingRemotePath : remotePath
 
       try {
-        const writeStream = sftp.createWriteStream(remotePath, {
+        const writeStream = sftp.createWriteStream(writeRemotePath, {
           mode: options?.mode ?? statInfo.mode,
         })
 
@@ -1086,7 +1114,7 @@ async function uploadFileDirect(
           finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
         })
 
-        writeStream.on("close", () => {
+        writeStream.on("close", async () => {
           const duration = Date.now() - startTime
           if (options?.onProgress && totalSize > 0) {
             options.onProgress({
@@ -1095,6 +1123,13 @@ async function uploadFileDirect(
               total: totalSize,
               percent: 100,
             })
+          }
+          try {
+            if (writeRemotePath !== remotePath) await sftpRename(sftp, writeRemotePath, remotePath)
+          } catch (error) {
+            await sftpUnlink(sftp, writeRemotePath)
+            finishOnce(() => reject(new Error(`Upload commit failed for ${localPath}: ${(error as Error).message}`)))
+            return
           }
           log("transfer", `Upload (direct) complete: ${localPath} -> ${remotePath} (${totalSize} bytes, ${duration}ms)`)
           finishOnce(() => resolve({
@@ -1120,6 +1155,7 @@ async function uploadFileDirect(
 
         writeStream.end(data)
       } catch (streamErr: any) {
+        if (writeRemotePath !== remotePath) await sftpUnlink(sftp, writeRemotePath)
         finishOnce(() => reject(new Error(`Upload failed for ${localPath}: ${streamErr.message}`)))
       }
       })
