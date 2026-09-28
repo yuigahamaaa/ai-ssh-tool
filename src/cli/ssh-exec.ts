@@ -374,6 +374,7 @@ async function interactiveShell(config: SshExecConfig): Promise<void> {
       strictHostKeyChecking: config.target.strictHostKeyChecking,
       knownHostsPath: config.target.knownHostsPath,
       jumpHosts,
+      openShell: true,
       name: `shell-${Date.now()}`,
     })
 

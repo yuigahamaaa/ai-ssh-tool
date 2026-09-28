@@ -38,7 +38,7 @@ export class SSHConnection extends EventEmitter {
 
   /** Connect through the chain of hosts */
   async connect(opts: ConnectionOptions & { sessionId?: string }): Promise<void> {
-    const { chain, terminalSize = { cols: 80, rows: 24 }, timeout = 10000 } = opts
+    const { chain, terminalSize = { cols: 80, rows: 24 }, timeout = 10000, openShell = true } = opts
     this.sessionId = opts.sessionId ?? ""
 
     if (chain.length === 0) {
@@ -73,9 +73,11 @@ export class SSHConnection extends EventEmitter {
         this.hops.push({ client, host })
       }
 
-      log("conn", `[${this.sessionId.slice(0, 8)}] Opening shell...`)
       const finalClient = this.hops[this.hops.length - 1].client
-      this.shell = await this.openShell(finalClient, terminalSize)
+      if (openShell) {
+        log("conn", `[${this.sessionId.slice(0, 8)}] Opening shell...`)
+        this.shell = await this.openShell(finalClient, terminalSize, timeout)
+      }
       this.connected = true
       // Reset the guard so the NEXT lifecycle (reconnect on the same
       // SSHConnection instance) can emit its own disconnected event.
@@ -186,11 +188,23 @@ export class SSHConnection extends EventEmitter {
   }
 
   /** Open an interactive shell session */
-  private openShell(client: Client, size: TerminalSize): Promise<ClientChannel> {
+  private openShell(client: Client, size: TerminalSize, timeoutMs: number): Promise<ClientChannel> {
     return new Promise((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new Error(`Opening interactive shell timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
       client.shell(
         { term: "xterm-256color", cols: size.cols, rows: size.rows },
         (err, stream) => {
+          if (settled) {
+            try { stream?.close() } catch {}
+            return
+          }
+          settled = true
+          clearTimeout(timer)
           if (err) {
             reject(new Error(`Failed to open shell: ${err.message}`))
             return

@@ -59,17 +59,18 @@ export class SSHGateway {
     if (!profile) throw new Error(`Profile "${profileIdOrName}" not found`)
 
     const chain = ProfileManager.chainFromProfile(profile)
-    const session = await this.connectByChain(chain, name ?? profile.name)
+    const session = await this.connectByChain(chain, name ?? profile.name, { openShell: false })
     this.profiles.markUsed(profile.id)
     return session
   }
 
   /** Connect using an inline host chain */
-  async connectByChain(chain: SSHConnectionChain, name?: string): Promise<SSHSession> {
+  async connectByChain(chain: SSHConnectionChain, name?: string, options?: { openShell?: boolean }): Promise<SSHSession> {
     const opts: ConnectionOptions = {
       chain,
       name,
       timeout: this.config.connectionTimeout,
+      openShell: options?.openShell ?? false,
     }
     const session = await this.sessions.connect(opts)
     // Resolve the dialect before returning the session so the first command
@@ -104,10 +105,11 @@ export class SSHGateway {
      * Pass `jumpHosts: []` explicitly to skip default gateways and connect directly.
      */
     jumpHosts?: (SSHHostKeyOptions & { host: string; port?: number; username: string; password?: string; privateKey?: string })[]
+    openShell?: boolean
     name?: string
   }): Promise<SSHSession> {
     const chain = buildSimpleChain(params, this.config.defaultGateways)
-    return this.connectByChain(chain, params.name)
+    return this.connectByChain(chain, params.name, { openShell: params.openShell ?? false })
   }
 
   /** Connect by resolving a hostname through ~/.ssh/config */
@@ -131,7 +133,7 @@ export class SSHGateway {
       if (overrides.privateKey) target.auth.privateKey = overrides.privateKey
     }
 
-    return this.connectByChain(chain, `ssh-config:${hostname}`)
+    return this.connectByChain(chain, `ssh-config:${hostname}`, { openShell: false })
   }
 
   /** Get the current default gateways */
