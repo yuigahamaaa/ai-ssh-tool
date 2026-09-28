@@ -263,7 +263,7 @@ export class SSHDaemon {
           const client = conn.getFinalClient()
           return execScheduledStream(client, task.command, task.timeoutMs ?? 120_000, onOutput, (pid) => {
             task.pid = pid
-          }, task.effectiveCwd, conn.getHostId())
+          }, task.effectiveCwd, conn.getHostId?.() ?? task.hostId)
         },
         cancel: (task) => {
           // Backstop cancel: if the scheduler's own background-task

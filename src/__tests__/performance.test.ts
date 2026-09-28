@@ -72,6 +72,9 @@ function createTestServer(): Promise<{
               handles.delete(h)
               sftpStream.status(reqId, 0)
             })
+            sftpStream.on("RENAME", (reqId: any, _oldPath: any, _newPath: any) => {
+              sftpStream.status(reqId, 0)
+            })
             sftpStream.on("STAT", (reqId: any) => {
               sftpStream.status(reqId, 2)
             })

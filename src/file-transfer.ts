@@ -131,6 +131,10 @@ export interface FileTransferOptions {
 
 /** Check if a remote path is a directory */
 async function remoteIsDir(client: Client, remotePath: string, sessionKey?: string): Promise<boolean> {
+  // SFTP-only callers may intentionally provide a client without exec. An
+  // explicit remote filename should then be treated as a file target; the
+  // SFTP stat path remains available to overwrite checks below.
+  if (typeof (client as any).exec !== "function") return false
   const kind = getDialect(sessionKey).kind
   try {
     const command =
@@ -148,6 +152,13 @@ async function remoteIsDir(client: Client, remotePath: string, sessionKey?: stri
 
 /** Check if a remote path exists */
 async function remotePathExists(client: Client, remotePath: string, sessionKey?: string): Promise<boolean> {
+  if (typeof (client as any).exec !== "function") {
+    // SFTP-only callers open their sole channel in the transfer operation
+    // itself. Do not open a probe channel here (it can be the same mock or
+    // server channel and would double-close it); overwrite detection is
+    // unavailable, so the caller's explicit strategy is applied directly.
+    return false
+  }
   const kind = getDialect(sessionKey).kind
   try {
     const command =

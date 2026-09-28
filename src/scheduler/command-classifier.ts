@@ -136,7 +136,10 @@ function hasUnsafeShellSyntax(command: string): boolean {
 
     if (ch === '`' || (ch === '$' && command[i + 1] === '(')) return true
     if (ch === '>' || ch === '<' || ch === '(' || ch === ')' || ch === '\n') return true
-    if (ch === '&' && command[i + 1] !== '&') return true
+    if (ch === '&') {
+      if (command[i + 1] === '&') { i++; continue }
+      return true
+    }
   }
   return false
 }
