@@ -160,6 +160,6 @@ describe("detectAndCache + getDialect", () => {
 
   it("getDialect honours the remoteShellHint (windows dialects land in P3/P4)", () => {
     assert.equal(getDialect(undefined, "posix").kind, "posix")
-    assert.equal(getDialect(undefined, "powershell").kind, "posix")
+    assert.equal(getDialect(undefined, "powershell").kind, "powershell")
   })
 })
